@@ -1,0 +1,21 @@
+# Only these folders are backed up. Everything else on the share (Redis and Qdrant data,
+# per-run scratch folders) stays out of Git.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/workspace/
+!/docker/
+!/launchers/
+!/config/
+!/memory_export/
+
+# Inside those folders, skip generated, temporary and private files
+__pycache__/
+*.pyc
+*.tmp
+*.log
+/workspace/.history/
+/workspace/logs/
+/config/*
+!/config/*.example

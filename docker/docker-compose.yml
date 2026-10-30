@@ -1,0 +1,43 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: blackboard-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - /mnt/blackboard/redis-data:/data
+    command: redis-server --appendonly yes
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: blackboard-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - /mnt/blackboard/qdrant-data:/qdrant/storage
+
+  # Telemetry dashboard on port 8080 (restarts with Docker after a reboot).
+  # Building it also produces agent-sandbox:latest, the image the pipeline uses for
+  # its throwaway per-run test containers (docker run --rm, no network by default).
+  # The old always-on "agent-sandbox" container, which had the workspace mounted
+  # read-write, was removed.
+  dashboard:
+    build: ./sandbox
+    image: agent-sandbox:latest
+    container_name: blackboard-dashboard
+    restart: unless-stopped
+    user: "1000:1000"
+    working_dir: /app
+    command: python3 -u agent_dashboard.py
+    environment:
+      - AGENT_REDIS_HOST=redis
+    ports:
+      - "8080:8080"
+    volumes:
+      - /mnt/blackboard/workspace:/app:ro
+      - /mnt/blackboard/config:/config:ro
+    depends_on:
+      - redis

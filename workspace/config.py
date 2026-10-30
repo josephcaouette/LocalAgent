@@ -1,0 +1,135 @@
+"""Shared settings for the agent cluster. Edit hosts, models and limits here.
+
+Imported by the pipeline, GUI, ingest worker, dashboard and reindex script, so
+a change here applies everywhere.
+
+Secrets (Redis password, Qdrant API key) are read from environment variables or
+from ../config/agent_secrets.env, i.e. Z:\\config on Windows and
+/mnt/blackboard/config on Node 2. That folder is outside the workspace, so
+sandboxed code can't read it.
+"""
+import os
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_env_file(path):
+    values = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    values[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return values
+
+
+_SECRETS = _load_env_file(os.path.join(_HERE, "..", "config", "agent_secrets.env"))
+
+
+def _setting(name, default=None):
+    return os.environ.get(name) or _SECRETS.get(name) or default
+
+
+# --- Nodes -------------------------------------------------------------------
+NODE1_IP = "192.168.254.24"   # Brain: RTX 4090, vLLM, GUI, pipeline
+NODE2_IP = "192.168.254.25"   # Blackboard: Redis, Qdrant, sandbox, file share
+NODE3_IP = "192.168.254.26"   # Worker: RTX 2070, Ollama
+
+# --- Paths (Windows view of the share) ----------------------------------------
+WORKSPACE = _setting("AGENT_WORKSPACE", _HERE)               # Z:\workspace
+RUNS_DIR = os.path.normpath(os.path.join(WORKSPACE, "..", "runs"))  # Z:\runs
+HISTORY_DIR = os.path.join(WORKSPACE, ".history")            # backups before overwrite
+LOG_DIR = os.path.join(WORKSPACE, "logs")
+
+# --- Paths on Node 2 (same share, Linux view) ---------------------------------
+SSH_TARGET = "server@" + NODE2_IP
+REMOTE_ROOT = "/mnt/blackboard"
+REMOTE_WORKSPACE = REMOTE_ROOT + "/workspace"
+REMOTE_RUNS_DIR = REMOTE_ROOT + "/runs"
+
+# --- Redis (task telemetry) ---------------------------------------------------
+REDIS_HOST = _setting("AGENT_REDIS_HOST", NODE2_IP)
+REDIS_PORT = 6379
+REDIS_PASSWORD = _setting("AGENT_REDIS_PASSWORD")
+TASK_KEY_PREFIX = "workflow:task:"
+TASK_INDEX_KEY = "workflow:tasks"          # sorted set of task keys, score = start time
+LATEST_KEY = "workflow:langgraph:001"      # copy of the most recent run (GUI reads this)
+TASK_TTL_SECONDS = 30 * 24 * 3600          # task records expire after 30 days
+TASK_INDEX_MAX = 500
+
+# --- Qdrant (long-term memory) ------------------------------------------------
+QDRANT_HOST = _setting("AGENT_QDRANT_HOST", NODE2_IP)
+QDRANT_PORT = 6333
+QDRANT_API_KEY = _setting("AGENT_QDRANT_API_KEY")
+COLLECTION_NAME = "agent_solutions"
+MEMORY_MIN_SCORE = 0.63    # cosine score needed to reuse a stored solution. In a 13-goal test with
+                           # qwen3-embedding:0.6b, right matches scored 0.707 or more (average 0.768)
+                           # and the best wrong match 0.566. Tune from the scores the retriever logs.
+MEMORY_TOP_K = 3
+
+# --- vLLM on Node 1 (planner / engineer / verifier) ---------------------------
+LLM_BASE_URL = "http://127.0.0.1:8001"   # not "localhost": Windows tries IPv6 first and each
+                                         # new connection to WSL then waits ~2 s before falling back
+LLM_MODEL = "RedHatAI/Qwen3.8-27B-INT4"   # if vLLM serves another model, the pipeline uses that one
+LLM_FALLBACK_CONTEXT = 8192    # used only if vLLM doesn't report max_model_len
+LLM_TIMEOUT = 600              # seconds per request
+ENGINEER_MAX_OUTPUT = 8000     # upper limit on tokens for one generated file
+LLM_ENABLE_THINKING = False    # Qwen3.x reasons step by step before answering unless this is off.
+                               # Off is several times faster; models without the switch ignore it.
+LLM_TEMPERATURE = 0.7          # sampling values from the Qwen3.8 model card (non-thinking mode)
+LLM_TOP_P = 0.8
+LLM_TOP_K = 20
+
+# --- Ollama on Node 3 (scout / condenser / ingest summaries / embeddings) ------
+OLLAMA_URL = f"http://{NODE3_IP}:11434"
+WORKER_MODEL = "qwen3.5:9b"          # was qwen2.5-coder:7b
+WORKER_THINK = False       # Qwen3.5 reasons step by step unless this is False. Use None for models
+                           # without a thinking mode (such as qwen2.5-coder), which reject the option.
+EMBED_MODEL = "qwen3-embedding:0.6b" # was nomic-embed-text. Changing it changes the vector size:
+                                     # run reindex_memory.py afterwards to rebuild the memory store.
+                                     # Ollama keeps it on Node 3's CPU next to qwen3.5:9b (8 GB GPU);
+                                     # that's fine at ~70 ms per call. With qwen3.5:4b both fit on the GPU.
+# Text added in front of what gets embedded. Qwen3-Embedding wants a task instruction on queries
+# and nothing on stored documents. (nomic-embed-text used "search_query: " / "search_document: ".)
+EMBED_QUERY_PREFIX = ("Instruct: Given a programming task, retrieve a stored Python utility that "
+                      "solves a similar task\nQuery:")
+EMBED_DOCUMENT_PREFIX = ""
+OLLAMA_NUM_CTX = 8192      # keep identical everywhere (incl. Restart_Node3_Worker.bat) or Ollama reloads the model
+OLLAMA_KEEP_ALIVE = -1     # sent with every request; -1 keeps models loaded indefinitely
+
+# --- Sandbox (fresh container per test run on Node 2) -------------------------
+SANDBOX_IMAGE = "agent-sandbox:latest"     # built from Z:\docker\sandbox\Dockerfile
+SANDBOX_PYTHON = "3.11"
+SANDBOX_PACKAGES = ["requests", "redis", "psutil", "yaml"]   # import names; keep in sync with the Dockerfile
+SANDBOX_TIMEOUT = 20       # seconds the script may run
+SANDBOX_MEMORY = "1g"
+SANDBOX_CPUS = 2
+SANDBOX_PIDS = 128
+MAX_ATTEMPTS = 3
+KEEP_RUNS = 30             # per-run scratch folders kept in Z:\runs
+KEEP_HISTORY_PER_FILE = 20 # backups kept per file in .history
+
+# --- Dashboard ----------------------------------------------------------------
+DASHBOARD_PORT = 8080
+DASHBOARD_URL = f"http://{NODE2_IP}:{DASHBOARD_PORT}"
+DASHBOARD_MAX_TASKS = 50
+
+# Infrastructure files the pipeline must never overwrite.
+PROTECTED_FILES = {
+    "run_langgraph_pipeline.py", "agent_gui.py", "agent_dashboard.py",
+    "background_ingest.py", "config.py", "agent_common.py", "reindex_memory.py",
+}
+
+
+def get_redis(decode_responses=False, timeout=3):
+    """Redis client with short timeouts so callers never hang when Node 2 is down."""
+    import redis
+    return redis.Redis(
+        host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, db=0,
+        decode_responses=decode_responses,
+        socket_connect_timeout=timeout, socket_timeout=timeout,
+    )
