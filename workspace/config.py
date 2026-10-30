@@ -85,6 +85,11 @@ LLM_TOP_P = 0.8
 LLM_TOP_K = 20
 
 # --- Ollama on Node 3 (scout / condenser / ingest summaries / embeddings) ------
+# Who does the pipeline's helper jobs (the scout's brief on referenced files and the diagnosis
+# of failed test runs): "node1" uses the main vLLM model, which is faster and stronger here;
+# "node3" uses WORKER_MODEL. Embeddings, background memory summaries and the GUI's chat
+# fallback always use Node 3.
+HELPER_BACKEND = "node1"
 OLLAMA_URL = f"http://{NODE3_IP}:11434"
 WORKER_MODEL = "qwen3.5:9b"          # was qwen2.5-coder:7b
 WORKER_THINK = False       # Qwen3.5 reasons step by step unless this is False. Use None for models

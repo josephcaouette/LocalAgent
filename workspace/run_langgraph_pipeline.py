@@ -572,19 +572,27 @@ def research_scout_node(state):
     if ref:
         with open(os.path.join(config.WORKSPACE, ref), encoding="utf-8", errors="replace") as f:
             ref_code = f.read()
-        prompt = (
-            f"You are a technical research scout. Inspect this existing Python file '{ref}':\n\n"
-            f"{TICK3}python\n{ref_code[:12000]}\n{TICK3}\n\n"
-            f"The user wants to accomplish this goal: \"{state['goal'][:1500]}\"\n\n"
-            "Extract a concise technical brief (max 6 bullet points):\n"
-            "- Available classes, functions, and signatures worth reusing.\n"
-            "- Hardcoded network ports, endpoints, or Redis keys.\n"
-            "- Execution constraints (CLI arguments, test flags, environment checks).\n"
-            "Return ONLY the bullet points."
-        )
+        ask = ("Extract a concise technical brief (max 6 bullet points) for someone implementing the goal:\n"
+               "- Available classes, functions, and signatures worth reusing.\n"
+               "- Hardcoded network ports, endpoints, or Redis keys.\n"
+               "- Execution constraints (CLI arguments, test flags, environment checks).\n"
+               "Return ONLY the bullet points.")
         try:
-            text = ollama_generate(prompt, temperature=0.1, timeout=60, num_predict=400)
-            lines.append(f"\n[Node: Research Scout] Brief on referenced file {ref} (Node 3):\n{text}")
+            if config.HELPER_BACKEND == "node1":
+                text, _ = llm_chat(
+                    "Scout", "You are a technical research scout. Be concise and factual.",
+                    [block(f"Existing file {ref}:", ref_code, trim=2, code=True, min_chars=2000),
+                     block("Goal:", state["goal"][:1500]),
+                     block("Instructions:", ask)],
+                    want_out=500, min_out=200, temperature=0.2)
+            else:
+                text = ollama_generate(
+                    f"You are a technical research scout. Inspect this existing Python file '{ref}':\n\n"
+                    f"{TICK3}python\n{ref_code[:12000]}\n{TICK3}\n\n"
+                    f"The user wants to accomplish this goal: \"{state['goal'][:1500]}\"\n\n" + ask,
+                    temperature=0.1, timeout=60, num_predict=400)
+            lines.append(f"\n[Node: Research Scout] Brief on referenced file {ref} "
+                         f"({'Node 1' if config.HELPER_BACKEND == 'node1' else 'Node 3'}):\n{text}")
             brief = f"Notes on {ref}:\n{text}"
         except Exception as e:
             lines.append(f"\n[Node: Research Scout] Brief on {ref} skipped ({short(e)}).")
@@ -831,27 +839,37 @@ def verifier_node(state):
 
 def error_condenser_node(state):
     raw_error = state["error"]
-    print(f"\n[Node: Error Condenser] Asking Node 3 to diagnose the failure "
+    where = "Node 1" if config.HELPER_BACKEND == "node1" else "Node 3"
+    print(f"\n[Node: Error Condenser] Diagnosing the failure on {where} "
           f"(attempt {state['attempt'] - 1})...")
     report(state, phase=f"diagnosing (attempt {state['attempt'] - 1}/{config.MAX_ATTEMPTS})")
-    prompt = (
-        "You are an expert runtime debugger. A Python script failed inside a Linux container.\n"
-        f"What the script should do: {state['goal'][:600]}\n\n"
-        f"Failing code:\n{TICK3}python\n{head(state['code'], 14000)}\n{TICK3}\n\n"
-        f"Error output:\n{tail(raw_error, 5000)}\n\n"
-        "Give a concise diagnosis:\n"
-        "1. Exact line number and exception type.\n"
-        "2. Root cause (why it failed).\n"
-        "3. The exact logical fix required.\n"
-        "Keep it under 4 sentences. Don't write replacement code."
-    )
+    ask = ("Give a concise diagnosis:\n"
+           "1. Exact line number and exception type, or which check failed.\n"
+           "2. Root cause (why it failed).\n"
+           "3. The exact logical fix required.\n"
+           "Keep it under 5 sentences. Don't write replacement code.")
     try:
-        diagnosis = ollama_generate(prompt, temperature=0.1, timeout=60, num_predict=300)
+        if config.HELPER_BACKEND == "node1":
+            diagnosis, _ = llm_chat(
+                "Condenser", "You are an expert Python debugger. A script failed inside a Linux container.",
+                [block("What the script should do:", state["goal"][:1500]),
+                 block("Acceptance checks:", numbered(state["checks"])),
+                 block("Failing code:", state["code"], trim=2, code=True, min_chars=3000),
+                 block("Error output:", raw_error, trim=1, keep="tail", min_chars=1500),
+                 block("Instructions:", ask)],
+                want_out=400, min_out=150, temperature=0.2)
+        else:
+            diagnosis = ollama_generate(
+                "You are an expert runtime debugger. A Python script failed inside a Linux container.\n"
+                f"What the script should do: {state['goal'][:600]}\n\n"
+                f"Failing code:\n{TICK3}python\n{head(state['code'], 14000)}\n{TICK3}\n\n"
+                f"Error output:\n{tail(raw_error, 5000)}\n\n" + ask,
+                temperature=0.1, timeout=60, num_predict=300)
     except Exception as e:
         print(f"-> Condenser skipped ({short(e)}); the engineer gets the raw error.")
         return {}
-    print(f"-> Node 3 diagnosis:\n{diagnosis}")
-    return {"error": f"DIAGNOSIS (Node 3):\n{diagnosis}\n\nRAW ERROR (tail):\n{tail(raw_error, 2500)}"}
+    print(f"-> Diagnosis ({where}):\n{diagnosis}")
+    return {"error": f"DIAGNOSIS:\n{diagnosis}\n\nRAW ERROR (tail):\n{tail(raw_error, 2500)}"}
 
 
 def finalize_node(state):

@@ -7,7 +7,7 @@ utilities, then remembers what worked.
 |---|---|---|
 | Node 1, 192.168.254.24 | i7-14700K, RTX 4090, 32 GB, Windows 11 + WSL2 | vLLM serving Qwen3.8-27B (4-bit, CUDA graphs, speculative decoding); the GUI and the pipeline |
 | Node 2, 192.168.254.25 | Dual Xeon E5-2400 v2, 64 GB ECC, 5 TB volume, Ubuntu 24.04 | The file share (`/mnt/blackboard`, mapped as `Z:\` on Node 1), Redis, Qdrant, the dashboard, the test sandbox |
-| Node 3, 192.168.254.26 | MSI laptop, RTX 2070 8 GB, Ubuntu 24.04 | Ollama: `qwen3.5:9b` helper and `qwen3-embedding:0.6b` embeddings |
+| Node 3, 192.168.254.26 | MSI laptop, RTX 2070 8 GB, Ubuntu 24.04 | Ollama: `qwen3-embedding:0.6b` embeddings, background memory summaries and the chat fallback (`qwen3.5:9b`) |
 
 ## What's in this repository
 
@@ -33,14 +33,14 @@ file backups in `workspace/.history/`.
 ## How a run works
 
 1. Pick the target file (the GUI's Target box, a file named in the goal, or a new name).
-2. In parallel: search memory for similar past solutions, and have Node 3 brief any file
-   the goal mentions.
+2. In parallel: search memory for similar past solutions, and brief any other file the goal
+   mentions (on Node 1 by default; see `HELPER_BACKEND` in `config.py`).
 3. The planner writes steps and 2-4 acceptance checks.
 4. The engineer writes the whole file into `runs/<run>/a<N>/`, never straight into the workspace.
 5. The file runs as `python3 <file> --test` in a fresh container on Node 2: no network unless
    allowed, read-only workspace, 1 GB of memory, 20 seconds.
 6. The verifier judges the output against the acceptance checks.
-7. Failures loop back (via Node 3's diagnosis for crashes), up to 3 attempts.
+7. Failures loop back, with a diagnosis step for crashes, up to 3 attempts.
 8. On a pass, the old file goes to `workspace/.history/`, the new one is promoted, and it is
    stored in memory.
 
