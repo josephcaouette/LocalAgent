@@ -60,6 +60,8 @@ TASK_INDEX_KEY = "workflow:tasks"          # sorted set of task keys, score = st
 LATEST_KEY = "workflow:langgraph:001"      # copy of the most recent run (GUI reads this)
 TASK_TTL_SECONDS = 30 * 24 * 3600          # task records expire after 30 days
 TASK_INDEX_MAX = 500
+ACTIVE_KEY = "workflow:active"             # sorted set: run_id -> last heartbeat (every 30 s)
+ACTIVE_STALE_S = 120                       # a run with no heartbeat for this long is gone
 
 # --- Qdrant (long-term memory) ------------------------------------------------
 QDRANT_HOST = _setting("AGENT_QDRANT_HOST", NODE2_IP)
@@ -76,7 +78,7 @@ LLM_BASE_URL = "http://127.0.0.1:8001"   # not "localhost": Windows tries IPv6 f
                                          # new connection to WSL then waits ~2 s before falling back
 LLM_MODEL = "RedHatAI/Qwen3.8-27B-INT4"   # if vLLM serves another model, the pipeline uses that one
 LLM_FALLBACK_CONTEXT = 8192    # used only if vLLM doesn't report max_model_len
-LLM_TIMEOUT = 600              # seconds per request
+LLM_TIMEOUT = 1200             # seconds per request (two runs share the GPU, so allow slow ones)
 ENGINEER_MAX_OUTPUT = 8000     # upper limit on tokens for one generated file
 LLM_ENABLE_THINKING = False    # Qwen3.x reasons step by step before answering unless this is off.
                                # Off is several times faster; models without the switch ignore it.
@@ -145,6 +147,14 @@ RUN_PROFILES = {
 }
 KEEP_HISTORY_PER_FILE = 20 # backups kept per file in .history
 
+# How many runs the GUI's queue runs at the same time. vLLM serves them together, so two runs
+# finish close to twice as many tasks per hour as one, each about 10-15% slower.
+MAX_PARALLEL_RUNS = 2
+
+# Test containers are started while the engineer writes, so a test doesn't wait ~7 s for one
+# (Docker on Node 2's HDD array). Each container is still used for one test and then removed.
+SANDBOX_PREWARM = True
+
 # --- Dashboard ----------------------------------------------------------------
 DASHBOARD_PORT = 8080
 DASHBOARD_URL = f"http://{NODE2_IP}:{DASHBOARD_PORT}"
@@ -165,3 +175,12 @@ def get_redis(decode_responses=False, timeout=3):
         decode_responses=decode_responses,
         socket_connect_timeout=timeout, socket_timeout=timeout,
     )
+
+
+def active_runs(client):
+    """run_ids of pipeline runs that sent a heartbeat recently (killed runs drop out)."""
+    import time
+    cutoff = time.time() - ACTIVE_STALE_S
+    client.zremrangebyscore(ACTIVE_KEY, 0, cutoff)
+    ids = client.zrangebyscore(ACTIVE_KEY, cutoff, "+inf")
+    return [i.decode() if isinstance(i, bytes) else i for i in ids]

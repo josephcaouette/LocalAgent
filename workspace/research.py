@@ -105,13 +105,13 @@ def reader_backend(caller):
     """Node 1 reads, unless a pipeline run is using it (then Node 3 does)."""
     if config.READER_BACKEND in ("node1", "node3"):
         return config.READER_BACKEND
-    if caller == "pipeline":
-        return "node1"   # the pipeline researches before planning, while Node 1 is free
     try:
-        status = config.get_redis(decode_responses=True, timeout=2).hget(config.LATEST_KEY, "status")
+        active = len(config.active_runs(config.get_redis(decode_responses=True, timeout=2)))
     except Exception:
-        status = None
-    return "node3" if status == "RUNNING" else "node1"
+        active = 0
+    # A run researches before it plans, so for it "busy" means another run is also going.
+    busy = active >= 2 if caller == "pipeline" else active >= 1
+    return "node3" if busy else "node1"
 
 
 def node_name(backend):

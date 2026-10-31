@@ -19,7 +19,22 @@ import urllib.request
 import config
 
 STATUS_COLORS = {"PASSED": "#4CAF50", "FAILED": "#f44336", "ERROR": "#e05cff",
-                 "RUNNING": "#ff9800", "PLANNED": "#ff9800"}
+                 "RUNNING": "#ff9800", "PLANNED": "#ff9800", "STOPPED": "#b0a060", "LOST": "#8a8a8a"}
+
+
+def fmt_secs(seconds):
+    try:
+        f = float(seconds)
+    except (TypeError, ValueError):
+        return ""
+    s = int(f)
+    if f < 10:
+        return f"{f:.1f}s"
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s // 3600}h {s % 3600 // 60:02d}m"
 
 _redis = None
 _backfilled = False
@@ -62,6 +77,8 @@ def fetch_tasks(limit):
     for key, _ in entries:
         pipe.hgetall(key)
     records = pipe.execute()
+    active = set(config.active_runs(r))
+    now = time.time()
     tasks, expired = [], []
     for (key, score), data in zip(entries, records):
         if not data:
@@ -69,6 +86,15 @@ def fetch_tasks(limit):
             continue
         data["_id"] = key.rsplit(":", 1)[-1]
         data["_started"] = int(float(data.get("started_at") or score or 0))
+        running = data["_id"] in active
+        if data.get("status") == "RUNNING" and not running and \
+                now - float(data.get("updated_at") or 0) > config.ACTIVE_STALE_S:
+            data["status"] = "LOST"           # its process ended without finishing
+        if data.get("elapsed_s"):
+            data["_took"] = fmt_secs(data["elapsed_s"])
+        elif data["_started"]:
+            end = now if running else float(data.get("updated_at") or data["_started"])
+            data["_took"] = fmt_secs(end - data["_started"])
         tasks.append(data)
     if expired:
         r.zrem(config.TASK_INDEX_KEY, *expired)
@@ -87,8 +113,17 @@ def render_row(t):
         status_html += f"<div class='sub'>{esc(t['phase'])}</div>"
     if t.get("attempt"):
         status_html += f"<div class='sub'>attempt {esc(t['attempt'])}</div>"
+    if t.get("_took"):
+        status_html += f"<div class='sub'>took {esc(t['_took'])}</div>"
     if t.get("memory_sync"):
         status_html += "<div class='sub'>memory updated</div>"
+    try:
+        timings = json.loads(t.get("timings") or "{}")
+    except ValueError:
+        timings = {}
+    steps = [f"{k} {fmt_secs(v)}" for k, v in timings.items() if float(v) >= 0.5]
+    if steps:
+        status_html += f"<div class='sub'>{esc(' · '.join(steps))}</div>"
 
     goal_html = ""
     if t.get("target_file"):

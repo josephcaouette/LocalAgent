@@ -33,7 +33,7 @@ SETTINGS_FILE = os.path.join(HERE, "launcher_settings.json")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
 GUI_PID_FILE = os.path.join(tempfile.gettempdir(), "agent_gui.pid")
-PIPELINE_PID_FILE = os.path.join(tempfile.gettempdir(), "agent_pipeline.pid")
+PIPELINE_PID_GLOB = os.path.join(tempfile.gettempdir(), "agent_pipeline*.pid")   # one per run
 LLM_URL = "http://127.0.0.1:8001"     # not "localhost": Windows tries IPv6 first (2 s delay)
 
 PRESETS = {
@@ -391,13 +391,22 @@ class Launcher:
         return v
 
     def apply_preset(self):
+        if self.v_preset.get() not in PRESETS:
+            return
         self._load_form(PRESETS[self.v_preset.get()])
         self.log(f"Loaded preset '{self.v_preset.get()}'. Start or restart vLLM to use it.")
+
+    @staticmethod
+    def preset_name(v):
+        """The preset these settings match exactly, or 'Custom'."""
+        return next((name for name, p in PRESETS.items()
+                     if all(v.get(k) == p[k] for k in p)), "Custom")
 
     def save_form(self, quiet=False):
         v = self.read_form()
         if v is None:
             return None
+        self.v_preset.set(self.preset_name(v))
         self.s["vllm"], self.s["preset"] = v, self.v_preset.get()
         save_settings(self.s)
         if not quiet:
@@ -494,9 +503,9 @@ class Launcher:
         if st["Redis"]:
             try:
                 import redis
-                st["last_run"] = redis.Redis(host=n2, socket_timeout=1, socket_connect_timeout=1,
-                                             decode_responses=True).hmget("workflow:langgraph:001",
-                                                                          "status", "phase", "target_file")
+                r = redis.Redis(host=n2, socket_timeout=1, socket_connect_timeout=1, decode_responses=True)
+                st["last_run"] = r.hmget("workflow:langgraph:001", "status", "phase", "target_file")
+                st["active_runs"] = r.zcount("workflow:active", time.time() - 120, "+inf")
             except Exception:
                 pass
         st["vllm_error"] = None
@@ -554,11 +563,14 @@ class Launcher:
         models = st["models"]
         self._set("Models", GREEN if models else ORANGE,
                   ", ".join(models) if models else ("none loaded (Warm up)" if models == [] else "unknown"))
-        lr = st["last_run"]
-        if lr and lr[0]:
-            color = {"PASSED": GREEN, "RUNNING": ORANGE}.get(lr[0], RED)
-            text = lr[0] + (f" - {lr[1]}" if lr[0] == "RUNNING" and lr[1] else "") + (f" ({lr[2]})" if lr[2] else "")
-            self._set("Last run", color, text)
+        lr, active = st["last_run"], st.get("active_runs", 0)
+        if active:
+            text = f"{active} running" + (f" - newest: {lr[1]} ({lr[2]})" if lr and lr[1] else "")
+            self._set("Last run", ORANGE, text)
+        elif lr and lr[0]:
+            status = "LOST" if lr[0] == "RUNNING" else lr[0]   # no heartbeat: its process is gone
+            color = {"PASSED": GREEN, "STOPPED": ORANGE, "LOST": GREY}.get(status, RED)
+            self._set("Last run", color, status + (f" ({lr[2]})" if lr[2] else ""))
         else:
             self._set("Last run", GREY, "none")
 
@@ -680,12 +692,13 @@ class Launcher:
         self.log("Opened the agent GUI.", "ok")
 
     def reset_pipeline(self):
-        if not messagebox.askyesno("Reset pipeline", "Stop the agent GUI and any running task, clear the "
-                                                     "last-run record, and reopen the GUI?"):
+        if not messagebox.askyesno("Reset pipeline", "Stop the agent GUI and every running task, clear "
+                                                     "their records and test containers, and reopen the GUI?"):
             return
 
         def work():
-            for pid_file in (GUI_PID_FILE, PIPELINE_PID_FILE):
+            import glob
+            for pid_file in [GUI_PID_FILE] + glob.glob(PIPELINE_PID_GLOB):
                 try:
                     with open(pid_file) as f:
                         pid = int(f.read().strip())
@@ -700,10 +713,21 @@ class Launcher:
                     pass
             try:
                 import redis
-                redis.Redis(host=self.s["node2_ip"], socket_timeout=3).delete("workflow:langgraph:001")
-                self.post("log", "Cleared the last-run record in Redis.")
+                r = redis.Redis(host=self.s["node2_ip"], socket_timeout=3, decode_responses=True)
+                # Mark every run still listed as running as stopped, so nothing shows as running.
+                stopped = 0
+                for key in r.zrevrange("workflow:tasks", 0, 50):
+                    if r.hget(key, "status") == "RUNNING":
+                        r.hset(key, mapping={"status": "STOPPED", "phase": "stopped by Reset pipeline"})
+                        stopped += 1
+                r.delete("workflow:langgraph:001", "workflow:active")
+                self.post("log", f"Cleared the run records in Redis ({stopped} marked stopped).")
             except Exception as e:
                 self.post("log", f"Couldn't clear Redis ({e}).", "err")
+            code, out = run_quiet(self.ssh(self.s["node2_ip"], "docker ps -aq --filter name=agent- | "
+                                           "xargs -r docker rm -f | wc -l"), timeout=60)
+            if code == 0:
+                self.post("log", f"Removed {out.strip() or 0} leftover test container(s) on Node 2.")
             time.sleep(1)
             self.post("call", self.open_agent_gui)
         self.in_thread(work)
