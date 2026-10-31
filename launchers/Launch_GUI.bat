@@ -6,8 +6,9 @@ echo ======================================================
 
 :: ---- vLLM settings ----
 :: Model: Qwen3.8-27B, Aug 2026, 4-bit build by Red Hat AI. Only 16 of its 64 layers keep a
-:: full KV cache, so context is cheap. Speculative decoding uses the model's own MTP head to
-:: draft 2 tokens per step: about 104 tok/s on this 4090, versus 27 for the old setup.
+:: full KV cache, so context is cheap. 16384 leaves room for 3+ requests at once, which best-of-N
+:: candidates need (20480 fits but leaves room for only one). Speculative decoding uses the
+:: model's own MTP head to draft 2 tokens per step: about 104 tok/s, versus 27 for the old setup.
 :: Memory: vLLM refuses to start if free VRAM is below VLLM_GPU_UTIL x 24 GB. WSL leaves about
 :: 22.45 GiB free, so 0.91 works and 0.95 never will. If startup ever reports too little free
 :: memory, set VLLM_GPU_UTIL=0.90 and VLLM_CTX=12288.

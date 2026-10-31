@@ -41,3 +41,18 @@ services:
       - /mnt/blackboard/config:/config:ro
     depends_on:
       - redis
+
+  # Private metasearch engine for the research feature (LAN only, JSON API on port 8888).
+  # Settings: docker/searxng/settings.yml. Secret key: /mnt/blackboard/config/searxng.env.
+  searxng:
+    image: searxng/searxng:latest
+    container_name: blackboard-searxng
+    restart: unless-stopped
+    ports:
+      - "8888:8080"
+    environment:
+      - SEARXNG_BASE_URL=http://192.168.254.25:8888/
+    env_file:
+      - /mnt/blackboard/config/searxng.env
+    volumes:
+      - /mnt/blackboard/docker/searxng:/etc/searxng

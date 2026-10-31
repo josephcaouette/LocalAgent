@@ -83,6 +83,12 @@ LLM_ENABLE_THINKING = False    # Qwen3.x reasons step by step before answering u
 LLM_TEMPERATURE = 0.7          # sampling values from the Qwen3.8 model card (non-thinking mode)
 LLM_TOP_P = 0.8
 LLM_TOP_K = 20
+# Where the pipeline lets the model think before answering (slower, better). Thinking calls use
+# the model card's thinking-mode sampling (temperature 0.6, top_p 0.95) and get THINK_TOKENS of
+# extra room. The engineer's thinking is set per run profile below.
+THINK_PLANNER = True
+THINK_VERIFIER = True
+THINK_TOKENS = 5000
 
 # --- Ollama on Node 3 (scout / condenser / ingest summaries / embeddings) ------
 # Who does the pipeline's helper jobs (the scout's brief on referenced files and the diagnosis
@@ -106,6 +112,17 @@ EMBED_DOCUMENT_PREFIX = ""
 OLLAMA_NUM_CTX = 8192      # keep identical everywhere (incl. Restart_Node3_Worker.bat) or Ollama reloads the model
 OLLAMA_KEEP_ALIVE = -1     # sent with every request; -1 keeps models loaded indefinitely
 
+# --- Web research (research.py) -------------------------------------------------
+SEARXNG_URL = f"http://{NODE2_IP}:8888"    # self-hosted SearXNG (docker-compose service)
+RESEARCH_ALLOWLIST_FILE = os.path.join(WORKSPACE, "research_allowlist.txt")
+READER_BACKEND = "auto"    # who reads pages, long attachments and long chats: "auto" = Node 1,
+                           # or Node 3 while a pipeline run is using Node 1; or "node1" / "node3"
+RESEARCH_MAX_PAGES = 5     # pages read per research request
+RESEARCH_FETCH_TIMEOUT = 15
+RESEARCH_MAX_PAGE_BYTES = 2_000_000
+RESEARCH_MAX_PAGE_CHARS = 60_000
+ATTACHMENT_COMPRESS_CHARS = 24_000   # attachments larger than this in total get condensed by the reader
+
 # --- Sandbox (fresh container per test run on Node 2) -------------------------
 SANDBOX_IMAGE = "agent-sandbox:latest"     # built from Z:\docker\sandbox\Dockerfile
 SANDBOX_PYTHON = "3.11"
@@ -114,8 +131,18 @@ SANDBOX_TIMEOUT = 20       # seconds the script may run
 SANDBOX_MEMORY = "1g"
 SANDBOX_CPUS = 2
 SANDBOX_PIDS = 128
-MAX_ATTEMPTS = 3
 KEEP_RUNS = 30             # per-run scratch folders kept in Z:\runs
+
+# --- Run profiles (GUI "Overnight run" checkbox, or --overnight) ----------------
+# candidates: how many versions the engineer writes at once; all are tested and the verifier
+# picks the best. think_engineer: "retries" = think only when fixing a failure, "always", "never".
+# A run stops as soon as a candidate passes, or when attempts or time run out.
+RUN_PROFILES = {
+    "normal":    {"max_attempts": 3, "candidates": 2, "time_limit_s": 30 * 60,
+                  "think_engineer": "retries"},
+    "overnight": {"max_attempts": 8, "candidates": 3, "time_limit_s": 12 * 3600,
+                  "think_engineer": "always"},
+}
 KEEP_HISTORY_PER_FILE = 20 # backups kept per file in .history
 
 # --- Dashboard ----------------------------------------------------------------
@@ -126,7 +153,7 @@ DASHBOARD_MAX_TASKS = 50
 # Infrastructure files the pipeline must never overwrite.
 PROTECTED_FILES = {
     "run_langgraph_pipeline.py", "agent_gui.py", "agent_dashboard.py",
-    "background_ingest.py", "config.py", "agent_common.py", "reindex_memory.py",
+    "background_ingest.py", "config.py", "agent_common.py", "reindex_memory.py", "research.py",
 }
 
 
