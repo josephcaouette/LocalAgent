@@ -147,8 +147,8 @@ RUN_PROFILES = {
 }
 KEEP_HISTORY_PER_FILE = 20 # backups kept per file in .history
 
-# How many runs the GUI's queue runs at the same time. vLLM serves them together, so two runs
-# finish close to twice as many tasks per hour as one, each about 10-15% slower.
+# How many runs the GUI's queue runs at the same time. vLLM serves them together, filling the GPU
+# while the other run plans or checks. Test: 3 runs took 5.6 min start to finish (8 min summed).
 MAX_PARALLEL_RUNS = 2
 
 # Test containers are started while the engineer writes, so a test doesn't wait ~7 s for one

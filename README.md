@@ -384,8 +384,9 @@ Measured on 2026-10-30:
   - Node 2's 64 GB and 24 threads are mostly idle too: its services use about 0.3 GB. Its 2013-era
     CPUs and DDR3 would run a model at only 1-2 tokens/s, so it stores, searches and tests instead.
 - **Two runs at once.** vLLM serves several requests together. One run fills the GPU only while it
-  writes candidates; during planning and checking, most of its capacity sits unused. A second run
-  fills that gap: each run is somewhat slower, but close to twice as many tasks finish per hour.
+  writes candidates; during planning and checking, most of its capacity sits unused, and a second
+  run fills that gap. In the first test, three queued runs (two at once, the third waiting) finished
+  in 5.6 minutes from start to finish, while their individual times add up to 8 minutes.
 - **Ready-made test containers.** Starting a container on Node 2's HDD array takes ~7 s; running a
   command in an already-started one takes ~0.1 s.
   - The pipeline starts each attempt's containers while the engineer is still writing, so a test
