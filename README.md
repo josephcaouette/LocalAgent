@@ -52,7 +52,9 @@ This repository is the share's root folder on Node 2. `.gitignore` allows only t
 - `docker/`: `docker-compose.yml` (Redis, Qdrant, SearXNG, dashboard), the sandbox image's
   Dockerfile and SearXNG's settings.
 - `launchers/`: the Agent Cluster window (`cluster_launcher/`), the fallback `.bat` files, Node 1's
-  WSL settings (`wslconfig.txt`) and `backup_node2.sh`.
+  WSL settings (`wslconfig.txt`), `backup_node2.sh`, and `cluster-ops/`: the Claude Code skill for
+  this cluster (layout, procedures, house rules, unit tests and benchmark scripts). It's installed
+  at `%USERPROFILE%\.claude\skills\cluster-ops\`, and `Backup_To_GitHub.bat` copies it here.
 - `config/`: a template for optional Redis and Qdrant passwords. Real secrets (`agent_secrets.env`,
   `searxng.env`) are never committed.
 - `memory_export/`: the long-term memory (summaries and code) as JSON.
@@ -620,6 +622,8 @@ databases, run folders, logs or secrets.
      `C:\AI\venvs\agent_brain\Scripts\pythonw.exe C:\AI\cluster_launcher\cluster_launcher.py`.
    - Optionally copy `launchers\*.bat` to the Desktop as fallbacks.
    - Copy `launchers\wslconfig.txt` to `%USERPROFILE%\.wslconfig`.
+   - Copy `launchers\cluster-ops\` to `%USERPROFILE%\.claude\skills\cluster-ops\` so Claude Code
+     knows the cluster.
 4. **Memory:** `python Z:\workspace\reindex_memory.py --import Z:\memory_export\agent_solutions.json`
 
 ## Troubleshooting

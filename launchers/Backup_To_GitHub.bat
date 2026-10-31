@@ -14,6 +14,8 @@ scp -q -o BatchMode=yes "%USERPROFILE%\.wslconfig" %NODE2%:/mnt/blackboard/launc
 :: The Agent Cluster window's code and settings live on C: so it works without Z:; back them up too.
 ssh -o BatchMode=yes %NODE2% "mkdir -p /mnt/blackboard/launchers/cluster_launcher"
 scp -q -o BatchMode=yes "C:\AI\cluster_launcher\cluster_launcher.py" "C:\AI\cluster_launcher\launcher_settings.json" %NODE2%:/mnt/blackboard/launchers/cluster_launcher/
+:: The cluster-ops skill (Claude Code instructions and test scripts for this cluster).
+if exist "%USERPROFILE%\.claude\skills\cluster-ops\SKILL.md" scp -q -r -o BatchMode=yes "%USERPROFILE%\.claude\skills\cluster-ops" %NODE2%:/mnt/blackboard/launchers/
 
 :: 2. First run only: ask which GitHub repository to back up to.
 set "REPO_URL="
