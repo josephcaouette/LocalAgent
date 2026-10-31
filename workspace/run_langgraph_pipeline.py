@@ -44,7 +44,9 @@ import shlex
 import shutil
 import subprocess
 import sys
+import random
 import tempfile
+import textwrap
 import threading
 import time
 import traceback
@@ -82,7 +84,7 @@ THINK_TOKENS = config.THINK_TOKENS                # replaced by the accuracy lev
 STEP_TIMES = {}        # step name -> seconds (summed over attempts)
 TOKENS = {}            # model role -> {"in": prompt tokens, "out": generated tokens}
 _stats_lock = threading.Lock()
-_llm_pool = ThreadPoolExecutor(max_workers=6)   # model calls that run beside each other
+_llm_pool = ThreadPoolExecutor(max_workers=10)  # model calls that run beside each other
 
 
 class LLMError(Exception):
@@ -106,7 +108,8 @@ class AgentState(TypedDict):
     attachment_names: list
     allow_network: bool
     research: bool
-    profile: str            # accuracy level: low, medium or high
+    profile: str            # accuracy level: low, medium, high, ultra or max
+    lvl: dict               # all of the level's settings (config.level_settings)
     max_attempts: int
     num_candidates: int
     think_engineer: str
@@ -116,10 +119,16 @@ class AgentState(TypedDict):
     critic_rounds: int
     critic_used: int
     repeat_tests: int
-    interface: str          # how tests can call the script (planned on High)
-    indep_test: str         # the independent acceptance test ("" = none)
-    indep_checks: list      # the checks it was written for
-    test_feedback: str      # a diagnosis saying the independent test itself was wrong
+    interface: str          # how tests can call the script (planned on High and above)
+    spec: str               # the reviewed spec (Ultra and MAX)
+    tests: dict             # independent tests by role ("acceptance", "adversarial") -> full file
+    test_checks: dict       # role -> the checks that test was written for
+    test_feedback: dict     # role -> a diagnosis saying that test itself was wrong
+    failed_test: str        # which test file failed last ("acceptance", "adversarial", "regression")
+    regression: list        # proven reviewer findings and mutation checks: [{"name", "code"}]
+    probe: str              # the prober's probe file for comparing candidates ("" = none)
+    probe_verdicts: dict    # the referee's decisions on disputed probe answers, reused later
+    mutation_done: bool
     retest: bool            # the diagnosis blamed only the test: fix it and re-test the same code
     retests_used: int
     best_passed: dict       # the last version that passed, kept while the reviewer's fixes run
@@ -477,9 +486,63 @@ def test_header(target):
     return TEST_HEADER.replace("{target}", target)
 
 
-def test_body(state):
-    """The independent test without the header the pipeline added."""
-    return state["indep_test"][len(test_header(state["target_file"])):]
+# Independent tests by role. Each is written without seeing the code; regression_test.py collects
+# proven reviewer findings and mutation checks (built by the pipeline, see regression_file()).
+TEST_FILES = {"acceptance": "acceptance_test.py", "adversarial": "adversarial_test.py"}
+REGRESSION_FILE = "regression_test.py"
+TEST_LABELS = {"acceptance": "the independent acceptance test", "adversarial": "the adversarial test",
+               "regression": "the regression tests (proven earlier findings)"}
+
+
+def active_roles(state):
+    roles = ["acceptance"] if state["tester"] else []
+    if state["lvl"]["adversary"]:
+        roles.append("adversarial")
+    return roles
+
+
+def test_body(state, role="acceptance"):
+    """An independent test without the header the pipeline added."""
+    return state["tests"].get(role, "")[len(test_header(state["target_file"])):]
+
+
+def regression_file(state):
+    """One file that runs every kept regression check, reporting each, and fails if any fails."""
+    if not state["regression"]:
+        return ""
+    parts = [test_header(state["target_file"]),
+             "_failures = []\n\n\ndef _check(name, fn):\n    try:\n        fn()\n        print('PASS:', name)\n"
+             "    except Exception as e:  # report every check, then fail at the end\n"
+             "        _failures.append(name)\n        print('FAIL:', name, '-', type(e).__name__, e)\n"]
+    for i, item in enumerate(state["regression"], 1):
+        body = textwrap.indent(item["code"].strip() or "pass", "    ")
+        parts.append(f"\n\ndef _regression_{i}():\n{body}\n")
+    calls = "".join(f"_check({item['name']!r}, _regression_{i})\n" for i, item in enumerate(state["regression"], 1))
+    parts.append("\n\n" + calls + "_sys.exit(1 if _failures else 0)\n")
+    return "".join(parts)
+
+
+def write_test_files(state, folder, tests=None, regression=None):
+    """Put the independent tests and the regression file into a candidate's folder."""
+    tests = state["tests"] if tests is None else tests
+    for role, code in tests.items():
+        if code:
+            with open(os.path.join(folder, TEST_FILES[role]), "w", encoding="utf-8", newline="\n") as f:
+                f.write(code)
+    reg = regression_file(dict(state, regression=state["regression"] if regression is None else regression))
+    if reg:
+        with open(os.path.join(folder, REGRESSION_FILE), "w", encoding="utf-8", newline="\n") as f:
+            f.write(reg)
+
+
+def snippet_ok(code):
+    """A reviewer or tester snippet compiles when wrapped in a function (and uses no undefined names)."""
+    wrapped = test_header("x.py") + "def _f():\n" + textwrap.indent(code.strip() or "pass", "    ") + "\n"
+    try:
+        compile(wrapped, "snippet", "exec")
+    except SyntaxError:
+        return False
+    return not static_problems(wrapped, "snippet")
 
 
 def parse_json_object(text):
@@ -742,16 +805,61 @@ def _docker_run(name, remote_dir, allow_network, extra, command):
     return cmd.replace("docker run ", 'docker run --user "$(id -u):$(id -g)" ', 1)
 
 
-def _test_command(target):
-    return ["timeout", "-k", "3", str(config.SANDBOX_TIMEOUT), "python3", target, "--test"]
+def test_timeout(state):
+    return state["lvl"]["test_timeout"]
+
+
+def _test_command(state, target):
+    """The script's own self-test. Absolute paths, so it also works when run from another folder."""
+    return ["timeout", "-k", "3", str(test_timeout(state)), "python3", f"/work/{target}", "--test"]
+
+
+def file_command(state, name):
+    return ["timeout", "-k", "3", str(test_timeout(state)), "python3", f"/work/{name}"]
+
+
+# A "box" is one folder under Z:\runs\<run>\ with its own container: a candidate (a<A>c<K>), a set
+# of proof tests (proofs-r<N>), a mutant (mut-<N>)...
+def box_dir(state, box):
+    return os.path.join(config.RUNS_DIR, state["run_id"], box)
+
+
+def box_remote(state, box):
+    return f"{config.REMOTE_RUNS_DIR}/{state['run_id']}/{box}"
+
+
+def box_container(state, box):
+    return f"agent-{state['run_id']}-{box}"
+
+
+def cand_box(attempt, k):
+    return f"a{attempt}c{k}"
 
 
 def container_name(state, attempt, k):
-    return f"agent-{state['run_id']}-a{attempt}c{k}"
+    return box_container(state, cand_box(attempt, k))
 
 
 def remote_cand_dir(state, attempt, k):
-    return f"{config.REMOTE_RUNS_DIR}/{state['run_id']}/a{attempt}c{k}"
+    return box_remote(state, cand_box(attempt, k))
+
+
+# Repeat runs on Ultra and MAX vary the environment: time zone (POSIX strings, no tz data needed),
+# locale, hash seed and working folder. The first entry is the normal run.
+ENV_VARIANTS = [
+    ({}, None),
+    ({"TZ": "XST-5:30", "LC_ALL": "C"}, "/tmp"),
+    ({"TZ": "PST8PDT,M3.2.0,M11.1.0", "LC_ALL": "C.UTF-8", "PYTHONHASHSEED": "1"}, None),
+    ({"TZ": "CHAST-12:45", "PYTHONHASHSEED": "2"}, "/tmp"),
+    ({"TZ": "UTC0", "LC_ALL": "C"}, None),
+]
+
+
+def env_label(env, workdir):
+    parts = [f"{k}={v}" for k, v in env.items()]
+    if workdir:
+        parts.append(f"run from {workdir}")
+    return ", ".join(parts) or "normal settings"
 
 
 _warm = {}                                     # (run_id, attempt) -> (Future of the warm-up, n)
@@ -778,6 +886,8 @@ def discard_containers(state, attempt, n):
     """Remove an attempt's containers in the background, once any early start-up has finished."""
     entry = _warm.pop((state["run_id"], attempt), None)
     names = " ".join(container_name(state, attempt, k) for k in range(1, n + 1))
+    with _started_lock:
+        _started_boxes.difference_update(cand_box(attempt, k) for k in range(1, n + 1))
 
     def work():
         if entry is not None:
@@ -822,14 +932,28 @@ def warm_ready(state, attempt):
 _NOT_WARM = ("No such container", "is not running", "container not found")
 
 
-def _start_container(state, attempt, k):
-    """Start this candidate's container now (when it wasn't prepared early, or has gone)."""
-    name = container_name(state, attempt, k)
-    res = run_ssh(_docker_run(name, remote_cand_dir(state, attempt, k), state["allow_network"],
+_started_boxes = set()           # containers started on demand (not prepared early)
+_started_lock = threading.Lock()
+
+
+def start_box(state, box):
+    """Start a box's container now (it wasn't prepared early, or has gone)."""
+    res = run_ssh(_docker_run(box_container(state, box), box_remote(state, box), state["allow_network"],
                               ["-d"], ["sleep", "3600"]) + " >/dev/null", 120)
     err = (res.stderr or res.stdout or "").strip()
     if res.returncode != 0 and not ("Conflict" in err and "already in use" in err):
         raise InfraError(f"the sandbox container couldn't start (exit {res.returncode}): {err[-600:]}")
+    with _started_lock:
+        _started_boxes.add(box)
+
+
+def remove_boxes(state, boxes):
+    """Remove containers started for extra jobs (proof tests, mutants) in the background."""
+    names = " ".join(box_container(state, b) for b in boxes)
+    if names:
+        _cleanup_pool.submit(lambda: run_ssh(f"docker rm -f {names} >/dev/null 2>&1; true", 60))
+    with _started_lock:
+        _started_boxes.difference_update(boxes)
 
 
 def _gone(res):
@@ -839,21 +963,30 @@ def _gone(res):
             and any(m in first for m in _NOT_WARM))
 
 
-def run_in_container(state, attempt, k, args):
-    """Run a command in this candidate's own container, starting the container if needed."""
-    name = container_name(state, attempt, k)
-    cmd = f"docker exec {name} " + " ".join(shlex.quote(a) for a in args)
-    if not warm_ready(state, attempt):
-        _start_container(state, attempt, k)
-    res = run_ssh(cmd, timeout=config.SANDBOX_TIMEOUT + 45)
+def run_in_box(state, box, args, env=None, workdir=None, prepared=False):
+    """Run a command in a box's own container, starting the container if needed."""
+    opts = "".join(f" -e {shlex.quote(f'{key}={value}')}" for key, value in (env or {}).items())
+    if workdir:
+        opts += f" -w {shlex.quote(workdir)}"
+    cmd = f"docker exec{opts} {box_container(state, box)} " + " ".join(shlex.quote(a) for a in args)
+    with _started_lock:
+        started = box in _started_boxes
+    if not prepared and not started:
+        start_box(state, box)
+    res = run_ssh(cmd, timeout=test_timeout(state) + 45)
     if _gone(res):
-        print(f"    [i] Candidate {k}: its container was gone; starting a fresh one.")
-        _start_container(state, attempt, k)
-        res = run_ssh(cmd, timeout=config.SANDBOX_TIMEOUT + 45)
+        print(f"    [i] {box}: its container was gone; starting a fresh one.")
+        start_box(state, box)
+        res = run_ssh(cmd, timeout=test_timeout(state) + 45)
     if res.returncode in (125, 126, 127, 255) and any(m in (res.stderr or "") for m in _INFRA_MARKERS):
         raise InfraError(f"couldn't run the test on Node 2 (exit {res.returncode}): "
                          f"{(res.stderr or '').strip()[-600:]}")
     return res
+
+
+def run_in_container(state, attempt, k, args, env=None, workdir=None):
+    """Run a command in a candidate's container (prepared early when possible)."""
+    return run_in_box(state, cand_box(attempt, k), args, env, workdir, prepared=warm_ready(state, attempt))
 
 
 _FAIL_LINE = re.compile(r"\bFAIL|\bFAILED\b|AssertionError|\bassert\b|Traceback|Error:", re.IGNORECASE)
@@ -866,11 +999,12 @@ def failure_lines(out, limit=2000):
     return head("\n".join(lines), limit)
 
 
-def run_error(res, elapsed, what):
+def run_error(res, elapsed, what, limit=None):
     """'' if the run passed, otherwise what went wrong (for the engineer)."""
     out, err, rc = res.stdout or "", res.stderr or "", res.returncode
-    if rc == 124 or (rc == 137 and elapsed >= config.SANDBOX_TIMEOUT):
-        return (f"{what} ran longer than {config.SANDBOX_TIMEOUT} seconds and was stopped. It must "
+    limit = limit or config.SANDBOX_TIMEOUT
+    if rc == 124 or (rc == 137 and elapsed >= limit):
+        return (f"{what} ran longer than {limit} seconds and was stopped. It must "
                 "finish quickly on its own (no endless loops, no waiting for input).\n"
                 f"STDOUT (tail):\n{tail(out, 1500)}\nSTDERR (tail):\n{tail(err, 1500)}")
     if rc == 137:
@@ -887,51 +1021,71 @@ def run_error(res, elapsed, what):
     return ""
 
 
-INDEP_FILE = "acceptance_test.py"
+def test_files_in(folder):
+    """The independent test files present in a candidate folder, in the order they run."""
+    order = [(role, name) for role, name in TEST_FILES.items()] + [("regression", REGRESSION_FILE)]
+    return [(role, name) for role, name in order if os.path.exists(os.path.join(folder, name))]
+
+
+def run_all_tests(state, box, target, files, env=None, workdir=None, prepared=False):
+    """The script's own --test, then each independent test. Returns (error, failed_role, outputs)
+    where outputs maps "self" and each role to (rc, stdout, stderr)."""
+    outputs = {}
+    t0 = time.time()
+    res = run_in_box(state, box, _test_command(state, target), env, workdir, prepared)
+    outputs["self"] = (res.returncode, res.stdout or "", res.stderr or "", time.time() - t0)
+    error = run_error(res, time.time() - t0, f"python3 {target} --test", test_timeout(state))
+    if error:
+        return error, "self", outputs
+    for role, name in files:
+        t0 = time.time()
+        r = run_in_box(state, box, file_command(state, name), env, workdir, prepared)
+        outputs[role] = (r.returncode, r.stdout or "", r.stderr or "", time.time() - t0)
+        e = run_error(r, time.time() - t0, TEST_LABELS[role].capitalize(), test_timeout(state))
+        if e:
+            if role == "regression":
+                return ("The script's own --test passed, but it fails checks that were proven earlier in "
+                        "this run (reviewer findings shown to be real, and mutation checks).\n" + e), role, outputs
+            return (f"The script's own --test passed, but {TEST_LABELS[role]} (written separately, from the "
+                    "goal and checks only, without seeing the code) failed.\n" + e), role, outputs
+    return "", "", outputs
 
 
 def run_candidate(state, cand):
-    """Test one staged candidate in its own container: its own --test, then the independent
-    acceptance test (High), then repeat runs (Medium and High). Returns it with results added."""
+    """Test one staged candidate in its own container: its own --test, then the independent tests
+    (High and above), then repeat runs (Medium and above, in varied environments on Ultra and MAX).
+    Returns it with results added."""
     attempt, target, k = state["attempt"], state["target_file"], cand["k"]
-    result = dict(cand, rc=None, stdout="", stderr="", elapsed=0.0, indep_rc=None, indep_stdout="",
-                  indep_stderr="", indep_failed=False, exec_ok=False)
-    has_indep = bool(state["indep_test"]) and os.path.exists(os.path.join(cand_dir(state, attempt, k), INDEP_FILE))
-    indep_cmd = ["timeout", "-k", "3", str(config.SANDBOX_TIMEOUT), "python3", INDEP_FILE]
+    box = cand_box(attempt, k)
+    result = dict(cand, rc=None, stdout="", stderr="", elapsed=0.0, tests_out={}, failed_test="",
+                  indep_failed=False, exec_ok=False, indep_stdout="")
+    files = test_files_in(box_dir(state, box))
+    prepared = warm_ready(state, attempt)
     started = time.time()
     try:
-        res = run_in_container(state, attempt, k, _test_command(target))
-        result.update(rc=res.returncode, stdout=res.stdout or "", stderr=res.stderr or "",
-                      elapsed=time.time() - started)
-        error = run_error(res, result["elapsed"], f"python3 {target} --test")
-        if not error and has_indep:
-            t0 = time.time()
-            r2 = run_in_container(state, attempt, k, indep_cmd)
-            result.update(indep_rc=r2.returncode, indep_stdout=r2.stdout or "", indep_stderr=r2.stderr or "")
-            e2 = run_error(r2, time.time() - t0, "The independent acceptance test")
-            if e2:
-                result["indep_failed"] = True
-                error = ("The script's own --test passed, but the independent acceptance test (written "
-                         "separately, from the goal and checks only) failed.\n" + e2)
+        error, failed, outputs = run_all_tests(state, box, target, files, prepared=prepared)
+        rc, out, err, secs = outputs["self"]
+        result.update(rc=rc, stdout=out, stderr=err, elapsed=secs, failed_test=failed,
+                      indep_failed=failed in TEST_FILES,
+                      tests_out={r: o for r, o in outputs.items() if r != "self"})
+        result["indep_stdout"] = "\n".join(f"--- {TEST_LABELS[r]} ---\n{o[1]}" for r, o in result["tests_out"].items())
         for i in range(2, state["repeat_tests"] + 1):
             if error:
                 break
-            t0 = time.time()
-            r3 = run_in_container(state, attempt, k, _test_command(target))
-            e3 = run_error(r3, time.time() - t0, f"python3 {target} --test")
-            if not e3 and has_indep:
-                t0 = time.time()
-                e3 = run_error(run_in_container(state, attempt, k, indep_cmd), time.time() - t0,
-                               "The independent acceptance test")
-            if e3:
-                error = (f"The tests passed the first time but failed on repeat run {i}. Results must not "
-                         "depend on randomness, timing, or files left behind by an earlier run.\n" + e3)
+            env, workdir = ENV_VARIANTS[(i - 1) % len(ENV_VARIANTS)] if state["lvl"]["vary_env"] else ({}, None)
+            e, failed, _ = run_all_tests(state, box, target, files, env, workdir, prepared)
+            if e:
+                where = f" (run with {env_label(env, workdir)})" if env or workdir else ""
+                error = (f"The tests passed the first time but failed on repeat run {i}{where}. Results must "
+                         "not depend on randomness, timing, the time zone, the locale, the current folder, "
+                         "or files left behind by an earlier run.\n" + e)
+                result["failed_test"] = failed
     except subprocess.TimeoutExpired:
         try:
             run_ssh(f"docker rm -f {container_name(state, attempt, k)}", timeout=30)
         except Exception:
             pass
-        error = (f"A test run didn't finish within {config.SANDBOX_TIMEOUT} seconds and was killed. "
+        error = (f"A test run didn't finish within {test_timeout(state)} seconds and was killed. "
                  "Tests must exit on their own: no endless loops, no waiting for input or network.")
         result["elapsed"] = time.time() - started
     result.update(exec_ok=not error, exec_error=error)
@@ -941,6 +1095,9 @@ def run_candidate(state, cand):
 # --------------------------------------------------------------------------- graph nodes
 
 def memory_retriever_node(state):
+    if NO_MEMORY:
+        print("\n[Node: Memory Retriever] Skipped (--no-memory): no past solutions as examples.")
+        return {"memory_context": "", "memory_summary": ""}
     lines = ["\n[Node: Memory Retriever] Searching Qdrant for similar past solutions..."]
     try:
         vector = embed(state["goal"][:2000], "query")
@@ -1055,7 +1212,7 @@ def planner_node(state):
         + ('{"steps": ["...", "..."], "checks": ["...", "..."], "interface": "..."}\n' if state["tester"]
            else '{"steps": ["...", "..."], "checks": ["...", "..."]}\n')
         + "- steps: 3-5 concrete implementation steps.\n"
-        f"- checks: 2-4 acceptance checks a reviewer can confirm from the script's stdout and exit "
+        f"- checks: 2-{state['lvl']['max_checks']} acceptance checks a reviewer can confirm from the script's stdout and exit "
         f"code when it runs as `python3 {target} --test` in an isolated sandbox ({network}; "
         f"Python {config.SANDBOX_PYTHON} standard library plus {', '.join(config.SANDBOX_PACKAGES)}). "
         "Each check must be specific and observable, e.g. 'prints one line per host with UP or DOWN'. "
@@ -1082,23 +1239,80 @@ def planner_node(state):
                       "testable Python utilities.", blocks, want_out=1500 if state["tester"] else 1000,
                       min_out=300, think=think)
     data = parse_json_object(raw) or {}
+    max_checks = state["lvl"]["max_checks"]
     steps = [str(s).strip() for s in data.get("steps") or [] if str(s).strip()]
-    checks = [str(c).strip() for c in data.get("checks") or [] if str(c).strip()][:4]
-    interface = data.get("interface") or ""
-    if isinstance(interface, dict):
-        interface = "\n".join(f"{k}: {v}" for k, v in interface.items())
-    elif isinstance(interface, list):
-        interface = "\n".join(str(i) for i in interface)
-    interface = str(interface).strip()
+    checks = [str(c).strip() for c in data.get("checks") or [] if str(c).strip()][:max_checks]
+    interface = as_text(data.get("interface"))
     plan = numbered(steps) if steps else raw
+    spec = ""
+    if state["lvl"]["spec_review"]:
+        spec, plan, checks, interface = review_spec(state, plan, checks, interface)
     print("\n" + "=" * 20 + " ARCHITECT EXECUTION PLAN " + "=" * 20)
     print(plan)
     print("Acceptance checks:\n" + (numbered(checks) if checks else "(none parsed; the verifier will judge against the goal)"))
     if interface:
         print("Interface:\n" + interface)
+    if spec:
+        print("Spec (reviewed):\n" + spec)
     print("=" * 66)
-    report(state, phase="planned", plan=plan, checks=checks, interface=interface)
-    return {"plan": plan, "checks": checks, "interface": interface}
+    report(state, phase="planned", plan=plan, checks=checks, interface=interface, spec=spec)
+    return {"plan": plan, "checks": checks, "interface": interface, "spec": spec}
+
+
+def as_text(value):
+    """A model's JSON field as plain text (it may come back as a dict or a list)."""
+    if isinstance(value, dict):
+        return "\n".join(f"{k}: {v}" for k, v in value.items()).strip()
+    if isinstance(value, list):
+        return "\n".join(str(i) for i in value).strip()
+    return str(value or "").strip()
+
+
+SPEC_SYSTEM = ("You are a meticulous requirements analyst. You turn a plan into a precise, testable "
+               "specification and fix the plan's mistakes. Reply with JSON only.")
+
+
+def review_spec(state, plan, checks, interface):
+    """Ultra and MAX: write a precise spec and correct the plan, checks and interface before any
+    code exists, while a misunderstanding is still cheap. Falls back to the plan as it was."""
+    print("\n[Node: Spec Reviewer] Writing a precise spec and checking the plan against the goal "
+          "(thinking first)...")
+    report(state, phase="reviewing the plan")
+    instructions = (
+        'Return ONLY this JSON object: {"spec": "...", "steps": ["..."], "checks": ["..."], "interface": "..."}\n'
+        "- spec: the exact behaviour the script must have: inputs and their formats, outputs, error "
+        "cases (what is raised or printed, and exit codes), and how every rule in the goal applies, "
+        "including any standard conventions the goal relies on (state each convention precisely). "
+        "List the tricky cases with their exact expected behaviour, but only results you are certain "
+        "of; mark anything you are unsure about as ASSUMPTION. Be concise.\n"
+        f"- steps, checks, interface: the plan's, corrected where they are wrong, ambiguous or "
+        f"incomplete. Up to {state['lvl']['max_checks']} checks, each observable in the --test output.\n"
+        "Judge everything against the goal itself: the plan may be wrong.")
+    blocks = [block("Goal:", state["goal"]),
+              block(WEB_TITLE, state["web_brief"], trim=2),
+              block("Plan:", plan), block("Acceptance checks:", numbered(checks)),
+              block("Interface:", interface),
+              block("Instructions:", instructions)]
+    try:
+        raw, _ = llm_chat("Spec reviewer", SPEC_SYSTEM, blocks, want_out=3000, min_out=800, think=True)
+    except ContextTooSmall as e:
+        print(f"-> Spec review skipped ({short(e)}).")
+        return "", plan, checks, interface
+    data = parse_json_object(raw) or {}
+    spec = as_text(data.get("spec"))
+    if not spec:
+        print("-> The review didn't come back as expected; keeping the plan as it was.")
+        return "", plan, checks, interface
+    steps = [str(s).strip() for s in data.get("steps") or [] if str(s).strip()]
+    new_checks = [str(c).strip() for c in data.get("checks") or [] if str(c).strip()][:state["lvl"]["max_checks"]]
+    new_interface = as_text(data.get("interface"))
+    changed = []
+    if new_checks and new_checks != checks:
+        changed.append("checks")
+    if new_interface and new_interface != interface:
+        changed.append("interface")
+    print(f"-> Spec written{'; corrected the ' + ' and '.join(changed) if changed else ''}.")
+    return (spec, numbered(steps) if steps else plan, new_checks or checks, new_interface or interface)
 
 
 def engineer_system(state):
@@ -1111,7 +1325,9 @@ def engineer_system(state):
         f"- Reply with the COMPLETE file in a single {TICK3}python fenced block and nothing else.\n"
         f"- It must run unattended as `python3 {state['target_file']} --test`: no prompts, no required "
         f"arguments, no GUI, no endless loops. In --test mode it must finish within "
-        f"{config.SANDBOX_TIMEOUT} seconds.\n"
+        f"{test_timeout(state)} seconds"
+        + (", from any working folder, in any time zone and locale" if state["lvl"]["vary_env"] else "")
+        + ".\n"
         "- In --test mode, print clear evidence for each acceptance check to stdout.\n"
         "- Exit with a non-zero status when something fails. Never hide failures behind broad "
         "try/except blocks, and never fake results (for example hardcoding success instead of "
@@ -1140,71 +1356,175 @@ APPROACHES = [
 
 TESTER_SYSTEM = ("You are an expert test engineer. You write independent acceptance tests from a "
                  "specification, without seeing the implementation.")
+ADVERSARY_SYSTEM = ("You are an adversarial tester. Your job is to find inputs that break a script, "
+                    "working only from its specification; you never see the implementation.")
+ROLE_NAMES = {"acceptance": "Tester", "adversarial": "Adversary"}
 
 
-def write_independent_test(state):
-    """High: a separate call writes acceptance_test.py from the goal, checks and interface only
-    (it never sees the code). Returns the full test file, or "" if none could be written."""
-    target = state["target_file"]
+def setup_note():
+    return ("The pipeline puts setup code in front of your file. It provides `target` (the script, "
+            "imported as a module without running its main block) and `run_script(*args, input=None, "
+            "timeout=15)`, which runs the script as a separate process and returns a "
+            "subprocess.CompletedProcess with text stdout and stderr. Don't repeat that setup.\n")
+
+
+def write_test(state, role="acceptance"):
+    """A separate call writes an independent test from the goal, spec, checks and interface only
+    (it never sees the code). "acceptance" checks the goal (on Ultra and MAX also against a simple
+    reference, and with property checks); "adversarial" (MAX) tries to break the script.
+    Returns the full test file, or "" if none could be written."""
+    target, name = state["target_file"], ROLE_NAMES[role]
     network = ("The sandbox can reach the LAN." if state["allow_network"] else
                "The sandbox has NO network access.")
-    instructions = (
-        f"Write an independent acceptance test for {target}, based only on the goal, the acceptance "
-        "checks and the interface. You have not seen the implementation.\n"
-        "The pipeline puts setup code in front of your file. It provides `target` (the script, "
-        "imported as a module without running its main block) and `run_script(*args, input=None, "
-        "timeout=15)`, which runs the script as a separate process and returns a "
-        "subprocess.CompletedProcess with text stdout and stderr. Don't repeat that setup.\n"
+    common = (
         f"- Use the Python {config.SANDBOX_PYTHON} standard library plus {', '.join(config.SANDBOX_PACKAGES)} "
-        f"only. {network} No display. The whole test must finish within {config.SANDBOX_TIMEOUT - 5} seconds. "
-        "Write scratch files only to the current folder or /tmp.\n"
-        "- Prefer checks that need no hand calculation: round trips, invariants, comparison with a "
-        "simple obviously-correct reference written in the test, and known values you are certain "
-        "of. Double-check every hand-computed expected value against the goal.\n"
-        "- Don't test exact wording or formatting unless the goal or interface specifies it.\n"
+        f"only. {network} No display. The whole test must finish within {test_timeout(state) - 5} seconds. "
+        "Write scratch files only to /tmp.\n"
+        "- Don't test exact wording or formatting unless the goal, spec or interface specifies it.\n"
         "- Print one line per check (\"PASS: ...\" or \"FAIL: ... expected X, got Y\"), then exit with "
         "status 1 if any check failed and 0 otherwise. Let unexpected exceptions propagate.\n"
-        "- Keep it compact (well under 200 lines): cover every acceptance check and the riskiest "
-        "edge cases rather than many similar examples.\n"
-        f"Reply with only the test code in one {TICK3}python block."
-    )
+        "- Keep it compact (well under 200 lines).\n"
+        f"Reply with only the test code in one {TICK3}python block.")
+    if role == "adversarial":
+        system = ADVERSARY_SYSTEM
+        instructions = (
+            f"Write a test that tries hard to break {target}, using only behaviour the goal, spec and "
+            "interface define. You have not seen the implementation.\n" + setup_note()
+            + "- Go for boundaries, off-by-one positions, empty and minimal input, the largest valid "
+              "input that still runs quickly, invalid input that must be rejected in the documented way, "
+              "and unusual but valid combinations of features.\n"
+              "- Never assert behaviour the goal leaves undefined. Double-check every expected value "
+              "against the goal; a wrong expectation is worse than a missing check.\n" + common)
+    else:
+        system = TESTER_SYSTEM
+        reference = ""
+        if state["lvl"]["reference_tests"]:
+            reference = (
+                "- Where feasible, write a simple, slow, obviously correct reference implementation inside "
+                "the test (brute force is fine) and compare the script with it on many generated inputs "
+                "(fixed random seed, within the time limit). Add property checks that must always hold "
+                "and need no hand calculation.\n")
+        instructions = (
+            f"Write an independent acceptance test for {target}, based only on the goal, the spec, the "
+            "acceptance checks and the interface. You have not seen the implementation.\n" + setup_note()
+            + "- Prefer checks that need no hand calculation: round trips, invariants, comparison with a "
+              "simple obviously-correct reference written in the test, and known values you are certain "
+              "of. Double-check every hand-computed expected value against the goal.\n"
+            + reference + "- Cover every acceptance check and the riskiest edge cases rather than many "
+              "similar examples.\n" + common)
     blocks = [
         block("Goal:", state["goal"]),
         block("Script under test:", target),
+        block("Spec (reviewed; judge against the goal if they disagree):", state["spec"], trim=3),
         block("Acceptance checks:", numbered(state["checks"]) or "(none; test the goal directly)"),
         block("Interface:", state["interface"] or "(not specified; infer the obvious interface from the goal)"),
     ]
-    if state["indep_test"]:
+    if state["tests"].get(role):
         update = "Update this test so it covers every acceptance check above. Keep the parts that are right."
-        if state["test_feedback"]:
+        feedback = state["test_feedback"].get(role, "")
+        if feedback:
             update = ("A diagnosis found that this test itself was wrong (see below). Fix the test, "
-                      "and make sure it covers every acceptance check above. Keep the parts that are right.")
-        blocks += [block("Your previous test:", test_body(state), trim=2, code=True, min_chars=2000),
-                   block("Diagnosis of the last failure:", state["test_feedback"], trim=1, keep="tail"),
+                      "and make sure it still covers the acceptance checks. Keep the parts that are right.")
+        blocks += [block("Your previous test:", test_body(state, role), trim=2, code=True, min_chars=2000),
+                   block("Diagnosis of the last failure:", feedback, trim=1, keep="tail"),
                    block("Task:", update)]
     blocks.append(block("Instructions:", instructions))
     try:
         # answer room first (min_out), so the thinking can't squeeze the test until it's cut off
-        raw, finish = llm_chat("Tester", TESTER_SYSTEM, blocks, want_out=5000, min_out=4000, think=True)
+        raw, finish = llm_chat(name, system, blocks, want_out=5000, min_out=4000, think=True)
         if finish == "length":
-            print("    [i] Tester: the test was cut off; writing it again without thinking.")
-            raw, finish = llm_chat("Tester", TESTER_SYSTEM, blocks, want_out=6000, min_out=3000, think=False)
+            print(f"    [i] {name}: the test was cut off; writing it again without thinking.")
+            raw, finish = llm_chat(name, system, blocks, want_out=6000, min_out=3000, think=False)
     except ContextTooSmall as e:
-        print(f"    [!] Tester: {short(e)}; continuing without an independent test this attempt.")
+        print(f"    [!] {name}: {short(e)}; continuing without this test this attempt.")
         return ""
     code, _ = extract_code(raw)
     if finish == "length" or not code.strip():
-        print("    [!] Tester: no complete test came back; continuing without one this attempt.")
+        print(f"    [!] {name}: no complete test came back; continuing without it this attempt.")
         return ""
     full = test_header(target) + code.strip() + "\n"
     try:
-        compile(full, INDEP_FILE, "exec")
+        compile(full, TEST_FILES[role], "exec")
     except SyntaxError as e:
-        print(f"    [!] Tester: the test doesn't compile (line {e.lineno}: {e.msg}); skipping it this attempt.")
+        print(f"    [!] {name}: the test doesn't compile (line {e.lineno}: {e.msg}); skipping it this attempt.")
         return ""
-    problems = static_problems(full, INDEP_FILE)
+    problems = static_problems(full, TEST_FILES[role])
     if problems:
-        print(f"    [!] Tester: the test uses undefined names ({problems[0]}); skipping it this attempt.")
+        print(f"    [!] {name}: the test uses undefined names ({problems[0]}); skipping it this attempt.")
+        return ""
+    return full
+
+
+PROBE_FILE = "probe_cases.py"
+PROBE_RUNNER = '''
+
+# --- added by the pipeline: run every case and print the results as one JSON line ---
+import json as _json
+
+
+def _canon(x):
+    if isinstance(x, (list, tuple)):
+        return [_canon(i) for i in x]
+    if isinstance(x, dict):
+        return {str(k): _canon(v) for k, v in sorted(x.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(x, (set, frozenset)):
+        return sorted((_canon(i) for i in x), key=repr)
+    if x is None or isinstance(x, (str, int, float, bool)):
+        return x
+    return repr(x)
+
+
+if __name__ == "__main__":
+    _results = []
+    for _case in CASES:
+        try:
+            _results.append(_canon(run(_case)))
+        except Exception as _e:   # an exception is a result too (compared by its type)
+            _results.append({"raised": type(_e).__name__})
+    print("PROBE-CASES:" + _json.dumps([repr(c)[:300] for c in CASES]))
+    print("PROBE-RESULTS:" + _json.dumps(_results))
+'''
+PROBER_SYSTEM = ("You design probe inputs that reveal differences between several implementations of "
+                 "the same specification. You never see the implementations.")
+
+
+def write_probe(state):
+    """Ultra and MAX: probe inputs every passing candidate answers, so they can be compared. The
+    pipeline adds the runner. Returns the full probe file, or "" if none could be written."""
+    target = state["target_file"]
+    instructions = (
+        f"Write probe cases for {target} so that several independent implementations can be compared "
+        "on the same inputs. You have not seen any implementation.\n" + setup_note()
+        + "Define exactly two things:\n"
+          "- CASES: a list of 20-40 inputs: ordinary ones, boundaries, and every tricky case the goal and "
+          "spec imply. Use plain values (numbers, strings, tuples, lists, dicts, datetimes).\n"
+          "- def run(case): call the script on one case through `target` (or `run_script` for "
+          "command-line behaviour) and return the result as plain data. Don't assert or check "
+          "anything: the pipeline compares the results; exceptions are recorded automatically.\n"
+          f"Stay within the interface. All cases together must run in a few seconds. Use the Python "
+          f"{config.SANDBOX_PYTHON} standard library only.\n"
+          f"Reply with only the code in one {TICK3}python block.")
+    blocks = [block("Goal:", state["goal"]),
+              block("Spec:", state["spec"], trim=3),
+              block("Interface:", state["interface"] or "(infer the obvious interface from the goal)"),
+              block("Instructions:", instructions)]
+    try:
+        raw, finish = llm_chat("Prober", PROBER_SYSTEM, blocks, want_out=3000, min_out=2000, think=True)
+    except ContextTooSmall as e:
+        print(f"    [!] Prober: {short(e)}; candidates won't be compared this run.")
+        return ""
+    code, _ = extract_code(raw)
+    if finish == "length" or not code.strip():
+        print("    [!] Prober: no complete probe file came back; candidates won't be compared yet.")
+        return ""
+    full = test_header(target) + code.strip() + "\n" + PROBE_RUNNER
+    try:
+        compile(full, PROBE_FILE, "exec")
+    except SyntaxError as e:
+        print(f"    [!] Prober: the probe file doesn't compile (line {e.lineno}: {e.msg}).")
+        return ""
+    if static_problems(full, PROBE_FILE) or "CASES" not in code or "def run" not in code:
+        print("    [!] Prober: the probe file is incomplete (needs CASES and run()).")
         return ""
     return full
 
@@ -1215,20 +1535,24 @@ def engineer_node(state):
     think = (state["think_engineer"] == "always"
              or (state["think_engineer"] == "retries" and fixing))
     diverse = state["diverse"] and not fixing and n > 1
-    need_test = state["tester"] and (not state["indep_test"] or state["indep_checks"] != state["checks"]
-                                     or bool(state["test_feedback"]))
+    roles_needed = [r for r in active_roles(state)
+                    if not state["tests"].get(r) or state["test_checks"].get(r) != state["checks"]
+                    or state["test_feedback"].get(r)]
+    need_probe = state["lvl"]["differential"] and not state["probe"]
     print(f"\n[Node: Engineer Coder] {'Fixing' if fixing else 'Writing'} {target}: {n} candidate(s)"
           f"{', each with a different approach' if diverse else ''}{', thinking first' if think else ''}"
           f" ({attempt_label(state)})...")
-    if need_test:
-        print("    The tester is writing the independent acceptance test at the same time"
-              f"{' (revising it)' if state['indep_test'] else ''}.")
+    helpers = [f"the {ROLE_NAMES[r].lower()}" + (" (revising its test)" if state["tests"].get(r) else "")
+               for r in roles_needed] + (["the prober"] if need_probe else [])
+    if helpers:
+        print(f"    At the same time: {', '.join(helpers)}.")
     report(state, phase=f"coding ({attempt_label(state)}, {n} candidates)", attempt=attempt)
     try:
         prewarm_containers(state, attempt, n)
     except OSError as e:
         print(f"    [i] Couldn't prepare test containers early ({short(e)}); tests will start their own.")
-    test_future = _llm_pool.submit(write_independent_test, state) if need_test else None
+    test_futures = {r: _llm_pool.submit(write_test, state, r) for r in roles_needed}
+    probe_future = _llm_pool.submit(write_probe, state) if need_probe else None
 
     checks = numbered(state["checks"]) or "(none given; demonstrate the goal clearly)"
     blocks = [
@@ -1236,19 +1560,20 @@ def engineer_node(state):
         block("Target file:", target),
         block("Acceptance checks (the --test run must demonstrate each one):", checks),
         block("Plan:", state["plan"]),
-        block("Interface (an independent acceptance test calls the script this way; implement it "
-              "exactly):", state["interface"]),
+        block("Spec (reviewed; if it disagrees with the goal, the goal wins):", state["spec"], trim=3),
+        block("Interface (independent tests call the script this way; implement it exactly):",
+              state["interface"]),
     ]
     existing = state["existing_code"]
     if fixing:
         if state["failure_kind"] == "critic":
-            title = "A reviewer found problems in the version that passed:"
+            title = "Reviewers found problems in the version that passed:"
         else:
             title = f"The previous attempt failed (attempt {attempt - 1}):"
         note = ""
-        if state["test_feedback"]:
-            note = ("The diagnosis says the independent acceptance test was (at least partly) wrong; "
-                    "it is being corrected. If your previous code was right, keep it as it is.")
+        if any(state["test_feedback"].values()):
+            note = ("The diagnosis says an independent test was (at least partly) wrong; it is being "
+                    "corrected. If your previous code was right, keep it as it is.")
         blocks += [
             block(title, state["error"], trim=2, keep="tail", min_chars=1500),
             block("Note:", note),
@@ -1333,21 +1658,29 @@ def engineer_node(state):
             print(f"    Candidate {k}: {cand['status']} ({cand['error'].splitlines()[0][:100]})")
         candidates.append(cand)
 
-    # The independent test (High): keep the old one if a new one couldn't be written.
-    tests = {}
-    if test_future is not None:
-        new_test = test_future.result()
-        if new_test:
-            tests = {"indep_test": new_test, "indep_checks": list(state["checks"]), "test_feedback": ""}
-            body_lines = len(new_test.splitlines()) - len(test_header(target).splitlines())
-            print(f"    Independent test ready ({body_lines} lines).")
-    indep_test = tests.get("indep_test", state["indep_test"])
-    if indep_test:
-        for c in candidates:
-            if c["status"] == "coded":
-                with open(os.path.join(cand_dir(state, attempt, c["k"]), INDEP_FILE), "w",
-                          encoding="utf-8", newline="\n") as f:
-                    f.write(indep_test)
+    # Independent tests and the probe file: keep the old ones if new ones couldn't be written.
+    tests, test_checks = dict(state["tests"]), dict(state["test_checks"])
+    feedback = dict(state["test_feedback"])
+    header_lines = len(test_header(target).splitlines())
+    for role, fut in test_futures.items():
+        new = fut.result()
+        if new:
+            tests[role], test_checks[role] = new, list(state["checks"])
+            feedback.pop(role, None)
+            print(f"    {ROLE_NAMES[role]}'s test ready ({len(new.splitlines()) - header_lines} lines).")
+    probe = state["probe"]
+    if probe_future is not None:
+        probe = probe_future.result() or probe
+        if probe:
+            print("    Prober's cases ready.")
+    updates = {"tests": tests, "test_checks": test_checks, "test_feedback": feedback, "probe": probe}
+    for c in candidates:
+        if c["status"] == "coded":
+            folder = cand_dir(state, attempt, c["k"])
+            write_test_files(state, folder, tests)
+            if probe:
+                with open(os.path.join(folder, PROBE_FILE), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(probe)
 
     if not any(c["status"] == "coded" for c in candidates):
         discard_containers(state, attempt, n)
@@ -1356,59 +1689,183 @@ def engineer_node(state):
         if first["status"] == "truncated" and state["error"]:
             msg += "\n\nThe problem you were fixing:\n" + tail(state["error"], 3000)
         return fail(state, first["status"], msg, candidates=candidates,
-                    code=first["code"] if first["status"] in ("syntax", "static") else state["code"], **tests)
-    return {"candidates": candidates, "status": "CODED", "error": "", "failure_kind": "", **tests}
+                    code=first["code"] if first["status"] in ("syntax", "static") else state["code"], **updates)
+    return {"candidates": candidates, "status": "CODED", "error": "", "failure_kind": "", **updates}
 
 
 MAX_RETESTS = 3     # re-tests of unchanged code after a blamed test, per run
 
 
 def retest_node(state):
-    """The diagnosis said only the independent test was wrong: the tester fixes it, and the same
+    """The diagnosis said only an independent test was wrong: its writer fixes it, and the same
     candidates are tested again in this attempt's folders (no rewrite of code that was right)."""
     prev, attempt, target = state["attempt"] - 1, state["attempt"], state["target_file"]
+    role = state["failed_test"] if state["failed_test"] in TEST_FILES else "acceptance"
     coded = [c for c in state["candidates"] if c["status"] == "coded"]
-    print(f"\n[Node: Re-test] The independent test was wrong; the tester fixes it and the same "
-          f"{len(coded)} candidate(s) are tested again ({attempt_label(state)}).")
-    report(state, phase=f"fixing the independent test ({attempt_label(state)})", attempt=attempt)
+    print(f"\n[Node: Re-test] {TEST_LABELS[role].capitalize()} was wrong; the {ROLE_NAMES[role].lower()} "
+          f"fixes it and the same {len(coded)} candidate(s) are tested again ({attempt_label(state)}).")
+    report(state, phase=f"fixing {TEST_LABELS[role]} ({attempt_label(state)})", attempt=attempt)
     try:
         prewarm_containers(state, attempt, state["num_candidates"])
     except OSError:
         pass
-    new_test = write_independent_test(state)
+    new_test = write_test(state, role)
     if not new_test:
-        print("    The tester couldn't fix the test; the engineer takes over instead.")
+        print(f"    The {ROLE_NAMES[role].lower()} couldn't fix the test; the engineer takes over instead.")
         discard_containers(state, attempt, state["num_candidates"])
         return {"status": "RETEST_SKIPPED", "retest": False, "retests_used": state["retests_used"] + 1}
+    tests, test_checks = dict(state["tests"], **{role: new_test}), dict(state["test_checks"], **{role: list(state["checks"])})
+    feedback = {r: t for r, t in state["test_feedback"].items() if r != role}
+    updates = {"tests": tests, "test_checks": test_checks, "test_feedback": feedback,
+               "retests_used": state["retests_used"] + 1}
+    view = dict(state, **updates)
     for c in coded:
         src, dst = cand_dir(state, prev, c["k"]), cand_dir(state, attempt, c["k"])
         os.makedirs(dst, exist_ok=True)
         shutil.copyfile(os.path.join(src, target), os.path.join(dst, target))
-        with open(os.path.join(dst, INDEP_FILE), "w", encoding="utf-8", newline="\n") as f:
-            f.write(new_test)
-    tests = {"indep_test": new_test, "indep_checks": list(state["checks"]), "test_feedback": "",
-             "retest": False, "retests_used": state["retests_used"] + 1}
-    body_lines = len(new_test.splitlines()) - len(test_header(target).splitlines())
-    print(f"    Corrected independent test ready ({body_lines} lines).")
-    return dict(sandbox_executor_node(dict(state, **tests)), **{k: v for k, v in tests.items()
-                                                                 if k != "retest"}, retest=False)
+        write_test_files(view, dst, tests)
+        if state["probe"]:
+            with open(os.path.join(dst, PROBE_FILE), "w", encoding="utf-8", newline="\n") as f:
+                f.write(state["probe"])
+    print(f"    Corrected test ready ({len(new_test.splitlines()) - len(test_header(target).splitlines())} lines).")
+    return dict(sandbox_executor_node(view), **updates, retest=False)
+
+
+REFEREE_SYSTEM = ("You are an impartial referee. You decide, strictly from the goal and the "
+                  "specification, which of several answers is correct. Reply with JSON only.")
+
+
+def probe_results(res):
+    """(case descriptions, results) from a probe run's output, or (None, None)."""
+    cases = results = None
+    for line in (res.stdout or "").splitlines():
+        if line.startswith("PROBE-CASES:"):
+            cases = json.loads(line[len("PROBE-CASES:"):])
+        elif line.startswith("PROBE-RESULTS:"):
+            results = json.loads(line[len("PROBE-RESULTS:"):])
+    return cases, results
+
+
+def compare_candidates(state, passed):
+    """Ultra and MAX: every passing candidate answers the prober's cases. Where the answers differ,
+    a referee decides from the goal which is right, and candidates that answered wrong fail with
+    that case as a counterexample. Returns ({k: error}, verdict updates for later attempts)."""
+    attempt = state["attempt"]
+    outs = {}
+    for c in passed:
+        try:
+            res = run_in_container(state, attempt, c["k"], file_command(state, PROBE_FILE))
+            cases, results = probe_results(res)
+        except (subprocess.TimeoutExpired, ValueError):
+            cases = results = None
+        if results is not None:
+            outs[c["k"]] = (cases, results)
+    if len(outs) < 2:
+        print("    Comparing candidates: the probe cases didn't run on enough candidates; skipped.")
+        return {}, {}
+    cases = next((c for c, _r in outs.values() if c), None)
+    if cases is None:
+        cases = [f"case {i}" for i in range(max(len(r) for _c, r in outs.values()))]
+    keys = sorted(outs)
+    disputed = []
+    for i in range(len(cases)):
+        answers = {}
+        for k in keys:
+            if i < len(outs[k][1]):
+                answers.setdefault(json.dumps(outs[k][1][i], sort_keys=True), []).append(k)
+        if len(answers) > 1:
+            disputed.append((i, answers))
+    if not disputed:
+        print(f"    Comparing candidates: all {len(keys)} agree on all {len(cases)} probe cases.")
+        return {}, {}
+    print(f"    Comparing candidates: they disagree on {len(disputed)} of {len(cases)} probe cases; "
+          "asking the referee.")
+    verdicts, known = {}, state["probe_verdicts"]
+    ask = []
+    for i, answers in disputed[:10]:
+        decided = [a for a in answers if known.get(f"{i}|{a}") is True]
+        if decided:
+            verdicts[i] = decided[0]
+        else:
+            ask.append((i, answers))
+    if ask:
+        lines = []
+        for i, answers in ask:
+            opts = "\n".join(f"   {chr(65 + j)}) {a[:400]}   (candidate{'s' if len(ks) > 1 else ''} "
+                             f"{', '.join(map(str, ks))})" for j, (a, ks) in enumerate(answers.items()))
+            lines.append(f"Case {i}: input {cases[i]}\n{opts}")
+        instructions = (
+            'Reply with ONLY: {"verdicts": [{"case": <number>, "correct": "A", "reason": "..."}]}\n'
+            "For each case, work out from the goal and spec what the result must be, then name the "
+            "letter of the correct answer, or \"none\" if no answer is right. An answer {\"raised\": X} "
+            "means the script raised exception X. Don't favour an answer because more candidates gave it.")
+        blocks = [block("Goal:", state["goal"]), block("Spec:", state["spec"], trim=3),
+                  block("Interface:", state["interface"]),
+                  block("How each case was run:", state["probe"][len(test_header(state['target_file'])):]
+                        .split("# --- added by the pipeline")[0], trim=4, code=True),
+                  block("Disputed cases:", "\n\n".join(lines), trim=2, min_chars=2000),
+                  block("Instructions:", instructions)]
+        try:
+            raw, _ = llm_chat("Referee", REFEREE_SYSTEM, blocks, want_out=1200, min_out=300, think=True)
+            data = parse_json_object(raw) or {}
+        except ContextTooSmall:
+            data = {}
+        for v in data.get("verdicts") or []:
+            try:
+                i, letter = int(v.get("case")), str(v.get("correct", "")).strip().upper()[:1]
+            except (TypeError, ValueError):
+                continue
+            match = next(((i2, a) for i2, a in ask if i2 == i), None)
+            if match and letter and letter != "N" and ord(letter) - 65 < len(match[1]):
+                verdicts[i] = list(match[1])[ord(letter) - 65]
+                print(f"    Referee, case {i}: answer {letter} is right. {str(v.get('reason', ''))[:200]}")
+            elif match:
+                print(f"    Referee, case {i}: no answer is right; nobody fails on this case.")
+    updates, failures = {}, {}
+    for i, answers in disputed:
+        right = verdicts.get(i)
+        if right is None:
+            continue
+        for a in answers:
+            updates[f"{i}|{a}"] = (a == right)
+        for a, ks in answers.items():
+            if a != right:
+                for k in ks:
+                    failures.setdefault(k, []).append(f"On probe case {cases[i]} the script returned {a[:300]}, "
+                                                      f"but the correct result is {right[:300]}.")
+    errors = {k: ("The script passed its tests, but compared with other independent implementations on the "
+                  "same inputs it gave wrong answers (a referee checked each disputed case against the goal):\n"
+                  + "\n".join(msgs[:4])) for k, msgs in failures.items()}
+    for k in errors:
+        print(f"    Candidate {k} answered {len(failures[k])} disputed case(s) wrong.")
+    return errors, updates
 
 
 def sandbox_executor_node(state):
     staged = [c for c in state["candidates"] if c["status"] == "coded"]
     network = "LAN network" if state["allow_network"] else "no network"
     extras = []
-    if state["indep_test"]:
-        extras.append("then the independent test")
+    roles = [r for r in active_roles(state) if state["tests"].get(r)]
+    if roles:
+        extras.append("then " + " and ".join(TEST_LABELS[r] for r in roles))
+    if state["regression"]:
+        extras.append(f"{len(state['regression'])} regression check(s)")
     if state["repeat_tests"] > 1:
-        extras.append(f"{state['repeat_tests']} runs in all")
+        extras.append(f"{state['repeat_tests']} runs in all" + (" in varied settings" if state["lvl"]["vary_env"] else ""))
     print(f"\n[Node: Sandbox Executor] Testing {len(staged)} candidate(s) with --test"
-          f"{' (' + ', '.join(extras) + ')' if extras else ''} in their own containers on Node 2 "
-          f"({network}, {config.SANDBOX_TIMEOUT}s limit per run)...")
+          f"{' (' + '; '.join(extras) + ')' if extras else ''} in their own containers on Node 2 "
+          f"({network}, {test_timeout(state)}s limit per run)...")
     report(state, phase=f"testing ({attempt_label(state)}, {len(staged)} candidates)")
+    verdict_updates = {}
     try:
         with ThreadPoolExecutor(max_workers=len(staged)) as pool:
             results = list(pool.map(lambda c: run_candidate(state, c), staged))
+        passed = [c for c in results if c["exec_ok"]]
+        if state["lvl"]["differential"] and state["probe"] and len(passed) >= 2:
+            errors, verdict_updates = compare_candidates(state, passed)
+            for c in results:
+                if c["k"] in errors:
+                    c.update(exec_ok=False, exec_error=errors[c["k"]], failed_test="probe")
     finally:
         discard_containers(state, state["attempt"], len(state["candidates"]))
     by_k = {c["k"]: c for c in results}
@@ -1421,23 +1878,22 @@ def sandbox_executor_node(state):
             print(tail(c["stdout"].rstrip(), 1500))
         if c["stderr"].strip():
             print("    stderr:\n" + tail(c["stderr"].rstrip(), 1500))
-        if c["indep_rc"] is not None:
-            print(f"    Independent test: {'passed' if c['indep_rc'] == 0 else 'FAILED'}")
-            if c["indep_rc"] != 0:
-                fails = failure_lines(c["indep_stdout"], 1500)
-                print(fails or tail((c["indep_stdout"] + "\n" + c["indep_stderr"]).strip(), 1500))
-        if not c["exec_ok"] and c["exec_error"] and c["rc"] == 0 and c["indep_rc"] in (None, 0):
+        for role, (trc, tout, terr, _secs) in c["tests_out"].items():
+            print(f"    {TEST_LABELS[role].capitalize()}: {'passed' if trc == 0 else 'FAILED'}")
+            if trc != 0:
+                print(failure_lines(tout, 1500) or tail((tout + "\n" + terr).strip(), 1500))
+        if not c["exec_ok"] and c["exec_error"] and c["rc"] == 0 and c["failed_test"] in ("", "probe"):
             print("    " + c["exec_error"].splitlines()[0])
+    known = dict(state["probe_verdicts"], **verdict_updates)
     if any(c["exec_ok"] for c in results):
-        return {"status": "EXECUTED", "candidates": candidates}
+        return {"status": "EXECUTED", "candidates": candidates, "probe_verdicts": known}
     # Nothing passed: fix the candidate that got furthest (its own test passed, then most output).
-    best = max(results, key=lambda c: (c["rc"] == 0, len(c["stdout"])))
-    kind = "indep" if best["indep_failed"] else "runtime"
-    output = best["stdout"]
-    if best["indep_failed"]:
-        output += "\n--- independent acceptance test ---\n" + best["indep_stdout"]
+    best = max(results, key=lambda c: (c["rc"] == 0, c["failed_test"] == "probe", len(c["stdout"])))
+    kind = "indep" if best["indep_failed"] else ("differential" if best["failed_test"] == "probe" else "runtime")
+    output = best["stdout"] + ("\n" + best["indep_stdout"] if best["indep_stdout"] else "")
     return fail(state, kind, best["exec_error"], code=best["code"], candidates=candidates,
-                execution_output=output, execution_stderr=best["stderr"] + best["indep_stderr"])
+                execution_output=output, execution_stderr=best["stderr"],
+                failed_test=best["failed_test"], probe_verdicts=known)
 
 
 VERIFIER_SYSTEM = ("You are a strict QA reviewer. You decide whether a script's test run really "
@@ -1451,7 +1907,46 @@ JUDGE_FOCUS = [
     "demonstrated by the output rather than just claimed.",
     "Pay special attention to hidden problems: hardcoded or faked results, swallowed errors, and "
     "behaviour the test never exercises.",
+    "Pay special attention to whether outputs, formats, exit codes and error behaviour match the goal "
+    "and interface exactly.",
+    "Pay special attention to the tricky cases the goal and spec imply: check each one the evidence "
+    "covers, and note any it doesn't.",
 ]
+HEAD_SYSTEM = ("You compare two implementations of the same specification and decide which is more "
+               "likely to be correct. Reply with JSON only.")
+
+
+def head_to_head(state, a, b):
+    """MAX: when several candidates pass, compare the top two side by side, asking twice with the
+    order swapped (models tend to favour the first). A pick only counts if both answers agree."""
+    print(f"    Head-to-head: comparing candidates {a['k']} and {b['k']} side by side (asked twice, "
+          "in both orders)...")
+    instructions = (
+        'Reply with ONLY: {"better": "A" or "B", "reason": "one or two sentences"}\n'
+        "Both versions passed every test. Decide which is more likely to be correct on inputs the tests "
+        "did not cover: check edge cases, error handling and faithfulness to the goal and spec. "
+        "Don't prefer length, style or comments.")
+
+    def ask(first, second):
+        blocks = [block("Goal:", state["goal"]), block("Spec:", state["spec"], trim=3),
+                  block("Interface:", state["interface"]),
+                  block("Version A:", first["code"], trim=2, code=True, min_chars=3000),
+                  block("Version B:", second["code"], trim=2, code=True, min_chars=3000),
+                  block("Instructions:", instructions)]
+        try:
+            raw, _ = llm_chat("Head-to-head", HEAD_SYSTEM, blocks, want_out=600, min_out=150, think=True)
+        except ContextTooSmall:
+            return None, ""
+        data = parse_json_object(raw) or {}
+        letter = str(data.get("better", "")).strip().upper()[:1]
+        pick = first if letter == "A" else second if letter == "B" else None
+        return pick, str(data.get("reason", ""))
+    (p1, r1), (p2, _r2) = list(_llm_pool.map(lambda pair: ask(*pair), [(a, b), (b, a)]))
+    if p1 is not None and p1 is p2:
+        print(f"    Head-to-head: candidate {p1['k']} is more likely right (both orders agree). {r1[:200]}")
+        return [p1, b if p1 is a else a]
+    print("    Head-to-head: the two answers disagreed; keeping the ranking by score.")
+    return [a, b]
 
 
 def judge(state, cand, focus="", label=None):
@@ -1473,8 +1968,8 @@ def judge(state, cand, focus="", label=None):
         block(f"Test run: python3 {state['target_file']} --test finished with exit code 0.", network),
         block("STDOUT:", cand["stdout"] or "(empty)", trim=2, keep="tail", min_chars=1500),
         block("STDERR:", cand["stderr"], trim=3, keep="tail"),
-        block("An independent acceptance test (written separately from the goal, without seeing the "
-              "code) also passed. Its output:", cand.get("indep_stdout", ""), trim=3, keep="tail"),
+        block("Independent tests (written separately from the goal, without seeing the code) also "
+              "passed. Their output:", cand.get("indep_stdout", ""), trim=3, keep="tail"),
         block("Script source:", cand["code"], trim=4, code=True, min_chars=2000),
         block("Instructions:", instructions),
     ]
@@ -1514,9 +2009,12 @@ def verifier_node(state):
         print(f"    Candidate {c['k']}: {text}")
     passed = [c for c in judged if c["pass"]]
     win, panel_note = None, ""
+    ranked = sorted(passed, key=lambda c: (c["score"], -len(c["code"])), reverse=True)
+    if state["lvl"]["head_to_head"] and len(ranked) >= 2:
+        ranked = head_to_head(state, ranked[0], ranked[1]) + ranked[2:]
     if passed and state["judges"] > 1:
-        # High: the best passing candidates (at most two) go to a panel; a majority must agree.
-        for c in sorted(passed, key=lambda c: (c["score"], -len(c["code"])), reverse=True)[:2]:
+        # High and above: the best passing candidates (at most two) go to a panel; a majority must agree.
+        for c in ranked[:2]:
             extra = list(_llm_pool.map(
                 lambda i: judge(state, c, JUDGE_FOCUS[i % len(JUDGE_FOCUS)],
                                 label=f"Verifier, candidate {c['k']} (panel vote {i + 1})"),
@@ -1535,7 +2033,7 @@ def verifier_node(state):
             c["failed_checks"] = [fc for v in extra if not v["pass"] for fc in v["failed_checks"]] or c["failed_checks"]
             c["reason"] = " | ".join(v["reason"] for v in extra if not v["pass"] and v["reason"])[:600] or c["reason"]
     elif passed:
-        win = max(passed, key=lambda c: (c["score"], -len(c["code"])))
+        win = ranked[0]
     by_k = {c["k"]: c for c in judged}
     candidates = [by_k.get(c["k"], c) for c in state["candidates"]]
     if win:
@@ -1558,7 +2056,7 @@ def verifier_node(state):
 
 def error_condenser_node(state):
     raw_error = state["error"]
-    indep = state["failure_kind"] == "indep" and bool(state["indep_test"])
+    indep = state["failure_kind"] == "indep" and bool(state["tests"].get(state["failed_test"]))
     if indep:
         return diagnose_independent_failure(state)
     where = "Node 1" if config.HELPER_BACKEND == "node1" else "Node 3"
@@ -1597,10 +2095,11 @@ def error_condenser_node(state):
 
 
 def diagnose_independent_failure(state):
-    """The script's own test passed but the independent test failed: decide, against the goal,
-    whether the script, the test or both are wrong. A wrong test goes back to the tester."""
-    print(f"\n[Node: Error Condenser] The independent test failed; deciding whether the script or "
-          f"the test is wrong (thinking first, attempt {state['attempt'] - 1})...")
+    """The script's own test passed but an independent test failed: decide, against the goal,
+    whether the script, the test or both are wrong. A wrong test goes back to its writer."""
+    role = state["failed_test"] if state["failed_test"] in TEST_FILES else "acceptance"
+    print(f"\n[Node: Error Condenser] {TEST_LABELS[role].capitalize()} failed; deciding whether the "
+          f"script or the test is wrong (thinking first, attempt {state['attempt'] - 1})...")
     report(state, phase=f"diagnosing (attempt {state['attempt'] - 1}/{state['max_attempts']})")
     ask = ("Give a concise diagnosis:\n"
            "1. Which check failed: what the script returned versus what the test expected.\n"
@@ -1614,10 +2113,11 @@ def diagnose_independent_failure(state):
             "Condenser", "You are an expert Python debugger and test reviewer. You are impartial "
                          "between the script and its test; only the goal decides who is right.",
             [block("What the script should do:", state["goal"]),
+             block("Spec (reviewed; the goal wins if they disagree):", state["spec"], trim=3),
              block("Acceptance checks:", numbered(state["checks"])),
              block("Interface:", state["interface"]),
              block("Script:", state["code"], trim=2, code=True, min_chars=3000),
-             block("Independent acceptance test:", test_body(state), trim=3, code=True, min_chars=2000),
+             block(f"{TEST_LABELS[role].capitalize()}:", test_body(state, role), trim=3, code=True, min_chars=2000),
              block("What happened:", state["error"], trim=1, keep="tail", min_chars=1500),
              block("Instructions:", ask)],
             want_out=500, min_out=150, think=True)
@@ -1629,8 +2129,11 @@ def diagnose_independent_failure(state):
     m = re.search(r"BLAME:\s*(script|test|both)", diagnosis, re.IGNORECASE)
     blame = m.group(1).lower() if m else "script"
     print(f"-> Diagnosis (Node 1, blame: {blame}):\n{diagnosis}")
+    feedback = dict(state["test_feedback"])
+    if blame in ("test", "both"):
+        feedback[role] = diagnosis
     update = {"error": f"DIAGNOSIS:\n{diagnosis}\n\nRAW ERROR (tail):\n{tail(state['error'], 2500)}",
-              "test_feedback": diagnosis if blame in ("test", "both") else "",
+              "test_feedback": feedback,
               # Only the test is wrong: fix it and re-test the same code instead of rewriting it.
               "retest": blame == "test" and state["retests_used"] < MAX_RETESTS}
     return update
@@ -1638,64 +2141,386 @@ def diagnose_independent_failure(state):
 
 CRITIC_SYSTEM = ("You are a meticulous senior code reviewer. You look for real bugs that tests "
                  "missed, not style. Reply with JSON only.")
+CRITIC_FOCUS = [
+    "Focus on correctness: wrong results, edge cases, off-by-one errors, and rules of the goal (or of "
+    "standard conventions it relies on) that the code gets wrong.",
+    "Focus on robustness: error handling, invalid input, extreme but valid sizes, determinism, and "
+    "hidden assumptions about the environment (time zone, locale, working folder).",
+]
 
 
-def critic_node(state):
-    """High: after a pass, look for bugs the tests didn't catch. Real problems become new
-    acceptance checks and go back to the engineer; the passing version is kept as a fallback."""
-    rnd = state["critic_used"] + 1
-    print(f"\n[Node: Critic] Reviewing the passing version for bugs the tests missed (round {rnd} of "
-          f"{state['critic_rounds']}, thinking first)...")
-    report(state, phase=f"reviewing (round {rnd}/{state['critic_rounds']})")
-    win = next((c for c in state["candidates"] if c["k"] == state["winner"]), {})
+def proof_file(state, code):
+    """A reviewer's proof snippet as a runnable file: it fails (AssertionError) if the problem exists."""
+    return (test_header(state["target_file"]) + "\n\ndef _proof():\n" + textwrap.indent(code.strip(), "    ")
+            + "\n\n\n_proof()\nprint('PASS: the problem was not shown')\n")
+
+
+def run_snippets(state, box, target_code, files):
+    """Run some test files against one version of the script in a fresh box. Returns {name: result}."""
+    folder = box_dir(state, box)
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, state["target_file"]), "w", encoding="utf-8", newline="\n") as f:
+        f.write(target_code.rstrip() + "\n")
+    results = {}
+    try:
+        for name, content in files.items():
+            with open(os.path.join(folder, name), "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+        for name in files:
+            try:
+                results[name] = run_in_box(state, box, file_command(state, name))
+            except subprocess.TimeoutExpired:
+                results[name] = subprocess.CompletedProcess([], 124, "", "timed out")
+    finally:
+        remove_boxes(state, [box])
+    return results
+
+
+def referee_proofs(state, shown):
+    """Each item failed when run: decide which show a real problem (the expectation follows from the
+    goal, and the failure comes from the script, not from a mistake in the test). Returns the real ones."""
+    parts = []
+    for n, (item, res) in enumerate(shown, 1):
+        parts.append(f"Finding {n}: {item['problem']}\nTest:\n{item['test'].strip()}\n"
+                     f"What happened when it ran:\n{tail((res.stdout or '') + (res.stderr or ''), 1200)}")
+    instructions = (
+        'Reply with ONLY: {"findings": [{"n": <number>, "real": true or false, "reason": "..."}]}\n'
+        "Each test was written to show a problem, and it failed when run against the script. A finding "
+        "is real only if the behaviour its test expects follows from the goal or spec, and the failure "
+        "comes from the script rather than from a mistake in the test itself.")
+    blocks = [block("Goal:", state["goal"]), block("Spec:", state["spec"], trim=3),
+              block("Interface:", state["interface"]),
+              block("Script:", state["code"], trim=2, code=True, min_chars=3000),
+              block("Findings:", "\n\n".join(parts), trim=1, min_chars=2000),
+              block("Instructions:", instructions)]
+    try:
+        raw, _ = llm_chat("Referee", REFEREE_SYSTEM, blocks, want_out=900, min_out=200, think=True)
+    except ContextTooSmall:
+        return [item for item, _ in shown]       # can't check: trust the failing tests
+    data = parse_json_object(raw) or {}
+    real = set()
+    for v in data.get("findings") or []:
+        try:
+            if v.get("real") in (True, "true", "True"):
+                real.add(int(v.get("n")))
+        except (TypeError, ValueError):
+            continue
+    for n, (item, _res) in enumerate(shown, 1):
+        print(f"    Referee: finding {n} is {'REAL' if n in real else 'not shown to be real'}.")
+    return [item for n, (item, _res) in enumerate(shown, 1) if n in real]
+
+
+def prove_findings(state, items, box):
+    """Ultra and MAX: run each finding's test against the passing script. A test that passes means
+    the problem wasn't shown; one that fails goes to the referee. Returns the proven findings."""
+    usable = [i for i in items if snippet_ok(str(i.get("test") or ""))]
+    for i in items:
+        if i not in usable:
+            print(f"    Not proven (no usable test): {i['problem'][:150]}")
+    if not usable:
+        return []
+    files = {f"proof_{n}.py": proof_file(state, i["test"]) for n, i in enumerate(usable, 1)}
+    results = run_snippets(state, box, state["code"], files)
+    shown = []
+    for n, item in enumerate(usable, 1):
+        res = results.get(f"proof_{n}.py")
+        if res is not None and res.returncode != 0:
+            shown.append((item, res))
+        else:
+            print(f"    Not shown by its own test (it passed): {item['problem'][:150]}")
+    return referee_proofs(state, shown) if shown else []
+
+
+def critique(state, focus, label, proof):
     instructions = (
         "Reply with ONLY this JSON object:\n"
-        '{"issues": [{"severity": "major" or "minor", "problem": "...", "check": "..."}]}\n'
-        "Report only real problems: wrong results for input the goal covers, crashes on valid input, "
-        "edge cases the goal implies but the code mishandles, results that are faked or not actually "
-        "computed, and self-tests that pass without really verifying what they claim. 'major' means "
-        "the script fails the goal for some valid use; everything else is 'minor'. For each problem, "
-        "'check' is one concrete acceptance check, observable in the --test output, that would catch "
-        "it. Return an empty list if nothing major is wrong. Don't report style, naming, comments, "
-        "performance that doesn't matter, or features the goal doesn't ask for."
-    )
+        + ('{"issues": [{"severity": "major" or "minor", "problem": "...", "check": "...", "test": "..."}]}\n'
+           if proof else '{"issues": [{"severity": "major" or "minor", "problem": "...", "check": "..."}]}\n')
+        + "Report only real problems: wrong results for input the goal covers, crashes on valid input, "
+          "edge cases the goal implies but the code mishandles, results that are faked or not actually "
+          "computed, and self-tests that pass without really verifying what they claim. 'major' means "
+          "the script fails the goal for some valid use; everything else is 'minor'. For each problem, "
+          "'check' is one concrete acceptance check, observable in the --test output, that would catch "
+          "it. Return an empty list if nothing major is wrong. Don't report style, naming, comments, "
+          "performance that doesn't matter, or features the goal doesn't ask for.\n"
+        + ("For every major problem, 'test' is a few lines of Python that FAIL (raise AssertionError) "
+           "while the problem exists and pass once it's fixed. `target` (the script, imported) and "
+           "`run_script(*args)` (runs it as a process, returns CompletedProcess) are available. Only "
+           "assert behaviour the goal or spec defines; a finding whose test passes is dropped.\n" if proof else "")
+        + (focus or ""))
+    win = next((c for c in state["candidates"] if c["k"] == state["winner"]), {})
     blocks = [
         block("Goal:", state["goal"]),
+        block("Spec (reviewed; the goal wins if they disagree):", state["spec"], trim=3),
         block("Acceptance checks it passed:", numbered(state["checks"])),
         block("Interface:", state["interface"]),
         block("Its --test output:", state["execution_output"], trim=2, keep="tail", min_chars=1000),
-        block("Independent acceptance test output:", win.get("indep_stdout", ""), trim=3, keep="tail"),
+        block("Independent test output:", win.get("indep_stdout", ""), trim=3, keep="tail"),
         block("Script:", state["code"], trim=1, code=True, min_chars=4000),
         block("Instructions:", instructions),
     ]
+    raw, _ = llm_chat(label, CRITIC_SYSTEM, blocks, want_out=1800 if proof else 900, min_out=300, think=True)
+    data = parse_json_object(raw) or {}
+    return [i for i in data.get("issues") or [] if isinstance(i, dict) and str(i.get("problem") or "").strip()]
+
+
+def critic_node(state):
+    """High and above: after a pass, look for bugs the tests didn't catch. Real problems become new
+    acceptance checks and go back to the engineer; the passing version is kept as a fallback. On
+    Ultra and MAX every claim must be proven by a test, and proven tests are kept as regression checks."""
+    rnd = state["critic_used"] + 1
+    n_critics, proof = state["lvl"]["critics"], state["lvl"]["critic_proof"]
+    print(f"\n[Node: Critic] {'Two reviewers look' if n_critics > 1 else 'Reviewing'} the passing version "
+          f"for bugs the tests missed (round {rnd} of {state['critic_rounds']}, thinking first"
+          f"{'; claims must be proven' if proof else ''})...")
+    report(state, phase=f"reviewing (round {rnd}/{state['critic_rounds']})")
+    focuses = [""] if n_critics == 1 else CRITIC_FOCUS[:n_critics]
+    labels = ["Critic"] if n_critics == 1 else [f"Critic {i + 1}" for i in range(n_critics)]
     try:
-        raw, _ = llm_chat("Critic", CRITIC_SYSTEM, blocks, want_out=900, min_out=200, think=True)
+        found = list(_llm_pool.map(lambda fl: critique(state, fl[0], fl[1], proof), zip(focuses, labels)))
     except LLMError as e:
         print(f"-> Review skipped ({short(e)}); keeping the version that passed.")
         return {"critic_used": state["critic_rounds"]}
-    data = parse_json_object(raw) or {}
-    issues = [i for i in data.get("issues") or [] if isinstance(i, dict) and str(i.get("problem") or "").strip()]
+    issues = [i for group in found for i in group]
     major = [i for i in issues if str(i.get("severity", "")).lower() == "major"]
     for i in issues:
         print(f"    {str(i.get('severity', '?')).upper()}: {i.get('problem')}")
+    if major and proof:
+        print(f"    Checking {len(major)} major claim(s) by running their tests against the passing version...")
+        major = prove_findings(state, major, f"proofs-r{rnd}")
     if not major:
-        print("-> No major problems found; keeping this version.")
+        print("-> No major problems " + ("proven" if proof and issues else "found") + "; keeping this version.")
         return {"critic_used": rnd}
     new_checks = [str(i.get("check")).strip() for i in major if str(i.get("check") or "").strip()]
-    checks = list(dict.fromkeys(state["checks"] + new_checks))[:8]
-    print(f"-> {len(major)} major problem(s); sending them back to the engineer with "
-          f"{len(checks) - len(state['checks'])} new acceptance check(s). The passing version is kept "
+    limit = 10 if state["lvl"]["max_checks"] > 4 else 8
+    checks = list(dict.fromkeys(state["checks"] + new_checks))[:limit]
+    regression = list(state["regression"])
+    if proof:
+        regression += [{"name": f"review {rnd}.{j}: {str(i['problem'])[:90]}", "code": str(i["test"])}
+                       for j, i in enumerate(major, 1)]
+    print(f"-> {len(major)} major problem(s){' proven' if proof else ''}; sending them back to the engineer with "
+          f"{len(checks) - len(state['checks'])} new acceptance check(s)"
+          f"{' and their tests as regression checks' if proof else ''}. The passing version is kept "
           "in case the fixes don't pass.")
     best = {"attempt": state["attempt"], "winner": state["winner"], "code": state["code"],
             "verdict": state["verdict"], "execution_output": state["execution_output"],
             "execution_stderr": state["execution_stderr"]}
-    error = ("A reviewer found these problems in the version that passed:\n"
+    error = ("Reviewers found these problems in the version that passed"
+             + (" (each was proven by a test that failed, and confirmed by a referee)" if proof else "") + ":\n"
              + numbered(str(i.get("problem")).strip() for i in major)
+             + ("\nThe tests that showed them:\n" + "\n---\n".join(str(i["test"]).strip() for i in major) if proof else "")
              + "\nFix them while keeping everything that already works. New acceptance checks were "
                "added for them, and the --test run must demonstrate those too.")
     report(state, phase=f"fixing review findings (round {rnd})", checks=checks)
     return {"status": "CRITIQUED", "failure_kind": "critic", "error": error, "checks": checks,
-            "best_passed": best, "critic_used": rnd, "attempt": state["attempt"] + 1}
+            "regression": regression, "best_passed": best, "critic_used": rnd, "attempt": state["attempt"] + 1}
+
+
+# --------------------------------------------------------------------------- mutation testing (MAX)
+
+_COMPARE_SWAP = {ast.Lt: ast.LtE, ast.LtE: ast.Lt, ast.Gt: ast.GtE, ast.GtE: ast.Gt,
+                 ast.Eq: ast.NotEq, ast.NotEq: ast.Eq, ast.In: ast.NotIn, ast.NotIn: ast.In}
+_BINOP_SWAP = {ast.Add: ast.Sub, ast.Sub: ast.Add}
+
+
+def _mutation_sites(tree):
+    """Places a small change could break, in the order ast.walk visits them, skipping the script's
+    own tests (functions named *test*) and the main block."""
+    skip = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and "test" in node.name.lower():
+            skip.update(id(n) for n in ast.walk(node))
+        if isinstance(node, ast.If) and "__main__" in ast.unparse(node.test):
+            skip.update(id(n) for n in ast.walk(node))
+    sites = []
+    for node in ast.walk(tree):
+        if id(node) in skip:
+            continue
+        if isinstance(node, ast.Compare) and type(node.ops[0]) in _COMPARE_SWAP:
+            sites.append(("compare", node))
+        elif isinstance(node, ast.BinOp) and type(node.op) in _BINOP_SWAP:
+            sites.append(("binop", node))
+        elif isinstance(node, ast.BoolOp):
+            sites.append(("boolop", node))
+        elif isinstance(node, ast.Constant) and type(node.value) is int and 0 < abs(node.value) < 10000:
+            sites.append(("const", node))
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            sites.append(("not", node))
+    return sites
+
+
+class _Unnot(ast.NodeTransformer):
+    """Replaces one specific `not x` node with `x`."""
+
+    def __init__(self, target):
+        self.target = target
+
+    def visit_UnaryOp(self, node):
+        self.generic_visit(node)
+        return node.operand if node is self.target else node
+
+
+def make_mutants(code, count, seed):
+    """Up to `count` versions of the code, each with one small change ([(description, code)])."""
+    try:
+        base = ast.parse(code)
+    except SyntaxError:
+        return []
+    n_sites = len(_mutation_sites(base))
+    order = list(range(n_sites))
+    random.Random(seed).shuffle(order)
+    mutants, seen = [], set()
+    for idx in order:
+        if len(mutants) >= count:
+            break
+        tree = ast.parse(code)
+        kind, node = _mutation_sites(tree)[idx]
+        before = ast.unparse(node)
+        if kind == "compare":
+            node.ops[0] = _COMPARE_SWAP[type(node.ops[0])]()
+        elif kind == "binop":
+            node.op = _BINOP_SWAP[type(node.op)]()
+        elif kind == "boolop":
+            node.op = ast.Or() if isinstance(node.op, ast.And) else ast.And()
+        elif kind == "const":
+            node.value += 1
+        if kind == "not":                       # `not x` -> `x`
+            after = ast.unparse(node.operand)
+            tree = _Unnot(node).visit(tree)
+            ast.fix_missing_locations(tree)
+        else:
+            after = ast.unparse(node)
+        new_code = ast.unparse(tree)
+        if new_code in seen:
+            continue
+        try:
+            compile(new_code, "mutant", "exec")
+        except SyntaxError:
+            continue
+        seen.add(new_code)
+        line = getattr(node, "lineno", "?")
+        mutants.append((f"line {line}: `{before[:80]}` -> `{after[:80]}`", new_code))
+    return mutants
+
+
+MUTANT_SYSTEM = ("You strengthen test suites. For small deliberate changes that no test caught, you "
+                 "write checks that would catch them. Reply with JSON only.")
+
+
+def mutation_node(state):
+    """MAX: plant small deliberate bugs in the winning code and check the tests catch them. For bugs
+    that slip through, the tester writes checks that catch them; checks that hold on the real code
+    join the regression tests, and any that fail on it go to the referee as possible real bugs."""
+    print("\n[Node: Mutation Tester] Planting small deliberate bugs in the winning code to check that "
+          "the tests catch them...")
+    report(state, phase="mutation testing")
+    target = state["target_file"]
+    mutants = make_mutants(state["code"], 12, state["run_id"])
+    if not mutants:
+        print("-> No places to plant a change; skipped.")
+        return {"mutation_done": True}
+    win_folder = cand_dir(state, state["attempt"], state["winner"])
+    tests = {}
+    for _role, name in test_files_in(win_folder):
+        with open(os.path.join(win_folder, name), encoding="utf-8") as f:
+            tests[name] = f.read()
+
+    def run_mutant(j):
+        """True if the tests catch mutant j, False if it slips through, None if it couldn't run."""
+        box = f"mut-{j}"
+        folder = box_dir(state, box)
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, target), "w", encoding="utf-8", newline="\n") as f:
+            f.write(mutants[j - 1][1])
+        for name, content in tests.items():
+            with open(os.path.join(folder, name), "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+        try:
+            error, _failed, _out = run_all_tests(state, box, target, test_files_in(folder))
+            return bool(error)
+        except subprocess.TimeoutExpired:
+            return True     # a mutant that hangs is caught (the tests didn't pass)
+        except InfraError:
+            return None
+        finally:
+            remove_boxes(state, [box])
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        caught = list(pool.map(run_mutant, range(1, len(mutants) + 1)))
+    survivors = [(j, mutants[j - 1]) for j in range(1, len(mutants) + 1) if caught[j - 1] is False]
+    ran = [c for c in caught if c is not None]
+    score = f"{sum(1 for c in ran if c)} of {len(ran)} planted bugs caught"
+    print(f"-> {score}.")
+    report(state, mutation_score=score)
+    if not survivors:
+        return {"mutation_done": True}
+    for j, (desc, _code) in survivors:
+        print(f"    Not caught: mutant {j}, {desc}")
+    diffs = "\n\n".join(f"Mutant {j}: {desc}" for j, (desc, _c) in survivors)
+    instructions = (
+        'Reply with ONLY: {"checks": [{"mutant": <number>, "equivalent": false, "name": "...", "test": "..."}]}\n'
+        "Each mutant is the script with one small change, and every existing test still passes on it. "
+        "For each: if the change alters behaviour the goal or spec defines, write a short check: a few "
+        "lines of Python (`target` and `run_script` are available) that pass on the correct behaviour and "
+        "fail (AssertionError) on the mutant. If the change doesn't alter any defined behaviour, set "
+        "\"equivalent\": true and leave out the test.")
+    blocks = [block("Goal:", state["goal"]), block("Spec:", state["spec"], trim=3),
+              block("Interface:", state["interface"]),
+              block("Script:", state["code"], trim=2, code=True, min_chars=3000),
+              block("Changes no test caught:", diffs),
+              block("Instructions:", instructions)]
+    try:
+        raw, _ = llm_chat("Mutation tester", MUTANT_SYSTEM, blocks, want_out=2500, min_out=500, think=True)
+    except ContextTooSmall:
+        return {"mutation_done": True}
+    data = parse_json_object(raw) or {}
+    proposals = []
+    for c in data.get("checks") or []:
+        try:
+            j = int(c.get("mutant"))
+        except (TypeError, ValueError):
+            continue
+        if c.get("equivalent") in (True, "true") or not snippet_ok(str(c.get("test") or "")):
+            print(f"    Mutant {j}: judged equivalent (no defined behaviour changes)" if c.get("equivalent")
+                  in (True, "true") else f"    Mutant {j}: no usable check came back")
+            continue
+        if any(j == s for s, _ in survivors):
+            proposals.append((j, str(c.get("name") or f"catches mutant {j}"), str(c["test"])))
+    if not proposals:
+        return {"mutation_done": True}
+    # Each new check must hold on the real code and fail on its mutant.
+    files = {f"check_{n}.py": proof_file(state, t) for n, (_j, _name, t) in enumerate(proposals, 1)}
+    on_real = run_snippets(state, "mutcheck-real", state["code"], files)
+    kept, suspicious = [], []
+    for n, (j, name, test) in enumerate(proposals, 1):
+        res = on_real.get(f"check_{n}.py")
+        if res is not None and res.returncode == 0:
+            on_mut = run_snippets(state, f"mutcheck-{j}", dict(survivors)[j][1], {"c.py": files[f"check_{n}.py"]})
+            if on_mut["c.py"].returncode != 0:
+                kept.append({"name": f"mutation {j}: {name[:80]}", "code": test})
+            else:
+                print(f"    Mutant {j}: the new check doesn't catch it either; dropped.")
+        elif res is not None:
+            suspicious.append(({"problem": f"(from mutation testing) {name}", "test": test,
+                                "check": name}, res))
+    regression = list(state["regression"]) + kept
+    print(f"-> Added {len(kept)} check(s) to the regression tests.")
+    update = {"mutation_done": True, "regression": regression}
+    if suspicious:
+        print(f"    {len(suspicious)} new check(s) fail on the winning code itself; asking the referee.")
+        real = referee_proofs(state, suspicious)
+        if real:
+            best = {"attempt": state["attempt"], "winner": state["winner"], "code": state["code"],
+                    "verdict": state["verdict"], "execution_output": state["execution_output"],
+                    "execution_stderr": state["execution_stderr"]}
+            update.update(
+                status="CRITIQUED", failure_kind="critic", best_passed=best, attempt=state["attempt"] + 1,
+                regression=regression + [{"name": f"mutation finding: {i['check'][:80]}", "code": i["test"]}
+                                         for i in real],
+                error=("Mutation testing found real problems in the version that passed (checks that fail "
+                       "on it, confirmed by a referee):\n" + numbered(i["check"] for i in real)
+                       + "\nThe checks:\n" + "\n---\n".join(i["test"].strip() for i in real)
+                       + "\nFix them while keeping everything that already works."))
+    return update
 
 
 def save_result_file(state):
@@ -1716,7 +2541,8 @@ def run_stats(state):
     elapsed = time.time() - state["started"]
     with _stats_lock:
         return {"timings": dict(STEP_TIMES), "tokens": {k: dict(v) for k, v in TOKENS.items()},
-                "elapsed_s": round(elapsed), "finished_at": int(time.time())}
+                "elapsed_s": round(elapsed), "finished_at": int(time.time()),
+                "regression_checks": len(state.get("regression") or [])}
 
 
 def finalize_node(state):
@@ -1761,6 +2587,9 @@ def finalize_node(state):
 def dispatch_ingest(state, result_file=""):
     """Store the verified script in Qdrant memory in a detached background process."""
     worker = os.path.join(config.WORKSPACE, "background_ingest.py")
+    if NO_INGEST:
+        print("[i] Not storing this result in long-term memory (--no-ingest).")
+        return
     if not os.path.exists(worker):
         return
     job_path = os.path.join(config.RUNS_DIR, state["run_id"], "ingest_job.json")
@@ -1803,11 +2632,26 @@ def route_after_executor(state):
     return "finalize" if out_of_budget(state) else "condenser"
 
 
+def _after_pass(state):
+    """Where a passing version goes next: more review rounds, mutation testing (MAX), or done."""
+    in_time = time.time() - state["started"] < state["time_limit_s"]
+    if state["critic_used"] < state["critic_rounds"] and in_time:
+        return "critic"
+    if state["lvl"]["mutation"] and not state["mutation_done"] and in_time:
+        return "mutation"
+    return "finalize"
+
+
 def route_after_verifier(state):
     if state["status"] == "PASSED":
-        in_time = time.time() - state["started"] < state["time_limit_s"]
-        return "critic" if state["critic_used"] < state["critic_rounds"] and in_time else "finalize"
+        return _after_pass(state)
     return "finalize" if out_of_budget(state) else "engineer"
+
+
+def route_after_mutation(state):
+    if state["status"] == "CRITIQUED" and not out_of_budget(state):
+        return "engineer"
+    return "finalize"     # (finalize keeps the passing version if the fixes ran out of attempts)
 
 
 def route_after_condenser(state):
@@ -1823,9 +2667,12 @@ def route_after_retest(state):
 
 
 def route_after_critic(state):
-    if state["status"] == "CRITIQUED" and not out_of_budget(state):
-        return "engineer"
-    return "finalize"     # satisfied, or no attempts/time left (finalize keeps the passing version)
+    if state["status"] == "CRITIQUED":
+        return "finalize" if out_of_budget(state) else "engineer"
+    in_time = time.time() - state["started"] < state["time_limit_s"]
+    if state["lvl"]["mutation"] and not state["mutation_done"] and in_time:
+        return "mutation"
+    return "finalize"     # satisfied (finalize also keeps the passing version if attempts ran out)
 
 
 def timed(step, fn):
@@ -1856,6 +2703,7 @@ def build_graph():
     g.add_node("condenser", timed("diagnosis", error_condenser_node))
     g.add_node("critic", timed("review", critic_node))
     g.add_node("retest", timed("re-test", retest_node))
+    g.add_node("mutation", timed("mutation testing", mutation_node))
     g.add_node("finalize", finalize_node)
     for first in ("retriever", "scout", "web"):     # these three run in parallel
         g.add_edge(START, first)
@@ -1863,8 +2711,9 @@ def build_graph():
     g.add_edge("planner", "engineer")
     g.add_conditional_edges("engineer", route_after_engineer, ["executor", "engineer", "finalize"])
     g.add_conditional_edges("executor", route_after_executor, ["verifier", "condenser", "finalize"])
-    g.add_conditional_edges("verifier", route_after_verifier, ["finalize", "engineer", "critic"])
-    g.add_conditional_edges("critic", route_after_critic, ["engineer", "finalize"])
+    g.add_conditional_edges("verifier", route_after_verifier, ["finalize", "engineer", "critic", "mutation"])
+    g.add_conditional_edges("critic", route_after_critic, ["engineer", "finalize", "mutation"])
+    g.add_conditional_edges("mutation", route_after_mutation, ["engineer", "finalize"])
     g.add_conditional_edges("condenser", route_after_condenser, ["retest", "engineer"])
     g.add_conditional_edges("retest", route_after_retest, ["verifier", "condenser", "engineer", "finalize"])
     g.add_edge("finalize", END)
@@ -1885,25 +2734,45 @@ def parse_args(argv):
     p.add_argument("--accuracy", choices=list(config.RUN_PROFILES), default=None,
                    help=f"accuracy level (default {config.DEFAULT_ACCURACY}); see RUN_PROFILES in config.py")
     p.add_argument("--overnight", action="store_true", help="old name for --accuracy=medium")
+    p.add_argument("--no-memory", action="store_true",
+                   help="don't show past solutions as examples (for from-scratch benchmarks)")
+    p.add_argument("--no-ingest", action="store_true", help="don't store the result in long-term memory")
     return p.parse_args(argv)
 
 
 def describe_level(name, p):
     parts = [f"{p['max_attempts']} attempts x {p['candidates']} candidates"]
+    if p["server"] == "long":
+        parts.append("32k server")
     if p["diverse"]:
         parts.append("different approaches")
     if p["think_tokens"] != config.THINK_TOKENS:
         parts.append(f"thinking up to {p['think_tokens']} tokens")
+    if p["spec_review"]:
+        parts.append("spec review")
     if p["tester"]:
-        parts.append("independent tests")
+        parts.append("independent tests" + (" with a reference" if p["reference_tests"] else ""))
+    if p["adversary"]:
+        parts.append("adversarial tests")
+    if p["differential"]:
+        parts.append("candidates compared")
     if p["judges"] > 1:
         parts.append(f"{p['judges']}-judge panel")
+    if p["head_to_head"]:
+        parts.append("head-to-head pick")
     if p["critic_rounds"]:
-        parts.append(f"up to {p['critic_rounds']} review rounds")
+        parts.append(f"{p['critics']} x up to {p['critic_rounds']} review rounds"
+                     + (" with proof" if p["critic_proof"] else ""))
+    if p["mutation"]:
+        parts.append("mutation testing")
     if p["repeat_tests"] > 1:
-        parts.append(f"tests run {p['repeat_tests']}x")
+        parts.append(f"tests run {p['repeat_tests']}x" + (" in varied settings" if p["vary_env"] else ""))
     parts.append(f"up to {p['time_limit_s'] // 60} min")
     return f"{name} ({', '.join(parts)})"
+
+
+NO_MEMORY = False      # --no-memory
+NO_INGEST = False      # --no-ingest
 
 
 def main(argv=None):
@@ -1931,21 +2800,23 @@ def main(argv=None):
         sys.stdout = Tee(sys.stdout, os.path.join(config.RUNS_DIR, run_id, "pipeline.log"))
     except OSError as e:
         print(f"[i] Not saving a log file for this run ({e}).")
-    global THINK_TOKENS
+    global THINK_TOKENS, NO_MEMORY, NO_INGEST
+    NO_MEMORY, NO_INGEST = args.no_memory, args.no_ingest
     profile_name = args.accuracy or ("medium" if args.overnight else config.DEFAULT_ACCURACY)
-    profile = config.RUN_PROFILES[profile_name]
+    profile = config.level_settings(profile_name)
     THINK_TOKENS = profile["think_tokens"]
     write_pid_file(run_id)
     state: AgentState = {
         "run_id": run_id, "task_key": config.TASK_KEY_PREFIX + run_id, "goal": goal,
         "target_file": target, "attachments": "", "attachment_names": [],
         "allow_network": bool(args.allow_network), "research": bool(args.research),
-        "profile": profile_name, "max_attempts": profile["max_attempts"],
+        "profile": profile_name, "lvl": profile, "max_attempts": profile["max_attempts"],
         "num_candidates": profile["candidates"], "think_engineer": profile["think_engineer"],
         "diverse": profile["diverse"], "tester": profile["tester"], "judges": profile["judges"],
         "critic_rounds": profile["critic_rounds"], "critic_used": 0,
-        "repeat_tests": profile["repeat_tests"], "interface": "", "indep_test": "", "indep_checks": [],
-        "test_feedback": "", "retest": False, "retests_used": 0, "best_passed": {},
+        "repeat_tests": profile["repeat_tests"], "interface": "", "spec": "", "tests": {},
+        "test_checks": {}, "test_feedback": {}, "failed_test": "", "regression": [], "probe": "",
+        "probe_verdicts": {}, "mutation_done": False, "retest": False, "retests_used": 0, "best_passed": {},
         "started": time.time(), "time_limit_s": profile["time_limit_s"],
         "existing_code": "", "memory_context": "", "memory_summary": "", "research_brief": "",
         "web_brief": "", "plan": "", "checks": [], "candidates": [], "winner": 0, "code": "",
@@ -1961,6 +2832,9 @@ def main(argv=None):
     try:
         connect_llm()
         print(f"Model: {MODEL_ID} | context window: {CONTEXT_TOKENS} tokens")
+        if profile["server"] == "long" and CONTEXT_TOKENS < 32768:
+            print("[i] This level is meant for the 32k server (the Agent Cluster window switches to it "
+                  "automatically). Running on this one limits thinking and file size.")
         check_sandbox()
         state["attachments"], state["attachment_names"] = load_attachments(args.attach, target, goal)
         prune_runs()

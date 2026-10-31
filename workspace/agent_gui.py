@@ -102,21 +102,38 @@ PIP_NAMES = {"yaml": "PyYAML", "cv2": "opencv-python", "PIL": "Pillow", "sklearn
 RUN_FIELDS = ("status", "phase", "target_file", "profile", "started_at", "updated_at", "finished_at",
               "elapsed_s", "attempt", "goal")
 
-LEVELS = [name for name in ("low", "medium", "high") if name in config.RUN_PROFILES]
+LEVELS = [name for name in ("low", "medium", "high", "ultra", "max") if name in config.RUN_PROFILES]
+LEVEL_TITLES = {"max": "MAX"}
+
+
+def level_title(name):
+    return LEVEL_TITLES.get(name, name.capitalize())
+
+
+def needs_long(level):
+    return config.level_settings(level)["server"] == "long"
 
 
 def level_summary(name):
     """One line describing an accuracy level, built from config.RUN_PROFILES."""
-    p = config.RUN_PROFILES[name]
+    p = config.level_settings(name)
     parts = [f"{p['max_attempts']} attempts x {p['candidates']}"
              f"{' different' if p['diverse'] else ''} candidates"]
-    parts.append("always thinks" if p["think_engineer"] == "always" else "thinks when fixing")
+    if p["server"] == "long":
+        parts.append("32k server")
+    if p["spec_review"]:
+        parts.append("spec review")
     if p["tester"]:
-        parts.append("independent tests")
+        parts.append("independent tests" + (" + adversary" if p["adversary"] else ""))
+    if p["differential"]:
+        parts.append("candidates compared")
     if p["judges"] > 1:
-        parts.append(f"{p['judges']}-judge panel")
+        parts.append(f"{p['judges']} judges")
     if p["critic_rounds"]:
-        parts.append("review rounds")
+        parts.append(f"{p['critics']} critic{'s' if p['critics'] > 1 else ''} x {p['critic_rounds']} rounds"
+                     + (", proven" if p["critic_proof"] else ""))
+    if p["mutation"]:
+        parts.append("mutation testing")
     if p["repeat_tests"] > 1:
         parts.append(f"tests run {p['repeat_tests']}x")
     if p["exclusive"]:
@@ -278,6 +295,8 @@ def result_context(data):
         parts.append("Acceptance checks:\n" + "\n".join(f"{i}. {c}" for i, c in enumerate(checks, 1)))
     if data.get("interface"):
         parts.append("Interface (how the script is meant to be called):\n" + data["interface"][:2000])
+    if data.get("spec"):
+        parts.append("Reviewed spec:\n" + data["spec"][:3000])
     if data.get("verdict"):
         parts.append("Verifier's verdict:\n" + data["verdict"][:2000])
     out = data.get("execution_output") or data.get("output") or ""
@@ -317,6 +336,11 @@ class AgentControlGUI:
         self.task_research = tk.BooleanVar(value=False)
         self.level = tk.StringVar(value=config.DEFAULT_ACCURACY)
         self._research_auto = False      # True when the level ticked "Research" by itself
+        # Automatic server switching (set by the Agent Cluster window; None on its own):
+        # server_hook(want, done) switches vLLM to "long" (32k) or "normal" and calls done(ok, message).
+        self.server_hook = None
+        self._server_mode = "normal"
+        self._switching = False
         # Chat
         self.chat_think = tk.BooleanVar(value=False)
         self.chat_attach = tk.BooleanVar(value=False)
@@ -455,7 +479,7 @@ class AgentControlGUI:
         row2.pack(fill=tk.X, pady=(6, 0))
         self._label(row2, "Accuracy:").pack(side=tk.LEFT)
         for name in LEVELS:
-            tk.Radiobutton(row2, text=name.capitalize(), value=name, variable=self.level,
+            tk.Radiobutton(row2, text=level_title(name), value=name, variable=self.level,
                            command=self._on_level_change, bg=BG, fg=TEXT, selectcolor=FIELD,
                            activebackground=BG, activeforeground=TEXT,
                            font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(6, 0))
@@ -483,8 +507,9 @@ class AgentControlGUI:
 
         qframe = tk.Frame(parent, bg=BG, padx=10)
         qframe.pack(fill=tk.X, pady=(4, 0))
-        self._label(qframe, f"Queue: up to {config.MAX_PARALLEL_RUNS} runs at once (a High run has the GPU "
-                            "to itself); the rest wait their turn. Select a run to see its log.").pack(anchor=tk.W)
+        self._label(qframe, f"Queue: up to {config.MAX_PARALLEL_RUNS} runs at once (High, Ultra and MAX have "
+                            "the GPU to themselves); the rest wait their turn. Select a run to see its log."
+                    ).pack(anchor=tk.W)
         qrow = tk.Frame(qframe, bg=BG)
         qrow.pack(fill=tk.X, pady=(2, 0))
         cols = ("n", "level", "state", "target", "progress")
@@ -1010,7 +1035,7 @@ class AgentControlGUI:
             if self.view_job is None:
                 self._select_job(job["id"])
             if self._exclusive(job):
-                self.log(f"[i] Run #{job['id']} queued. A High run has the GPU to itself, so it starts "
+                self.log(f"[i] Run #{job['id']} queued. A {level_title(level)} run has the GPU to itself, so it starts "
                          "once the running tasks finish.")
             else:
                 self.log(f"[i] Run #{job['id']} queued; it starts when a slot is free.")
@@ -1020,8 +1045,13 @@ class AgentControlGUI:
         return config.RUN_PROFILES.get(job.get("level"), {}).get("exclusive", False)
 
     def _pump_queue(self):
-        """Start waiting runs in order. Up to MAX_PARALLEL_RUNS share the GPU; an exclusive (High)
-        run starts only when nothing else runs, and nothing starts beside it."""
+        """Start waiting runs in order. Up to MAX_PARALLEL_RUNS share the GPU; an exclusive (High and
+        above) run starts only when nothing else runs, and nothing starts beside it. Inside the Agent
+        Cluster window, vLLM is switched to the 32k server before an Ultra or MAX run and back to the
+        normal one when no such run is left."""
+        if self._switching:
+            self._update_status()
+            return
         running = self._running_jobs()
         for job in self.jobs:
             if job["state"] != "QUEUED":
@@ -1032,9 +1062,39 @@ class AgentControlGUI:
                 break                       # wait for the GPU to be free; keep the queue order
             if len(running) >= config.MAX_PARALLEL_RUNS:
                 break
+            want = "long" if needs_long(job["level"]) and not job.get("long_failed") else "normal"
+            if self.server_hook is not None and want != self._server_mode:
+                if not running:             # never switch under a running task
+                    self._switch_server(want, job)
+                break
             if self._launch(job):
                 running.append(job)
+        if (self.server_hook is not None and not self._switching and self._server_mode == "long"
+                and not running and not any(j["state"] == "QUEUED" for j in self.jobs)):
+            self._switch_server("normal", None)     # nothing needs the 32k server any more
         self._update_status()
+
+    def _switch_server(self, want, job):
+        self._switching = True
+        if job is not None:
+            job["phase"] = ("waiting for vLLM to switch to the 32k server (about a minute)" if want == "long"
+                            else "waiting for vLLM to switch back to the normal server (about a minute)")
+            self._refresh_job_row(job)
+        self.log(f"[i] Switching vLLM to the {'32k' if want == 'long' else 'normal'} server...")
+        self.server_hook(want, lambda ok, msg: self._server_switched(want, job, ok, msg))
+
+    def _server_switched(self, want, job, ok, msg):
+        self._switching = False
+        self._vllm_cache = None             # the chat re-reads the context size
+        if ok:
+            self._server_mode = want
+            self.log(f"[+] {msg}")
+        else:
+            self._server_mode = "normal"
+            self.log(f"[!] {msg}")
+            if want == "long" and job is not None:
+                job["long_failed"] = True   # run it on the normal server rather than retry forever
+        self._pump_queue()
 
     def _launch(self, job):
         goal_file = os.path.join(tempfile.gettempdir(), f"agent_gui_goal_{os.getpid()}_{job['id']}.txt")
@@ -1207,8 +1267,13 @@ class AgentControlGUI:
     def _update_status(self):
         running = len(self._running_jobs())
         queued = sum(1 for j in self.jobs if j["state"] == "QUEUED")
-        if running or queued:
+        if self._switching:
+            self.status_lbl.config(text="Switching vLLM" + (f", {queued} queued" if queued else ""),
+                                   fg="#f0ad4e")
+        elif running or queued:
             text = f"Running {running}" + (f", {queued} queued" if queued else "")
+            if self._server_mode == "long":
+                text += " (32k server)"
             self.status_lbl.config(text=text, fg="#f0ad4e")
         else:
             last = next((j for j in reversed(self.jobs) if j["state"] not in ("QUEUED", "RUNNING")), None)
@@ -1356,12 +1421,20 @@ class AgentControlGUI:
             d.insert(tk.END, "Time per step: " + timing_line(data) + "\n", "muted")
         if token_line(data):
             d.insert(tk.END, "Tokens: " + token_line(data) + "\n", "muted")
+        extras = []
+        if data.get("mutation_score"):
+            extras.append(f"mutation testing: {data['mutation_score']}")
+        if data.get("regression_checks") not in (None, "", "0"):
+            extras.append(f"{data['regression_checks']} regression check(s) kept")
+        if extras:
+            d.insert(tk.END, "Checks: " + " · ".join(extras) + "\n", "muted")
         if data.get("memory_sync"):
             d.insert(tk.END, f"Memory: {data['memory_sync']}\n", "muted")
         checks = json_field(data, "checks", [])
         sections = [("Goal", data.get("goal")), ("Plan", data.get("plan")),
                     ("Acceptance checks", "\n".join(f"{i}. {c}" for i, c in enumerate(checks, 1))),
                     ("Interface", data.get("interface")),
+                    ("Spec (reviewed)", data.get("spec")),
                     ("Verdict", data.get("verdict")),
                     ("Test output" if data.get("status") == "PASSED" else "Output / error",
                      data.get("execution_output") or data.get("output"))]

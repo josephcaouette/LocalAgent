@@ -71,6 +71,7 @@ DEFAULTS = {
     "preset": "Fast (default)", "vllm": copy.deepcopy(PRESETS["Fast (default)"]),
 }
 KNOWN_MODELS = ["RedHatAI/Qwen3.8-27B-INT4", "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"]
+LONG_PRESET = "Long context (32k, about half speed)"   # what Ultra and MAX runs switch to
 
 BG, PANEL, FIELD, TEXT, MUTED = "#1e1e1e", "#2d2d2d", "#252526", "#d4d4d4", "#8a8a8a"
 GREEN, RED, ORANGE, GREY = "#4CAF50", "#e05252", "#f0ad4e", "#777777"
@@ -462,6 +463,11 @@ class ClusterWindow:
             self._clear(self.agent_header)
             self.agent = agent_gui.AgentControlGUI(self.root, write_pid=False, notebook=self.tabs,
                                                    frames=self.agent_frames, header=self.agent_header)
+            # Let the queue switch vLLM for Ultra and MAX runs, starting from what's running now.
+            self.agent.server_hook = self.ensure_server
+            card = vllm_card()
+            if card and card.get("max_model_len") == PRESETS[LONG_PRESET]["ctx"] != self.s["vllm"]["ctx"]:
+                self.agent._server_mode = "long"
         except Exception as e:
             self.agent = None
             self.agent_failed = True     # don't retry every 5 s; the Try again button retries
@@ -708,17 +714,67 @@ class ClusterWindow:
             self.log("vLLM is already running. Use Restart vLLM to apply new settings.")
             return
         self.log("Starting vLLM: " + " ".join(vllm_args(v)[2:]))
+        self._launch_vllm(v)
+        self._set("vLLM", ORANGE, "vLLM starting", "starting...")
+
+    def _launch_vllm(self, v):
+        """Start vLLM with settings v (no window of its own: the log shows on the Model server tab,
+        and vLLM keeps running if this window closes; Stop vLLM stops it). Safe from any thread."""
         run_quiet(["wsl", "-u", "root", "bash", "-c",
                    "fuser -k -9 8001/tcp >/dev/null 2>&1; pkill -9 -f '[v]llm serve' >/dev/null 2>&1"])
         run_quiet(["wsl", "bash", "-c", "rm -f ~/vllm_last.log"])
-        # No window of its own: the log shows on the Model server tab, and vLLM keeps running if
-        # this window closes. Stop vLLM stops it.
         self.vllm_proc = subprocess.Popen(["wsl", "bash", "-c", vllm_script(v)], stdin=subprocess.DEVNULL,
                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                           creationflags=NO_WINDOW | NEW_GROUP)
         self.vllm_started_at = time.time()
         self._vlog_text = ""
-        self._set("vLLM", ORANGE, "vLLM starting", "starting...")
+
+    def ensure_server(self, want, done):
+        """For the run queue: make vLLM serve the 32k preset ("long") or your saved settings
+        ("normal"), then call done(ok, message) on the main thread. Never changes the saved
+        settings. If the 32k preset won't start, it goes back to the saved settings (ok=False)."""
+        v = copy.deepcopy(PRESETS[LONG_PRESET]) if want == "long" else copy.deepcopy(self.s["vllm"])
+        label = "the 32k server" if want == "long" else "your saved settings"
+
+        def matches():
+            card = vllm_card()
+            return bool(card) and card.get("max_model_len") == v["ctx"] and card.get("id") == v["model"]
+
+        def wait_ready(limit=480):
+            end = time.time() + limit
+            while time.time() < end:
+                if matches():
+                    return True
+                if self.vllm_proc is not None and self.vllm_proc.poll() is not None:
+                    return False
+                time.sleep(3)
+            return False
+
+        def work():
+            if matches():
+                self.post("call", lambda: done(True, f"vLLM already runs {label}."))
+                return
+            self.post("log", f"Switching vLLM to {label} for the run queue (about a minute)...")
+            self._stop_vllm_blocking()
+            self._launch_vllm(v)
+            if wait_ready():
+                self.vllm_started_at = None
+                self.post("log", f"vLLM now runs {label} ({v['ctx'] // 1024}k context).", "ok")
+                self.post("call", lambda: done(True, f"vLLM switched to {label}."))
+                return
+            self.post("log", f"vLLM didn't start with {label}.", "err")
+            if want == "long":
+                self._stop_vllm_blocking()
+                self._launch_vllm(copy.deepcopy(self.s["vllm"]))
+                ok = wait_ready()
+                self.vllm_started_at = None
+                self.post("call", lambda: done(False, "The 32k server didn't start, so the run uses the normal "
+                                                      "one" + ("" if ok else " (which isn't up yet either)") + "."))
+            else:
+                self.vllm_started_at = None
+                self.post("call", lambda: done(False, "vLLM didn't start with your saved settings; check the "
+                                                      "Model server tab."))
+        self.in_thread(work)
 
     def start_everything(self):
         """Connect Z: if needed, start vLLM if it isn't running, and load Node 3's models."""

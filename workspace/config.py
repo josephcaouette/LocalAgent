@@ -137,21 +137,36 @@ SANDBOX_CPUS = 2
 SANDBOX_PIDS = 128
 KEEP_RUNS = 30             # per-run scratch folders kept in Z:\runs
 
-# --- Accuracy levels (the GUI's Low / Medium / High selector, or --accuracy) -----
-# candidates:     versions the engineer writes per attempt; all are tested, the best one wins.
-# think_engineer: "retries" = think only when fixing a failure, "always", or "never".
-# think_tokens:   most hidden thinking per call (always capped so the answer still fits).
-# diverse:        on the first attempt each candidate is told to take a different approach.
-# tester:         a separate call writes an independent acceptance test from the goal (it never
-#                 sees the code); candidates must pass it as well as their own --test.
-# judges:         independent verifier votes the winner needs a majority of.
-# critic_rounds:  after a pass, a reviewer looks for bugs the tests missed; up to this many fix
-#                 rounds. If a fix doesn't pass in time, the earlier passing version is kept.
-# repeat_tests:   runs of a passing test; a later failure means randomness or timing problems.
-# exclusive:      the run has the GPU to itself (the GUI queue starts nothing beside it).
+# --- Accuracy levels (the GUI's Low / Medium / High / Ultra / MAX selector, or --accuracy) -----
+# candidates:      versions the engineer writes per attempt; all are tested, the best one wins.
+# think_engineer:  "retries" = think only when fixing a failure, "always", or "never".
+# think_tokens:    most hidden thinking per call (always capped so the answer still fits).
+# diverse:         on the first attempt each candidate is told to take a different approach.
+# tester:          a separate call writes an independent acceptance test from the goal (it never
+#                  sees the code); candidates must pass it as well as their own --test.
+# judges:          independent verifier votes the winner needs a majority of.
+# critic_rounds:   after a pass, reviewers look for bugs the tests missed; up to this many fix
+#                  rounds. If a fix doesn't pass in time, the earlier passing version is kept.
+# repeat_tests:    runs of a passing test; a later failure means randomness or timing problems.
+# exclusive:       the run has the GPU to itself (the GUI queue starts nothing beside it).
 # research_default: the GUI ticks "Research the web first" when this level is chosen.
-# A run ends as soon as a candidate passes (and, on High, the reviewer is satisfied), or when
-# attempts or time run out.
+# Ultra and MAX only (see LEVEL_DEFAULTS for what the other levels use):
+# server:          "long" = the Agent Cluster window switches vLLM to the 32k preset for the run.
+# spec_review:     a reviewer turns the plan into a precise spec and fixes plan, checks, interface.
+# reference_tests: the tester also compares against a simple reference and checks properties.
+# differential:    passing candidates answer the same probe inputs; a referee settles disputes.
+# critics:         reviewers per round (with different focuses).
+# critic_proof:    every reviewer claim must come with a test that shows it; proven ones are kept.
+# adversary:       a second independent tester tries to break the script.
+# head_to_head:    when several candidates pass, a judge compares the top two side by side.
+# mutation:        deliberate small bugs check that the tests catch them; the tests get stronger.
+# vary_env:        repeat runs use other time zones, locales and working folders.
+# test_timeout:    seconds per test run.   max_checks: acceptance checks the planner may write.
+# A run ends as soon as a candidate passes (and the reviewers are satisfied), or when attempts
+# or time run out.
+LEVEL_DEFAULTS = {"server": None, "spec_review": False, "reference_tests": False, "differential": False,
+                  "critics": 1, "critic_proof": False, "adversary": False, "head_to_head": False,
+                  "mutation": False, "vary_env": False, "test_timeout": SANDBOX_TIMEOUT, "max_checks": 4}
 RUN_PROFILES = {
     "low": {"max_attempts": 3, "candidates": 2, "time_limit_s": 30 * 60, "think_engineer": "retries",
             "think_tokens": THINK_TOKENS, "diverse": False, "tester": False, "judges": 1,
@@ -162,15 +177,35 @@ RUN_PROFILES = {
     "high": {"max_attempts": 10, "candidates": 4, "time_limit_s": 12 * 3600, "think_engineer": "always",
              "think_tokens": 10000, "diverse": True, "tester": True, "judges": 3,
              "critic_rounds": 2, "repeat_tests": 3, "exclusive": True, "research_default": True},
+    "ultra": {"max_attempts": 12, "candidates": 4, "time_limit_s": 12 * 3600, "think_engineer": "always",
+              "think_tokens": 16000, "diverse": True, "tester": True, "judges": 3,
+              "critic_rounds": 3, "repeat_tests": 3, "exclusive": True, "research_default": True,
+              "server": "long", "spec_review": True, "reference_tests": True, "differential": True,
+              "critics": 1, "critic_proof": True, "vary_env": True, "test_timeout": 60, "max_checks": 6},
+    "max": {"max_attempts": 16, "candidates": 5, "time_limit_s": 24 * 3600, "think_engineer": "always",
+            "think_tokens": 16000, "diverse": True, "tester": True, "judges": 5,
+            "critic_rounds": 4, "repeat_tests": 5, "exclusive": True, "research_default": True,
+            "server": "long", "spec_review": True, "reference_tests": True, "differential": True,
+            "critics": 2, "critic_proof": True, "adversary": True, "head_to_head": True,
+            "mutation": True, "vary_env": True, "test_timeout": 60, "max_checks": 6},
 }
 DEFAULT_ACCURACY = "low"
 LEGACY_PROFILES = {"normal": "low", "overnight": "medium"}   # names stored by older runs
+LONG_CONTEXT_PRESET = "Long context (32k, about half speed)"  # the window's preset for server "long"
 
 
 def accuracy_level(name):
-    """Map a stored profile name (including the old 'normal'/'overnight') to low/medium/high."""
-    name = LEGACY_PROFILES.get(name or "", name or "")
+    """Map a stored profile name (including the old 'normal'/'overnight') to a level name."""
+    name = (name or "").strip().lower()
+    name = LEGACY_PROFILES.get(name, name)
     return name if name in RUN_PROFILES else DEFAULT_ACCURACY
+
+
+def level_settings(name):
+    """Every setting of a level, with LEVEL_DEFAULTS filling in what it doesn't set."""
+    return {**LEVEL_DEFAULTS, **RUN_PROFILES[accuracy_level(name)]}
+
+
 KEEP_HISTORY_PER_FILE = 20 # backups kept per file in .history
 
 # How many runs the GUI's queue runs at the same time. vLLM serves them together, filling the GPU

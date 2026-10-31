@@ -250,6 +250,33 @@ Older runs stored "normal" (now Low) and "overnight" (now Medium).
 | GPU | shares (2 runs at once) | shares | has it to itself |
 | Measured, simple tasks | ~2 min | ~4 min | ~7 min |
 
+### Ultra and MAX
+
+Two more levels for peak accuracy (settings in `RUN_PROFILES`, explained in comments in `config.py`):
+
+| | Ultra | MAX |
+|---|---|---|
+| Server | 32k preset, switched to automatically | 32k preset, switched to automatically |
+| Candidates / attempts / cap | 4 / 12 / 12 h | 5 / 16 / 24 h |
+| Thinking | up to 16,000 tokens | up to 16,000 tokens |
+| Spec review before coding | yes | yes |
+| Tests | independent test with a reference and property checks; candidates compared on probe inputs (a referee settles disagreements) | the same, plus an adversarial tester |
+| Judges | 3 | 5, plus a head-to-head pick between the top two |
+| Critics | 1 per round, 3 rounds; every claim must be proven by a test, and proven tests are kept as regression checks | 2 per round (correctness and robustness), 4 rounds, same proof rule |
+| Mutation testing | - | small deliberate bugs check that the tests catch them; missed ones get new checks |
+| Repeat runs | 3, in varied time zones, locales and folders | 5, varied the same way |
+| Test time limit | 60 s | 60 s |
+
+**Automatic 32k switching.** In the Agent Cluster window, the queue restarts vLLM with the Long
+context preset before an Ultra or MAX run (they run alone), keeps it for consecutive Ultra/MAX runs,
+and switches back to your saved settings when none are left (about a minute each way). If the 32k
+server won't start, the run uses the normal one. Runs started from the command line don't switch.
+First measurement: a small Ultra task took 20.7 minutes, including the spec review (about 5.5 minutes
+of thinking).
+
+Benchmark flags for the command line: `--no-memory` (no past solutions as examples) and
+`--no-ingest` (don't store the result).
+
 **Why High is more accurate.**
 
 - **Independent tests:** in Low and Medium, one model call writes both the code and the test that
