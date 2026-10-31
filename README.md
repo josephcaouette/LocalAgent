@@ -65,15 +65,36 @@ Used by the GUI's "Search the web" option in chat and by the pipeline's "Researc
 
 Every search, fetch and skipped result is logged to `workspace/logs/research.log`. Web text is
 treated as untrusted. Generated code never gets internet access: the test sandbox stays offline.
-The allowlist starts from OpenAI Codex's published "Common dependencies" preset plus
-documentation and Q&A sites; edit it freely.
+The allowlist starts from OpenAI Codex's published "Common dependencies" preset plus about 80
+documentation, reference and Q&A sites; edit it freely. Stack Overflow and the other Stack
+Exchange sites block scripted page fetches, so research reads their questions and top answers
+through the public Stack Exchange API instead.
 
 The same reader condenses large attachments before planning and summarizes long chats.
 
+## Cluster Launcher
+
+`launchers/cluster_launcher/cluster_launcher.py`, installed on Node 1 at `C:\AI\cluster_launcher`
+with a "Cluster Launcher" shortcut on the Desktop. It replaces the five `.bat` files, which
+still work as fallbacks.
+
+- **Status:** live health of vLLM, the GPU, `Z:`, the agent GUI, Redis, Qdrant, SearXNG, the
+  dashboard, the file share and Ollama, plus Node 3's loaded models and the last run.
+- **Model server:** presets (Fast, Long context, Old model) and every vLLM setting: model,
+  context, GPU memory, parallel requests, KV cache type, attention backend, speculative decoding,
+  CUDA graphs, prefix caching, text-only, reasoning parser and extra arguments. "Check free VRAM"
+  measures what vLLM will see and suggests the highest GPU memory setting that will start.
+- **Cluster:** open the agent GUI, connect `Z:`, reset the pipeline, restart Node 2's services,
+  restart Ollama on Node 3, warm up Node 3's models, back up to GitHub.
+- **Links & files:** dashboard, search page, GitHub, folders, logs, allowlist and settings.
+
+Measured on this 4090 (WSL leaves 22.45 of 23.99 GiB free): at 16k context, GPU memory 0.92
+holds about 59,000 tokens of KV cache (3.6 full requests at once); 0.93 is the most that starts.
+
 ## Backups
 
-Run `Backup_To_GitHub.bat` on Node 1's Desktop. It copies the launchers to Node 2, exports
-memory, commits on Node 2 and pushes. Node 2 pushes with its own key
+Use "Back up to GitHub" in the launcher (or `Backup_To_GitHub.bat`). It copies the launchers
+and launcher settings to Node 2, exports memory, commits on Node 2 and pushes. Node 2 pushes with its own key
 (`~/.ssh/github_agent_cluster`), registered as a deploy key on this repository only.
 
 ## Restoring from scratch
@@ -85,6 +106,8 @@ memory, commits on Node 2 and pushes. Node 2 pushes with its own key
 3. **Node 1:** install vLLM 0.32 in WSL at `~/vllm_env`; the first launch downloads
    `RedHatAI/Qwen3.8-27B-INT4`. Create the `C:\AI\venvs\agent_brain` venv with `openai`,
    `langgraph`, `redis`, `qdrant-client`, `requests` and `trafilatura`. Map `Z:` to
-   `\\192.168.254.25\blackboard`, copy `launchers\*.bat` to the Desktop and
-   `launchers\wslconfig.txt` to `%USERPROFILE%\.wslconfig`.
+   `\\192.168.254.25\blackboard`, copy `launchers\cluster_launcher\` to `C:\AI\cluster_launcher`
+   (shortcut target: `C:\AI\venvs\agent_brain\Scripts\pythonw.exe C:\AI\cluster_launcher\cluster_launcher.py`),
+   optionally copy `launchers\*.bat` to the Desktop, and copy `launchers\wslconfig.txt` to
+   `%USERPROFILE%\.wslconfig`.
 4. **Memory:** `python Z:\workspace\reindex_memory.py --import Z:\memory_export\agent_solutions.json`

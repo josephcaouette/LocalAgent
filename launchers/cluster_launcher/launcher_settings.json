@@ -1,0 +1,28 @@
+{
+  "node2_ip": "192.168.254.25",
+  "node3_ip": "192.168.254.26",
+  "ssh_user": "server",
+  "drive": "Z:",
+  "share": "\\\\192.168.254.25\\blackboard",
+  "venv": "C:\\AI\\venvs\\agent_brain",
+  "github": "https://github.com/josephcaouette/LocalAgent",
+  "worker_model": "qwen3.5:9b",
+  "embed_model": "qwen3-embedding:0.6b",
+  "ollama_num_ctx": 8192,
+  "preset": "Fast (default)",
+  "vllm": {
+    "model": "RedHatAI/Qwen3.8-27B-INT4",
+    "ctx": 16384,
+    "gpu_util": 0.92,
+    "max_seqs": 8,
+    "kv_dtype": "fp8",
+    "attention": "TRITON_ATTN",
+    "mtp": true,
+    "mtp_tokens": 2,
+    "cuda_graphs": true,
+    "prefix_caching": false,
+    "text_only": true,
+    "reasoning_parser": "qwen3",
+    "extra": ""
+  }
+}

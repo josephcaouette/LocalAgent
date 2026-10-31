@@ -12,6 +12,7 @@ Every search, fetch and skipped result is logged to logs/research.log. Web text 
 reference material, and the prompts tell the models to ignore any instructions inside it.
 The same reader also condenses long attachments and long chats (compress, summarize_chat).
 """
+import html
 import os
 import re
 import threading
@@ -175,11 +176,73 @@ def search(query, allowlist, limit=10):
     return kept[:limit]
 
 
+_SE_SITES = {"stackoverflow.com": "stackoverflow", "serverfault.com": "serverfault",
+             "superuser.com": "superuser", "askubuntu.com": "askubuntu"}
+_SE_QUESTION = re.compile(r"/questions/(\d+)")
+
+
+def _se_site(host):
+    host = (host or "").lower()
+    for domain, site in _SE_SITES.items():
+        if host == domain or host.endswith("." + domain):
+            return site
+    if host.endswith(".stackexchange.com") and host != "api.stackexchange.com":
+        return host[: -len(".stackexchange.com")]       # unix.stackexchange.com -> unix
+    return None
+
+
+def _html_to_text(fragment):
+    """Small HTML-to-markdown converter for Stack Exchange post bodies (code kept in fences)."""
+    s = re.sub(r"<pre[^>]*>\s*<code[^>]*>(.*?)</code>\s*</pre>",
+               lambda m: "\n```\n" + m.group(1) + "\n```\n", fragment, flags=re.S)
+    s = re.sub(r"<code>(.*?)</code>", r"`\1`", s, flags=re.S)
+    s = re.sub(r"<br\s*/?>|</p>|</li>|</h\d>|</blockquote>", "\n", s)
+    s = re.sub(r"<li>", "- ", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    return html.unescape(s).strip()
+
+
+def fetch_stackexchange(url, allowlist):
+    """Stack Exchange question pages refuse scripted fetches, so read the question and its top
+    answers through the public API (no key needed for light use). Returns None if the URL isn't
+    a question page, '' on failure, otherwise the text."""
+    parsed = urlparse(url)
+    site, match = _se_site(parsed.hostname), _SE_QUESTION.search(parsed.path)
+    if not site or not match or not allowed("https://api.stackexchange.com/", allowlist):
+        return None
+    api, qid = "https://api.stackexchange.com/2.3", match.group(1)
+    try:
+        question = requests.get(f"{api}/questions/{qid}", timeout=15,
+                                params={"site": site, "filter": "withbody"}).json()
+        answers = requests.get(f"{api}/questions/{qid}/answers", timeout=15,
+                               params={"site": site, "filter": "withbody", "sort": "votes",
+                                       "order": "desc", "pagesize": 3}).json()
+    except Exception as e:
+        log("FETCH!", f"{url} Stack Exchange API: {e}")
+        return ""
+    items = question.get("items") or []
+    if not items:
+        log("FETCH!", f"{url} Stack Exchange API: {question.get('error_message', 'no such question')}")
+        return ""
+    q = items[0]
+    parts = [f"Question: {html.unescape(q.get('title', ''))} (score {q.get('score', 0)})",
+             _html_to_text(q.get("body", ""))]
+    for n, a in enumerate(answers.get("items") or [], 1):
+        accepted = ", accepted" if a.get("is_accepted") else ""
+        parts.append(f"Answer {n} (score {a.get('score', 0)}{accepted}):\n{_html_to_text(a.get('body', ''))}")
+    text = "\n\n".join(parts)
+    log("FETCH", f"API {len(text)} chars {url} (quota left {answers.get('quota_remaining', '?')})")
+    return text[:config.RESEARCH_MAX_PAGE_CHARS]
+
+
 def fetch(url, allowlist):
     """Return the main text of an allowlisted page (markdown, code blocks kept), or ''."""
     if not allowed(url, allowlist):
         log("BLOCKED", url)
         return ""
+    se_text = fetch_stackexchange(url, allowlist)
+    if se_text is not None:
+        return se_text
     try:
         with requests.get(url, stream=True, timeout=(5, config.RESEARCH_FETCH_TIMEOUT),
                           headers={"User-Agent": BROWSER_UA,

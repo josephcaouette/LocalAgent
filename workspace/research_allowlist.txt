@@ -111,3 +111,64 @@ ollama.com
 langchain.com
 nvidia.com
 searxng.org
+samba.org
+trafilatura.readthedocs.io
+
+# --- Stack Exchange API (lets research read Stack Overflow answers; its pages block fetches) ---
+api.stackexchange.com
+
+# --- Linux, shell and networking references ---
+gnu.org
+tldp.org
+die.net
+crontab.guru
+cyberciti.biz
+linuxize.com
+digitalocean.com
+baeldung.com
+openssh.com
+openssl.org
+nmap.org
+wireshark.org
+iana.org
+ietf.org
+rfc-editor.org
+cloudflare.com
+kubernetes.io
+proxmox.com
+
+# --- Programming languages and standards ---
+cppreference.com
+rust-lang.org
+go.dev
+typescriptlang.org
+regular-expressions.info
+json.org
+yaml.org
+toml.io
+geeksforgeeks.org
+w3schools.com
+
+# --- Python ecosystem ---
+pytest.org
+pydantic.dev
+sqlalchemy.org
+tiangolo.com
+matplotlib.org
+scikit-learn.org
+jupyter.org
+python-poetry.org
+
+# --- Databases, web servers and monitoring ---
+mysql.com
+mariadb.org
+mongodb.com
+caddyserver.com
+prometheus.io
+grafana.com
+
+# --- AI and ML ---
+anthropic.com
+openai.com
+tensorflow.org
+arxiv.org

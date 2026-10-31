@@ -10,7 +10,7 @@ echo ======================================================
 :: candidates need (20480 fits but leaves room for only one). Speculative decoding uses the
 :: model's own MTP head to draft 2 tokens per step: about 104 tok/s, versus 27 for the old setup.
 :: Memory: vLLM refuses to start if free VRAM is below VLLM_GPU_UTIL x 24 GB. WSL leaves about
-:: 22.45 GiB free, so 0.91 works and 0.95 never will. If startup ever reports too little free
+:: 22.45 GiB free: 0.92 is the tested default, 0.93 is the most that starts. If startup ever reports too little free
 :: memory, set VLLM_GPU_UTIL=0.90 and VLLM_CTX=12288.
 :: More context instead of speed: remove --no-enable-prefix-caching and both --speculative-config
 :: options, then set VLLM_CTX=32768 and VLLM_GPU_UTIL=0.90, for about 55 tok/s.
@@ -22,7 +22,7 @@ echo ======================================================
 :: and later starts reuse the cache. If startup ever fails, add --enforce-eager to VLLM_EXTRA.
 set "VLLM_MODEL=RedHatAI/Qwen3.8-27B-INT4"
 set "VLLM_CTX=16384"
-set "VLLM_GPU_UTIL=0.91"
+set "VLLM_GPU_UTIL=0.92"
 set "VLLM_EXTRA=--kv-cache-dtype fp8 --attention-backend TRITON_ATTN --max-num-seqs 8 --language-model-only --reasoning-parser qwen3 --no-enable-prefix-caching --speculative-config.method mtp --speculative-config.num_speculative_tokens 2"
 
 :: 1. Check if vLLM API is already running on port 8001
