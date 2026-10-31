@@ -1,0 +1,137 @@
+{
+ "run": "20261031-134126",
+ "correct": 7,
+ "mutants": 40,
+ "equivalent": 24,
+ "context": 16384,
+ "generation": [
+  {
+   "arm": "old",
+   "secs": 263,
+   "usable": 3
+  },
+  {
+   "arm": "new",
+   "secs": 253,
+   "usable": 3
+  },
+  {
+   "arm": "new2",
+   "secs": 183,
+   "usable": 3
+  }
+ ],
+ "rows": {
+  "old_1": {
+   "uses_csv": false,
+   "lines": 276,
+   "passes_final": false,
+   "false_failures": 7,
+   "mutants_caught": 0,
+   "fails_on_final": [
+    "FAIL: known_errors '\"a\"\"\"': no ValueError; 'a\"b\"c': no ValueError; '\"a\"\"\"': no ValueError",
+    "FAIL: random_valid_round_trip valid '\\n\"\",\" \"\"\"\"cc\"\"\\n\",\"a\"\\n\"\"\\n\"b,a\"': ref=[[''], ['', ' \"\"cc\"\\n', 'a'], [''], ['b,a']], got=[[], ['', ' \"\"cc\"\\n', 'a'], [''], ['b,a']]; valid '\" \\rc\",\"\",\"\"\"\"\"\",\"\",\"a",
+    "FAIL: random_fuzz_reference random 'b \\nc\\n\\n b\"\\rc\\r\\rab\\n': ref=[['b '], ['c'], [''], [' b\"\\rc\\r\\rab']], got=[['b '], ['c'], [], [' b\"\\rc\\r\\rab']]; random 'c \\n\\n': ref=[['c '], ['']], got=[['c '], "
+   ]
+  },
+  "old_2": {
+   "uses_csv": false,
+   "lines": 270,
+   "passes_final": true,
+   "false_failures": 1,
+   "mutants_caught": 39,
+   "fails_on_final": []
+  },
+  "old_3": {
+   "uses_csv": false,
+   "lines": 233,
+   "passes_final": false,
+   "false_failures": 7,
+   "mutants_caught": 0,
+   "fails_on_final": [
+    "FAIL: error_'a\"b\"' expected 'ValueError', got 'no error'",
+    "FAIL: random_'\\naaa \\ra\"\"aa ' expected ([[''], ['aaa \\ra\"\"aa ']], None), got ([[], ['aaa \\ra\"\"aa ']], None)",
+    "FAIL: random_reference expected None, got None",
+    "FAIL: roundtrip_'\\n\\n\\n\"\"\" \\n\"' expected [[''], [], [], ['\" \\n']], got [[], [], [], ['\" \\n']]",
+    "FAIL: roundtrip expected None, got None"
+   ]
+  },
+  "new_1": {
+   "uses_csv": false,
+   "lines": 249,
+   "passes_final": false,
+   "false_failures": 7,
+   "mutants_caught": 0,
+   "fails_on_final": [
+    "FAIL: naive_0 text='\\naaaaaa,baaa,\\n\\nbabaa\\nba\\n' expected [[''], ['aaaaaa', 'baaa', ''], [''], ['babaa'], ['ba']] got [[], ['aaaaaa', 'baaa', ''], [], ['babaa'], ['ba']]",
+    "FAIL: naive_3 text='aaa,b\\n\\nbaa\\nbabba' expected [['aaa', 'b'], [''], ['baa'], ['babba']] got [['aaa', 'b'], [], ['baa'], ['babba']]",
+    "FAIL: naive_5 text='b\\na\\n,\\n,\\n\\n' expected [['b'], ['a'], ['', ''], ['', ''], ['']] got [['b'], ['a'], ['', ''], ['', ''], []]",
+    "FAIL: naive_6 text='\\n' expected [['']] got [[]]",
+    "FAIL: naive_7 text='b\\n\\n,,ab\\n\\naa\\n\\n,b,ab,' expected [['b'], [''], ['', '', 'ab'], [''], ['aa'], [''], ['', 'b', 'ab', '']] got [['b'], [], ['', '', 'ab'], [], ['aa'], [], ['', 'b', 'ab', '']]",
+    "FAIL: naive_10 text='\\nba\\nb\\nb,b\\nbb,a,b\\n\\n,bba' expected [[''], ['ba'], ['b'], ['b', 'b'], ['bb', 'a', 'b'], [''], ['', 'bba']] got [[], ['ba'], ['b'], ['b', 'b'], ['bb', 'a', 'b'], [], ['', 'bba']"
+   ]
+  },
+  "new_2": {
+   "uses_csv": false,
+   "lines": 202,
+   "passes_final": false,
+   "false_failures": 7,
+   "mutants_caught": 0,
+   "fails_on_final": [
+    "PASS: --test no FAIL/Traceback",
+    "FAIL: round_trip_random case 1: text='' expected=[[]] got=[]"
+   ]
+  },
+  "new_3": {
+   "uses_csv": false,
+   "lines": 180,
+   "passes_final": true,
+   "false_failures": 1,
+   "mutants_caught": 39,
+   "fails_on_final": []
+  },
+  "new2_1": {
+   "uses_csv": false,
+   "lines": 241,
+   "passes_final": false,
+   "false_failures": 7,
+   "mutants_caught": 0,
+   "fails_on_final": [
+    "FAIL: quote_only expected [[\"'\"]], got [[\"''\"]]",
+    "FAIL: quoted_then_empty expected [['a', '']], got [['a', ''], ['b']]",
+    "FAIL: quoted_then_crlf_empty expected [['a', '']], got [['a', ''], ['b']]",
+    "FAIL: comma_after_quote_ok_no_error expected ValueError, got [['a', 'b']]",
+    "FAIL: roundtrip_unquoted expected [['', ''], ['a\"\"'], ['']], got [['', ''], ['a\"\"']]"
+   ]
+  },
+  "new2_2": {
+   "uses_csv": false,
+   "lines": 281,
+   "passes_final": false,
+   "false_failures": 7,
+   "mutants_caught": 0,
+   "fails_on_final": [
+    "FAIL: tricky_34 expected 'reference result', got \"ValueError('invalid character after closing quote')\"",
+    "FAIL: tricky_35 expected 'reference result', got \"ValueError('invalid character after closing quote')\"",
+    "FAIL: tricky_36 expected 'reference result', got \"ValueError('invalid character after closing quote')\"",
+    "FAIL: roundtrip expected [['a0\\na\\r', 'b\\n,\\n', 'a\\na \\r'], ['\\ra\\n', ''], [], []], got [['a0\\na\\r', 'b\\n,\\n', 'a\\na \\r'], ['\\ra\\n', ''], []]",
+    "FAIL: roundtrip expected 'all 300 round trips', got '25 failures'"
+   ]
+  },
+  "new2_3": {
+   "uses_csv": false,
+   "lines": 250,
+   "passes_final": false,
+   "false_failures": 7,
+   "mutants_caught": 0,
+   "fails_on_final": [
+    "FAIL: quoted_empty expected [['']], got ('ok', [['']])",
+    "FAIL: quoted_comma expected [['a,b']], got ('ok', [['a,b']])",
+    "FAIL: escaped_quote expected [['a\"b']], got ('ok', [['a\"b']])",
+    "FAIL: quoted_nl expected [['a\\nb']], got ('ok', [['a\\nb']])",
+    "FAIL: quoted_crlf expected [['a\\r\\nb']], got ('ok', [['a\\r\\nb']])",
+    "FAIL: quoted_lone_cr expected [['a\\rb']], got ('ok', [['a\\rb']])"
+   ]
+  }
+ }
+}

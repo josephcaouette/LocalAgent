@@ -428,7 +428,11 @@ two that rejected correct code, and each showed a weak spot in the pipeline, now
   now spells out the `\n` case.
 - **The CSV parser on Ultra took 6 attempts** for another reason: its independent test compared
   random inputs with the test writer's own CSV parser, which had a new bug after each fix. The
-  diagnosis rightly blamed the test every time.
+  diagnosis rightly blamed the test every time. Telling the test writer to use a standard-library
+  module as its reference instead (Python's `csv`, which the script was banned from but a test isn't)
+  didn't help, so it isn't in the pipeline: in a side-by-side of 9 acceptance tests on the same plan,
+  none used `csv`, and only 1 of 3 tests with the old instructions and 1 of 6 with two new wordings
+  passed a correct parser. The rest tripped over empty lines (`['']` where the goal says `[]`).
 
 **On every level.**
 

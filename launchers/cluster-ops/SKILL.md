@@ -108,7 +108,8 @@ force, own parsers; validated against good and deliberately wrong stubs in `test
 uses `battery2_checks.py` (semver ranges, text justify, Game of Life, CSV, TTL cache; stubs in
 `tests/stubs2/`). One run: `battery.py one set1 TASK LEVEL`; `BATTERY_TAG=_x` suffixes the target
 name and `BATTERY_EXTRA="--helper-think 8000"` adds pipeline flags. Results go to
-`battery_results_<set>.json` (set 1's first run wrote `battery_results.json`); the produced
+`battery_results_<set>.json` for a full battery (set 1's first run wrote `battery_results.json`);
+quick, one-off and tagged runs add a suffix (`battery_results_set2_x_one.json`); the produced
 `<task>_<level>.py` files in `Z:\workspace` must be deleted afterwards. Use it after pipeline changes
 so fixes aren't tuned to one task.
 
@@ -141,6 +142,13 @@ acceptance test on them. On 2026-10-31: without the note, script 3/3 (the loop);
 the cycle (test once, script plus a correction three times), and the corrected candidates dropped
 the old failures but overcorrected a neighbouring case. The battery's csv goal now spells out "\n";
 the original wording is kept in `tests/data/csv_high_case/goal.txt` for the replay.
+
+`scripts/tests/testwriter_ab.py [N] [ARMS]` A/Bs the acceptance test writer on set 2's csv/ultra plan:
+each test runs on the run's correct implementations (a failure = a false failure, which costs a
+re-test in a real run) and on 40 mutants. On 2026-10-31, guidance to use a standard-library reference
+and to write an own reference only when much simpler didn't help (usable tests: old 1/3, new 1/3 and
+0/3; no test used `csv`), so it was removed. The base rate is the finding: 2 of 3 Ultra acceptance
+tests for CSV fail correct code out of the gate (empty lines), and the pipeline recovers by re-testing.
 
 ### Benchmark a level
 `scripts/tests/ultra_max_e2e.py bench` (Ultra + MAX on a cron parser) or `bench-max`, run in the

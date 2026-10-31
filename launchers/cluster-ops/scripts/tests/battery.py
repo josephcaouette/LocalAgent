@@ -2,7 +2,9 @@
 accuracy levels, then each result is checked against a reference in the sandbox.
 
 Usage: python battery.py [full|quick] [set1|set2]   (quick = Low only; set2 = the second task set)
-Results: battery_results_<set>.json next to this file, and a table at the end of the output.
+       python battery.py one set2 TASK LEVEL        (one run; BATTERY_TAG=_x suffixes the target name)
+Results: battery_results_<set>.json next to this file for a full battery (other modes and tags add a
+suffix, e.g. battery_results_set2_x_one.json), and a table at the end of the output.
 The produced files land in Z:\\workspace as <task>_<level>.py: delete them afterwards.
 """
 import json
@@ -184,7 +186,10 @@ for j in jobs:
         f"{tok} tok | digest {'yes' if rec.get('digest') else 'NO'} | {score.splitlines()[0] if score else '?'}")
     for line in score.splitlines()[1:4]:
         say("      ", line[:250])
-with open(os.path.join(HERE, f"battery_results_{SET}.json"), "w", encoding="utf-8") as f:
+# Only a full battery writes battery_results_<set>.json; a quick, one-off or tagged run gets its own
+# file, so it can't replace a whole battery's results.
+suffix = TAG + ("" if MODE == "full" else f"_{MODE}")
+with open(os.path.join(HERE, f"battery_results_{SET}{suffix}.json"), "w", encoding="utf-8") as f:
     json.dump(results, f, indent=1)
 say("BATTERY DONE")
 app._remove_pid_file()
