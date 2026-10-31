@@ -8,7 +8,8 @@ os.chdir(r"Z:\workspace")
 import config  # noqa: E402
 import run_langgraph_pipeline as p  # noqa: E402
 
-GOOD = "```python\nimport sys\n\n\ndef f():\n    return 1\n\n\nif __name__ == '__main__':\n    print('PASS: f')\n```"
+GOOD = ("```python\nimport sys\n\n\ndef f():\n    return 1\n\n\nif __name__ == '__main__':\n"
+        "    if sys.argv[1:] == ['--test']:\n        print('PASS: f')\n```")
 calls = []
 
 

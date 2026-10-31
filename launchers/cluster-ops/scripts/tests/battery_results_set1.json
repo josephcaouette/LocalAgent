@@ -1,0 +1,13 @@
+[
+ {
+  "task": "calc",
+  "level": "max",
+  "state": "PASSED",
+  "run_id": "20261031-080850",
+  "attempt": "4",
+  "elapsed_s": "3671",
+  "tokens_out": 487925,
+  "digest": true,
+  "check": "SCORE 1532/1532"
+ }
+]

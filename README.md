@@ -48,6 +48,7 @@ This repository is the share's root folder on Node 2. `.gitignore` allows only t
   - `research.py` and `research_allowlist.txt`: web research and the sites it may read.
   - `agent_dashboard.py`: web dashboard on port 8080 (runs as a Docker service on Node 2).
   - `background_ingest.py`, `reindex_memory.py`, `agent_common.py`: long-term memory and shared helpers.
+  - `run_digest.py`: the plain-English run summaries Node 1 writes while the queue is idle.
   - Every other `.py` file is a utility the agent built.
 - `docker/`: `docker-compose.yml` (Redis, Qdrant, SearXNG, dashboard), the sandbox image's
   Dockerfile and SearXNG's settings.
@@ -99,8 +100,10 @@ window, and **Dispatch Run**.
 
 Talk a task through before running it. Chatting never changes files.
 
-- **Model:** Node 1 (the 27B model, best, ~104 tokens/s) or Node 3 (the 9B model, for when Node 1 is
-  off; it makes more mistakes).
+- **Model:** **Automatic** (the default) uses Node 1, except while a pipeline run is going: then
+  Node 3 answers, so chatting doesn't slow the run, and a line in the chat says so. Pick **Node 1**
+  (the 27B model, best, ~104 tokens/s) to use it anyway, or **Node 3** (the 9B model; it makes more
+  mistakes) for when Node 1 is off.
 - **Think step by step:** the model reasons privately first. Better for design and debugging;
   slower (it may write 1,000-5,000 hidden tokens first).
 - **Search the web:** researches first (see [Web research](#web-research)) and answers with
@@ -158,8 +161,14 @@ seconds while open.
     STOPPED (by you or Reset), and LOST (its process ended without finishing, for example when the
     PC restarted mid-run). Greyed-out PLANNED and COMPLETED records come from the pipeline's first
     version.
-- **Details:** settings, the current phase, **time per step**, **tokens generated** per role, the
-  goal, plan, checks, interface (High), verdict and output.
+- **Details:** a plain-English **Summary** of the run (see below), settings, the current phase,
+  **time per step**, **tokens generated** per role, the goal, plan, checks, interface (High), verdict
+  and output.
+- **Summaries:** whenever nothing is running or queued, Node 1 writes a short summary of each
+  finished run that doesn't have one yet: the result, what happened and which safeguards made a
+  difference, where the time went, and anything worth checking. They take a few seconds each, run in
+  the background (`run_digest.py`, log in `workspace\logs\digest.log`), and stop the moment a run
+  starts. The summary reports what each step concluded; a step's conclusion can be wrong.
 - **Buttons:** **Talk about this run**, **Open file** (in an editor), **Run it** (runs the file on
   this PC in a console window, after asking; it installs missing packages with pip first),
   **Re-run this goal** (loads the goal, level and settings into the Task tab), **Show full log**
@@ -195,11 +204,30 @@ Measured on this 4090. WSL leaves 22.45 of 23.99 GiB free, so 0.95 can't start:
 | **0.92** | **58,982 tokens** | **3.6** | 0.38 GiB |
 | 0.93 | 62,259 tokens | 3.8 | 0.14 GiB (fragile) |
 
-The **Long context (32k)** preset (GPU memory 0.90, no speculative decoding) holds **106,799
-tokens** of KV cache, 3.26 full 32k requests at once: more than Fast, because there's no draft
-model taking memory. It generates about 54 tokens/s for one request (Fast: ~104) and about 230
+The **Long context (32k)** preset (GPU memory 0.92, no speculative decoding) holds **118,935
+tokens** of KV cache, 3.6 full 32k requests at once: more than Fast, because there's no draft
+model taking memory. It generates about 53 tokens/s for one request (Fast: ~104) and about 230
 tokens/s in total with five at once (Fast: ~290), so it's half speed for chat but only about 20%
 slower when a High run writes four candidates and a test together.
+
+An A/B on 2026-10-31 tried other settings for this preset under the load of a MAX run: one long
+thinking request, then eight long requests at once, then five short reviews (`vllm_ab.py` in the
+cluster-ops skill's tests):
+
+| Setting | KV cache | One request | Eight at once | All three |
+|---|---|---|---|---|
+| 0.90 (until 2026-10-31) | 106,799 tokens | 53 tokens/s | 434 s, 4 preemptions | 552 s |
+| **0.92 (now)** | **118,935 tokens** | 53 tokens/s | **394 s, 2 preemptions** | **514 s** |
+| 0.92 + 4096-token prefill batches | 63,108 tokens | 53 tokens/s | 865 s, 18 preemptions | 984 s |
+| 0.92 + speculative decoding | 71,493 tokens | 72 tokens/s | 1,802 s, 678 preemptions | 1,894 s |
+| 0.92 + both | didn't start: too little memory left for one 32k request | | | |
+
+A preemption is vLLM pausing a request because the KV cache is full, then computing it again
+later. Speculative decoding makes one request a third faster, but its draft model leaves 40% less
+cache, so eight requests at once ran four times slower. Bigger prefill batches
+(`--max-num-batched-tokens 4096`) need more working memory, which also comes out of the cache.
+During two hours of real Ultra and MAX runs the 32k server paused requests only 15 times, so
+0.92's extra cache is headroom more than a fix.
 
 Node 1's monitors run on the Intel graphics, not the 4090, which is why vLLM sees almost all 24 GB.
 Keep it that way: a monitor on the 4090 would use some of its memory.
@@ -246,6 +274,7 @@ line). Older runs stored "normal" (now Low) and "overnight" (now Medium). Every 
 | Different approaches | - | - | yes | yes | yes |
 | Thinking per call | up to 5,000 | up to 5,000 | up to 10,000 (about 5,000 for the engineer in 16k) | up to 16,000 | up to 16,000 |
 | **Spec review** before coding | - | - | - | yes | yes |
+| **Examples checked** by running code before coding | - | - | yes | yes | yes |
 | **Independent tests** | - | - | acceptance test | + reference and property checks | + an **adversarial tester** |
 | **Candidates compared** on probe inputs | - | - | - | yes, with a referee | yes, with a referee |
 | Judges | 1 | 1 | 3 | 3 | 5, plus a **head-to-head** pick |
@@ -341,6 +370,66 @@ to the thinking budget, a spec assumption (a 1,461-day search limit) broke leap-
 candidates whose thinking spilled into their answer were dropped, and a tester printed FAIL lines
 but exited 0.
 
+**Beyond the cron task: a five-task battery** (2026-10-31, from scratch, no memory examples, one
+run each). Five goals with rules that are easy to get subtly wrong: shell-style wildcard matching,
+bowling scores with validation, an integer expression evaluator, a dependency order with cycle
+reporting, and free meeting slots. Each ran on Low, Medium and High, plus three on Ultra and MAX:
+18 runs, unattended, through the queue. Afterwards each result was checked in the sandbox against
+a reference implementation on 600-3,000 generated cases.
+
+| | Low | Medium | High | Ultra | MAX |
+|---|---|---|---|---|---|
+| Passed | 4 of 5 | 5 of 5 | 5 of 5 | 2 of 2 | 1 of 1 |
+| Final file matched the reference on every case | 5 of 5 | 5 of 5 | 5 of 5 | 2 of 2 | 1 of 1 |
+| Time per run | 1.5-7 min | 2.5-6.5 min | 9-27 min | 27-32 min | 62 min |
+
+Every file the pipeline produced was correct, including the Low run marked failed: its code was
+right, and its own self-test's expected value was wrong (it said `a*b*c` doesn't match `abcc`),
+which the quick diagnosis then blamed on the code. The two slowest runs (wildcards on High and the
+evaluator on MAX, 4 attempts each) also lost their time to wrong tests, not wrong code: each fix
+of an independent test brought a new wrong value. That led to in-place test fixes, a short thinking
+diagnosis on Low and Medium, and a check that rejects a plan returned instead of code. More thinking
+for the test writers didn't help: the MAX run repeated with `--helper-think 8000` still had two
+wrong expected values in its adversarial test (`10-4/2/3` as 9 instead of 10, `1- - -2` as 3
+instead of -1) and took the same 4 attempts in about the same hour, with 35% more tokens.
+
+**A second battery** (same day, same setup): semantic version ranges, text justification, Game of
+Life with other birth/survival rules, a CSV parser and a cache with expiry, each checked against a
+reference on 307-1,537 generated cases (`scripts/tests/battery2_checks.py` of the cluster-ops skill).
+
+| | Low | Medium | High | Ultra | MAX |
+|---|---|---|---|---|---|
+| Passed | 3 of 5 | 4 of 5 | 4 of 5 | 2 of 2 | 1 of 1 |
+| Final file matched the reference on every case | 4 of 5 | 4 of 5 | 5 of 5 | 2 of 2 | 1 of 1 |
+| Time per run | 3-6 min | 4-10 min | 11-57 min | 37-62 min | 30 min |
+
+Again every file produced was correct. The misses were two runs that stopped without a file and
+two that rejected correct code, and each showed a weak spot in the pipeline, now fixed:
+
+- **Version ranges on Low and Medium stopped without a file.** On Low, fixing a long file didn't fit
+  the 16k window; the engineer now sends SEARCH/REPLACE edits to the previous version instead. On
+  Medium, the step that finishes a cut-off candidate from its notes asked for more room than was
+  left (the file plus half again); it now settles for the file's own size, and if even that can't
+  fit, only that candidate is left cut off.
+- **Game of Life on Low rejected correct code:** each rewrite brought new wrong grids into its own
+  test. When the diagnosis blames only the expected values, one candidate now corrects just those.
+- **The CSV parser on High spent all 10 attempts on correct code.** The goal says "a line break at
+  the very end doesn't start another record", which can be read two ways: the independent test took
+  a lone `\n` as no record, while every candidate returned one empty record, as Python's `csv`
+  module (and the reference) does. The diagnosis blamed the script nine times, and the candidates
+  never changed. Now, when the same checks still fail after a diagnosis blamed the script, the
+  diagnosis is told so and asked for a decision that sticks: blame the test if the goal allows the
+  candidates' reading, or put a correction into the interface the engineer must implement exactly.
+  Replayed on Node 1, the old diagnosis blamed the script 3 times of 3, as in the run. With the
+  note, all 4 tries broke the cycle: once it blamed the test (calling the goal ambiguous and the
+  candidates' reading defensible), and three times it wrote the test's reading into the interface.
+  Candidates written from that interface dropped the old failures but overcorrected a neighbouring
+  case, so a run would go on with new failures instead of repeating the old ones. The battery's goal
+  now spells out the `\n` case.
+- **The CSV parser on Ultra took 6 attempts** for another reason: its independent test compared
+  random inputs with the test writer's own CSV parser, which had a new bug after each fix. The
+  diagnosis rightly blamed the test every time.
+
 **On every level.**
 
 - **Static check (pyflakes):** rejects a candidate that uses a name it never defines, a crash
@@ -357,17 +446,26 @@ but exited 0.
 1. **Pick the target file** (the Target box, a file named in the goal, or a new name).
 2. **Gather, in parallel:**
    - **Memory:** search for similar solved tasks. Anything scoring 0.63 or more is shown to the
-     planner as an example.
+     planner as an example, with the pitfalls proven when it was built. A match just below that
+     (within 0.05) is shown only if Node 3 judges it relevant to the goal.
    - **Scout:** brief any other workspace file the goal mentions.
    - **Web research**, if ticked.
 3. **Planner** (thinks first): writes steps and 2-4 concrete **acceptance checks** (up to 6 on Ultra
    and MAX). On High and above it also writes the **interface**: the functions and command-line
    usage tests will call. On Ultra and MAX the **spec reviewer** then writes a precise spec and
    corrects the plan.
+   - **Example check (High and above):** Node 1 writes a short brute-force script, without
+     thinking, that recomputes every hand-worked expected value in the spec and checks, and runs it
+     in the sandbox (about 15-60 s; a crashed script gets one repair). Node 1 then re-derives any
+     value the script disputes, thinking first, and corrects the plan before any candidate copies
+     it. If anything goes wrong (a script that still fails), the step is skipped.
+     `EXAMPLE_CHECK_BACKEND = "node3"` hands the script to Node 3 instead, which frees Node 1 but
+     fails on harder checks (see [Where the time and hardware go](#where-the-time-and-hardware-go)).
 4. **Engineer:** writes **several candidate files at once** into `Z:\runs\<run>\a<attempt>c<candidate>\`,
    never straight into the workspace. Each includes its own self-test under `--test`.
    - It thinks first when fixing a failure (always, on Medium and above).
-   - Candidates that use undefined names are rejected straight away.
+   - Candidates that use undefined names are rejected straight away, and so are replies that aren't
+     a script: no `--test` mode, or only bare values (a plan in JSON compiles as Python too).
    - At the same time: the tester writes `acceptance_test.py` (High and above), the adversary writes
      `adversarial_test.py` (MAX), and the prober writes `probe_cases.py` (Ultra and MAX).
    - Meanwhile, Node 2 starts one test container per candidate.
@@ -389,11 +487,33 @@ but exited 0.
    failures are always shown to it, wherever they appear in the output. If only an independent
    test was wrong, its writer fixes it and the **same candidates are tested again** without being
    rewritten (up to 3 times per run).
+   - The writer fixes a wrong test **in place**: small search-and-replace edits to just the
+     disputed checks, so the checks that already passed can't change. (Rewriting the whole test
+     re-rolled every hand-computed value: in the battery below, a MAX run fixed its adversarial test
+     three times because each rewrite brought a new wrong value.) If the edits don't apply, the
+     test is written again as before.
+   - The engineer's self-test gets the same treatment: when the diagnosis blames only its expected
+     values, candidate 1 corrects them with edits to the previous version and the other candidates
+     rewrite the file, in case the diagnosis is wrong.
+   - When a fix's whole file can't fit in the context window (a long file on the 16k server: the
+     prompt carries the previous version and the answer would need it all again), every candidate
+     sends edits instead. Before, the run stopped there with an error.
+   - On Low and Medium, when checks fail without a crash, the diagnosis thinks briefly (up to
+     3,000 tokens) before deciding whether the code or the self-test's expected value is wrong.
    - On High and above the diagnosis thinks first, sees the spec, and is told when several
      candidates failed in exactly the same way. Candidates written independently rarely share a
      bug, but they all copy an expected value from the plan or spec, so identical failures point at
      the expected value. When independently written candidates agree and the diagnosis finds the
      spec's example wrong, a **correction is added to the spec** for every later step.
+   - **A disagreement that won't move gets settled.** If an independent test's checks still fail the
+     same way after the diagnosis blamed the script, the candidates evidently read the goal
+     differently from the test, and saying it again won't change them. The diagnosis is told this
+     and must decide for good: blame the test when the goal allows the candidates' reading, or add
+     a **correction to the interface**, which the engineer implements exactly and the test writers
+     read too. (In the second battery a CSV run went round this loop nine times.)
+   - A candidate whose answer was cut off after thinking is finished from its own notes, asking for
+     at least the room its file needs. If even that doesn't fit, it stays cut off and the other
+     candidates carry on; before, this could stop the run.
 8. **Critics (High and above):** review the passing version; real problems send it back with new
    checks. On Ultra and MAX each claim must be proven by a test first, and proven tests become
    regression checks. A pass is never lost: if the fixes don't pass in time, or a later step stops on
@@ -404,7 +524,9 @@ but exited 0.
 10. **On a pass:**
     - the old file goes to `workspace\.history\` (20 kept per file);
     - the winner is copied in;
-    - Node 3 summarizes it into long-term memory in the background.
+    - Node 3 summarizes it into long-term memory in the background, with the pitfalls the run
+      proved by machine (corrected expected values, and checks added by critics and mutation
+      testing).
 
 ### What a run leaves behind
 
@@ -428,8 +550,12 @@ Exit codes from the command line: 0 passed, 1 failed, 2 stopped by an error.
 ```
 python run_langgraph_pipeline.py --goal="..." [--target=name.py] [--attach=path ...]
                                  [--allow-network] [--research] [--accuracy=low|medium|high|ultra|max]
-                                 [--no-memory] [--no-ingest]
+                                 [--no-memory] [--no-ingest] [--helper-think=TOKENS]
 ```
+
+`--helper-think` sets how much the test writers (tester, adversary, prober) may think, for
+experiments; normally they use the level's budget. Raising it to 8,000 on MAX didn't reduce the
+wrong expected values in tests (see the five-task battery above).
 
 ## Web research
 
@@ -498,8 +624,10 @@ Change behaviour everywhere (pipeline, agent tabs, dashboard, memory tools) by e
 | `mutation` | Plant small bugs to check the tests catch them, and strengthen the tests |
 | `vary_env` | Repeat runs use other time zones, locales, hash seeds and folders |
 | `test_timeout`, `max_checks` | Seconds per test run; acceptance checks the planner may write |
+| `example_check` | Recompute the plan's hand-worked expected values with a script before coding |
+| `helper_think_tokens` | Thinking for the test writers (unset: the level's `think_tokens`) |
 
-Low, Medium and High leave the last twelve unset; `LEVEL_DEFAULTS` fills them in.
+Keys a level leaves out come from `LEVEL_DEFAULTS`.
 `DEFAULT_ACCURACY` (low) is used when none is given; `MAX_PARALLEL_RUNS` (2) is how many shared
 runs the queue starts at once.
 
@@ -518,6 +646,7 @@ runs the queue starts at once.
 | Setting | Value | Meaning |
 |---|---|---|
 | `HELPER_BACKEND` | "node1" | Who writes the scout's brief and failure diagnoses. Node 1 is faster and better; "node3" frees Node 1 at some cost to quality. (Deciding whether a script or an independent test is wrong always uses Node 1) |
+| `EXAMPLE_CHECK_BACKEND` | "node1" | Who writes the example-check script. Node 1's scripts worked 6 of 6 times; Node 3's often crashed or were cut off on checks as hard as the task |
 | `READER_BACKEND` | "auto" | Who reads research pages, condenses attachments and summarizes chats. "auto" uses Node 1, or Node 3 while Node 1 is busy with runs |
 | `WORKER_MODEL`, `WORKER_THINK` | qwen3.5:9b, False | Node 3's model, thinking off for speed |
 | `OLLAMA_NUM_CTX` | 8192 | Node 3's context. Must match everywhere, or Ollama reloads the model (~10 s) |
@@ -527,8 +656,9 @@ runs the queue starts at once.
 
 | Setting | Value | Meaning |
 |---|---|---|
-| `EMBED_MODEL` | qwen3-embedding:0.6b | Turns text into vectors to find similar tasks. Changing it needs `reindex_memory.py` |
+| `EMBED_MODEL` | qwen3-embedding:0.6b | Turns text into vectors to find similar tasks. Changing it needs `reindex_memory.py`. The 4B model ranked the same 10 test goals just as well (10 of 10) with a wider gap between right and wrong matches, but it's 4x larger and can't share Node 3's 8 GB with the 9B model, so 0.6B stays |
 | `MEMORY_MIN_SCORE` | 0.63 | How similar a past solution must be to be shown. In tests right matches scored 0.71+ and the best wrong one 0.57. Raise it if irrelevant examples appear, lower it if good ones are missed (the retriever logs scores) |
+| `MEMORY_RELEVANCE_CHECK`, `MEMORY_RELEVANCE_MARGIN` | True, 0.05 | A match up to 0.05 below the minimum is shown only if Node 3 judges it relevant (it recovered a right match at 0.629) |
 | `MEMORY_TOP_K` | 3 | Most past examples shown |
 
 **Research**
@@ -577,6 +707,22 @@ Measured on 2026-10-30:
   in 5.6 minutes from start to finish, while their individual times add up to 8 minutes.
 - **High runs alone.** A High run already keeps the GPU busy (4 candidates plus the tester, then
   the panel), so a second run beside it would mostly slow both down.
+- **Node 3 (RTX 2070, Qwen3.5 9B at ~49 tokens/s without thinking)** takes the jobs that must not
+  slow Node 1 down: memory embeddings and summaries, the relevance check on near-miss memory
+  matches, reading web pages during runs, and chat while a run is going (Automatic). It was also
+  tried for the example check, measured on 2026-10-31: its scripts were reliable when the check is
+  simpler than the task (bowling scores: 3 of 3) and often failed when the check is as hard as the
+  task (a cron parser: about 1 in 5; an expression parser: 0 of 3). Its thinking mode didn't help
+  (8,000 tokens and no script), and qwen2.5-coder 7B found nothing to check. Node 1 wrote working
+  scripts 6 of 6 times in 15-30 s, so the example check moved to Node 1. Node 1 also writes the run
+  summaries, when it's idle.
+  It was also tried for Ultra and MAX's **probe cases** (2026-10-31, `probe_trial.py` in the
+  cluster-ops skill's tests): each probe file ran on the correct candidates of three battery runs and
+  on 35-40 small deliberate bugs in their final files. Node 1's files caught 114 of 115 bugs with no
+  false disputes. Of 9 Node 3 files, 2 didn't compile, 3 caught nothing (each wrapped a wrong call to
+  the script in its own `try`, so every version gave the same answer), 3 caught most bugs but made
+  correct versions disagree 4-7 times (each a referee call on Node 1), and 1 matched Node 1. The
+  prober is one call per run, so it stays on Node 1.
 - **Ready-made test containers.** Starting a container on Node 2's HDD array takes ~7 s; running a
   command in an already-started one takes ~0.1 s.
   - The pipeline starts each attempt's containers while the engineer is still writing, so a test
@@ -639,7 +785,7 @@ databases, run folders, logs or secrets.
 | Chat is slow during an Ultra or MAX run | vLLM is on the 32k server then (about half speed for one request); it switches back when those runs finish |
 | A script needs a package to run on this PC | Talk about result names it with the pip command, and Run it installs it for you |
 | A run log says "Shortened '...' to fit the ... context window" | The prompt plus room for thinking and the answer didn't fit. Extras (attachments, web notes, past examples) are cut first; then the thinking shrinks, down to half its budget, before the spec or the failure report is cut. Common on High (16k) with big files; Ultra and MAX use the 32k server for this reason |
-| A run log says "cut off at N tokens: about X of thinking, Y of answer" | A reply reached its token limit; the line shows where the room went. When thinking runs past its budget, the model tends to keep reasoning in its answer, which then gets cut off; such a candidate is finished from its own notes without thinking again ("finishing them from their own notes"). A candidate that still came back cut off or broken keeps the model's reply as `model_reply.txt` in its folder under `Z:\runs\<run>\` |
+| A run log says "cut off at N tokens: about X of thinking, Y of answer" | A reply reached its token limit; the line shows where the room went. When thinking runs past its budget, the model tends to keep reasoning in its answer, which then gets cut off. Every thinking step then answers again from its own notes without thinking ("answering again from its notes"; for candidates, "finishing them from their own notes"). A candidate that still came back cut off or broken keeps the model's reply as `model_reply.txt` in its folder under `Z:\runs\<run>\`; a reply with no `--test` mode (a plan or notes instead of the script) is rejected straight away |
 | Research finds nothing useful | The allowlist may not cover the topic. Add the relevant documentation site to `research_allowlist.txt` |
 | Node 3 is slow on its first answer | Its models were unloaded. Cluster tab, Warm up Node 3 models |
 | The window itself won't respond | Run `Reset_Cluster.bat` (one of the fallback `.bat` files; copies are in `launchers/`): it stops the window and every run, then reopens the window |

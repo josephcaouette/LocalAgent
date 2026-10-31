@@ -1,0 +1,200 @@
+[
+ {
+  "task": "semver",
+  "level": "low",
+  "state": "ERROR",
+  "run_id": "20261031-103617",
+  "attempt": "2",
+  "elapsed_s": "223",
+  "tokens_out": 23240,
+  "digest": true,
+  "check": "SCORE 0/1 (could not run: FileNotFoundError: [Errno 2] No such file or directory: '/bb/runs/20261031-103617/final_semver_low.py')"
+ },
+ {
+  "task": "justify",
+  "level": "low",
+  "state": "PASSED",
+  "run_id": "20261031-103618",
+  "attempt": "2",
+  "elapsed_s": "376",
+  "tokens_out": 36050,
+  "digest": true,
+  "check": "SCORE 809/809"
+ },
+ {
+  "task": "life",
+  "level": "low",
+  "state": "FAILED",
+  "run_id": "20261031-104018",
+  "attempt": "3",
+  "elapsed_s": "352",
+  "tokens_out": 40837,
+  "digest": true,
+  "check": "SCORE 510/510"
+ },
+ {
+  "task": "csv",
+  "level": "low",
+  "state": "PASSED",
+  "run_id": "20261031-104237",
+  "attempt": "1",
+  "elapsed_s": "171",
+  "tokens_out": 13978,
+  "digest": true,
+  "check": "SCORE 815/815"
+ },
+ {
+  "task": "cache",
+  "level": "low",
+  "state": "PASSED",
+  "run_id": "20261031-104530",
+  "attempt": "1",
+  "elapsed_s": "174",
+  "tokens_out": 19257,
+  "digest": true,
+  "check": "SCORE 307/307"
+ },
+ {
+  "task": "semver",
+  "level": "medium",
+  "state": "ERROR",
+  "run_id": "20261031-104615",
+  "attempt": "3",
+  "elapsed_s": "589",
+  "tokens_out": 79402,
+  "digest": true,
+  "check": "SCORE 0/1 (could not run: FileNotFoundError: [Errno 2] No such file or directory: '/bb/runs/20261031-104615/final_semver_medium.py')"
+ },
+ {
+  "task": "justify",
+  "level": "medium",
+  "state": "PASSED",
+  "run_id": "20261031-104826",
+  "attempt": "2",
+  "elapsed_s": "360",
+  "tokens_out": 49374,
+  "digest": true,
+  "check": "SCORE 809/809"
+ },
+ {
+  "task": "life",
+  "level": "medium",
+  "state": "PASSED",
+  "run_id": "20261031-105428",
+  "attempt": "2",
+  "elapsed_s": "378",
+  "tokens_out": 54185,
+  "digest": true,
+  "check": "SCORE 510/510"
+ },
+ {
+  "task": "csv",
+  "level": "medium",
+  "state": "PASSED",
+  "run_id": "20261031-105608",
+  "attempt": "1",
+  "elapsed_s": "234",
+  "tokens_out": 27848,
+  "digest": true,
+  "check": "SCORE 815/815"
+ },
+ {
+  "task": "cache",
+  "level": "medium",
+  "state": "PASSED",
+  "run_id": "20261031-110004",
+  "attempt": "1",
+  "elapsed_s": "243",
+  "tokens_out": 33771,
+  "digest": true,
+  "check": "SCORE 307/307"
+ },
+ {
+  "task": "semver",
+  "level": "high",
+  "state": "PASSED",
+  "run_id": "20261031-110409",
+  "attempt": "1",
+  "elapsed_s": "737",
+  "tokens_out": 110527,
+  "digest": true,
+  "check": "SCORE 1537/1537"
+ },
+ {
+  "task": "justify",
+  "level": "high",
+  "state": "PASSED",
+  "run_id": "20261031-111629",
+  "attempt": "3",
+  "elapsed_s": "886",
+  "tokens_out": 134496,
+  "digest": true,
+  "check": "SCORE 809/809"
+ },
+ {
+  "task": "life",
+  "level": "high",
+  "state": "PASSED",
+  "run_id": "20261031-113117",
+  "attempt": "4",
+  "elapsed_s": "1369",
+  "tokens_out": 182948,
+  "digest": true,
+  "check": "SCORE 510/510"
+ },
+ {
+  "task": "csv",
+  "level": "high",
+  "state": "FAILED",
+  "run_id": "20261031-115408",
+  "attempt": "10",
+  "elapsed_s": "3425",
+  "tokens_out": 545641,
+  "digest": true,
+  "check": "SCORE 815/815"
+ },
+ {
+  "task": "cache",
+  "level": "high",
+  "state": "PASSED",
+  "run_id": "20261031-125118",
+  "attempt": "1",
+  "elapsed_s": "693",
+  "tokens_out": 102701,
+  "digest": true,
+  "check": "SCORE 307/307"
+ },
+ {
+  "task": "semver",
+  "level": "ultra",
+  "state": "PASSED",
+  "run_id": "20261031-130356",
+  "attempt": "2",
+  "elapsed_s": "2248",
+  "tokens_out": 225750,
+  "digest": true,
+  "check": "SCORE 1537/1537"
+ },
+ {
+  "task": "csv",
+  "level": "ultra",
+  "state": "PASSED",
+  "run_id": "20261031-134126",
+  "attempt": "6",
+  "elapsed_s": "3724",
+  "tokens_out": 389698,
+  "digest": true,
+  "check": "SCORE 815/815"
+ },
+ {
+  "task": "justify",
+  "level": "max",
+  "state": "PASSED",
+  "run_id": "20261031-144333",
+  "attempt": "1",
+  "elapsed_s": "1792",
+  "tokens_out": 234660,
+  "digest": true,
+  "check": "SCORE 809/809"
+ }
+]

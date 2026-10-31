@@ -42,3 +42,16 @@ for name, st in [("independent, all agree", state(True)), ("same base code, all 
 low = dict(state(True), judges=1)
 p.llm_chat = lambda *a, **k: ("diagnosis", "stop")
 print("Low/Medium keep the quick diagnosis:", "spec" not in p.error_condenser_node(low))
+
+# Low and Medium: a failed check without a crash gets a short thinking diagnosis; a crash doesn't.
+config.HELPER_BACKEND = "node1"
+calls = []
+p.llm_chat = lambda label, system, blocks, **kw: (calls.append(kw), fake_chat(label, system, blocks, **kw))[1]
+low = dict(state(False, n=2), judges=1, lvl=config.level_settings("low"),
+           error="Self-test: exit code 1.\nLines in its output that report failures:\n"
+                 "FAIL a*b*c abcc expected=False got=True\nSTDERR:\n\nSTDOUT (tail):\nFAIL 1 case(s) failed")
+p.error_condenser_node(low)
+crash = dict(low, error="Self-test: exit code 1.\nSTDERR:\nTraceback (most recent call last):\nKeyError: 'x'\n")
+p.error_condenser_node(crash)
+print("Low, failed check -> thinking diagnosis:", calls[0].get("think") is True,
+      "| budget", calls[0].get("think_tokens"), "| crash -> quick diagnosis:", not calls[1].get("think"))

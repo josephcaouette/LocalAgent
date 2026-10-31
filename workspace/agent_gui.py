@@ -51,6 +51,8 @@ STATE_COLORS = {"PASSED": "#4CAF50", "FAILED": "#f44336", "ERROR": "#e05cff", "R
 
 NODE1_LABEL = f"Node 1 - {config.LLM_MODEL.split('/')[-1]} (RTX 4090)"
 NODE3_LABEL = f"Node 3 - {config.WORKER_MODEL} (RTX 2070)"
+AUTO_LABEL = "Automatic - Node 1, or Node 3 while a run is going"
+CHAT_MODELS = [AUTO_LABEL, NODE1_LABEL, NODE3_LABEL]
 
 CHAT_SYSTEM = (
     "You are the planning assistant for a home-lab AI cluster. Talk with the user, answer questions, "
@@ -350,6 +352,7 @@ class AgentControlGUI:
         self.chat_history = []  # [{"role": "user"|"assistant", "content": ...}]
         self.chat_gen = 0
         self.chat_busy = False
+        self._auto_note_shown = False   # "Node 3 answers while a run is going" was said
         self.chat_stop = threading.Event()
         self._vllm_cache = None
         # Runs tab
@@ -362,6 +365,9 @@ class AgentControlGUI:
         if write_pid:
             self._write_pid_file()
         threading.Thread(target=self._poller, daemon=True).start()
+        self._digest_proc = None
+        self._digest_due = True     # summaries of finished runs are written when the queue is idle
+        self.root.after(20000, self._pump_queue)
         if not self.embedded:
             self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(50, self._drain)
@@ -421,8 +427,7 @@ class AgentControlGUI:
         opts = tk.Frame(parent, bg=BG, padx=10, pady=6)
         opts.pack(fill=tk.X)
         self._label(opts, "Model:").pack(side=tk.LEFT)
-        self.chat_backend = ttk.Combobox(opts, state="readonly", width=38,
-                                         values=[NODE1_LABEL, NODE3_LABEL])
+        self.chat_backend = ttk.Combobox(opts, state="readonly", width=46, values=CHAT_MODELS)
         self.chat_backend.current(0)
         self.chat_backend.pack(side=tk.LEFT, padx=6)
         for text, var in (("Think step by step", self.chat_think),
@@ -648,7 +653,14 @@ class AgentControlGUI:
         return "break"
 
     def _backend(self):
-        return "node3" if self.chat_backend.current() == 1 else "node1"
+        """Node 1 or Node 3, as picked. Automatic keeps chat off Node 1 while a pipeline run is using
+        it, so chatting doesn't slow the run (the same rule web research uses)."""
+        pick = CHAT_MODELS[self.chat_backend.current()]
+        if pick == NODE3_LABEL:
+            return "node3"
+        if pick == NODE1_LABEL:
+            return "node1"
+        return research.reader_backend("chat")
 
     def send_chat(self):
         if self.chat_busy:
@@ -699,6 +711,11 @@ class AgentControlGUI:
         self.chat_gen += 1
         self._shown_think = False
         self._shown_answer = False
+        auto = CHAT_MODELS[self.chat_backend.current()] == AUTO_LABEL
+        if auto and backend == "node3" and not self._auto_note_shown:
+            self._chat_write("\n(A run is using Node 1, so Node 3 answers until it finishes. Pick Node 1 "
+                             "in the Model list to use it anyway.)\n", "info")
+        self._auto_note_shown = auto and backend == "node3"
         if mode == "chat":
             self._chat_write(f"\n{label.split(' (')[0]}\n", "model")
         doing = "researching" if use_web else ("thinking" if think else "replying")
@@ -1072,9 +1089,50 @@ class AgentControlGUI:
         if (self.server_hook is not None and not self._switching and self._server_mode == "long"
                 and not running and not any(j["state"] == "QUEUED" for j in self.jobs)):
             self._switch_server("normal", None)     # nothing needs the 32k server any more
+        if (not running and not self._switching and not any(j["state"] == "QUEUED" for j in self.jobs)
+                and (self.server_hook is None or self._server_mode == "normal")):
+            self._maybe_digest()
         self._update_status()
 
+    def _maybe_digest(self):
+        """Nothing running or queued: let Node 1 write the plain-English summaries of finished runs
+        (run_digest.py, in the background). Starting a run or switching vLLM stops it."""
+        if not self._digest_due or (self._digest_proc is not None and self._digest_proc.poll() is None):
+            return
+        worker = os.path.join(config.WORKSPACE, "run_digest.py")
+        if not os.path.exists(worker):
+            return
+        self._digest_due = False
+        try:
+            os.makedirs(config.LOG_DIR, exist_ok=True)
+            with open(os.path.join(config.LOG_DIR, "digest.log"), "a", encoding="utf-8") as log:
+                self._digest_proc = subprocess.Popen(
+                    [sys.executable, "-u", worker, "--pending", "--limit", "20"], cwd=config.WORKSPACE,
+                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    env=dict(os.environ, PYTHONIOENCODING="utf-8"),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError as e:
+            self.log(f"[!] Couldn't start the run summaries: {e}")
+
+    def _stop_digest(self):
+        proc = self._digest_proc
+        if proc is not None and proc.poll() is None:
+            # /T: the venv's python.exe is a launcher with the real interpreter as its child.
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+            else:
+                proc.kill()
+            self._digest_due = True     # a summary in progress is simply written next time
+            try:                        # a killed worker can't release its lock itself
+                r = config.get_redis(decode_responses=True, timeout=2)
+                if str(proc.pid) in (r.get("workflow:digest_lock") or "").split():
+                    r.delete("workflow:digest_lock")
+            except Exception:
+                pass
+        self._digest_proc = None
+
     def _switch_server(self, want, job):
+        self._stop_digest()
         self._switching = True
         if job is not None:
             job["phase"] = ("waiting for vLLM to switch to the 32k server (about a minute)" if want == "long"
@@ -1097,6 +1155,7 @@ class AgentControlGUI:
         self._pump_queue()
 
     def _launch(self, job):
+        self._stop_digest()             # the run gets Node 1 to itself
         goal_file = os.path.join(tempfile.gettempdir(), f"agent_gui_goal_{os.getpid()}_{job['id']}.txt")
         try:
             # Passing the goal in a file avoids Windows' command-line length limit.
@@ -1255,6 +1314,7 @@ class AgentControlGUI:
             last = next((ln for ln in reversed(job["lines"]) if ln.strip().startswith(("[x]", "[!]"))), "")
             job.update(state="ERROR", phase=(last.strip()[:120] or f"exit code {rc}"))
         self._refresh_job_row(job)
+        self._digest_due = True
         try:
             if job["goal_file"]:
                 os.remove(job["goal_file"])
@@ -1431,7 +1491,8 @@ class AgentControlGUI:
         if data.get("memory_sync"):
             d.insert(tk.END, f"Memory: {data['memory_sync']}\n", "muted")
         checks = json_field(data, "checks", [])
-        sections = [("Goal", data.get("goal")), ("Plan", data.get("plan")),
+        sections = [("Summary (written by Node 1 after the run)", data.get("digest")),
+                    ("Goal", data.get("goal")), ("Plan", data.get("plan")),
                     ("Acceptance checks", "\n".join(f"{i}. {c}" for i, c in enumerate(checks, 1))),
                     ("Interface", data.get("interface")),
                     ("Spec (reviewed)", data.get("spec")),
@@ -1661,6 +1722,7 @@ class AgentControlGUI:
 
     def shutdown(self):
         self.chat_stop.set()
+        self._stop_digest()
         self._remove_pid_file()
 
     def _on_close(self):

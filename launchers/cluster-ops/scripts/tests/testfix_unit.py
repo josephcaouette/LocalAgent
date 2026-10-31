@@ -12,7 +12,7 @@ GOOD = BAD.replace("print('FAIL:', ex)", "print('FAIL: f raised')")
 replies, seen = [BAD, GOOD], []
 
 
-def fake_chat(label, system, blocks, want_out, min_out, temperature=None, think=False):
+def fake_chat(label, system, blocks, want_out, min_out, temperature=None, think=False, think_tokens=None):
     seen.append((think, [b["text"] for b in blocks if b["title"] == "Problem:"]))
     return replies[len(seen) - 1], "stop"
 

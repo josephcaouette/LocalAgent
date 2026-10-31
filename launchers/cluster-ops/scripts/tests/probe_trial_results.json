@@ -1,0 +1,239 @@
+[
+ {
+  "task": "glob",
+  "run_id": "20261031-063008",
+  "correct_candidates": 3,
+  "equivalent_mutants": 15,
+  "node3_generation": [
+   {
+    "sample": 1,
+    "usable": true,
+    "secs": 27,
+    "calls": [
+     {
+      "prompt_tokens": 1489,
+      "out_tokens": 1282,
+      "secs": 26.7,
+      "done": "stop"
+     }
+    ]
+   },
+   {
+    "sample": 2,
+    "usable": true,
+    "secs": 17,
+    "calls": [
+     {
+      "prompt_tokens": 1489,
+      "out_tokens": 827,
+      "secs": 17.3,
+      "done": "stop"
+     }
+    ]
+   },
+   {
+    "sample": 3,
+    "usable": false,
+    "secs": 63,
+    "calls": [
+     {
+      "prompt_tokens": 1489,
+      "out_tokens": 2981,
+      "secs": 63.3,
+      "done": "stop"
+     }
+    ]
+   }
+  ],
+  "rows": {
+   "node1": {
+    "cases": 40,
+    "ran_on_final": true,
+    "interface_errors": 0,
+    "false_disputes": 0,
+    "failed_on_correct": 0,
+    "mutants_caught": 40,
+    "mutants": 40
+   },
+   "node3_1": {
+    "cases": 30,
+    "ran_on_final": true,
+    "interface_errors": 0,
+    "false_disputes": 0,
+    "failed_on_correct": 0,
+    "mutants_caught": 38,
+    "mutants": 40
+   },
+   "node3_2": {
+    "cases": 44,
+    "ran_on_final": true,
+    "interface_errors": 0,
+    "false_disputes": 0,
+    "failed_on_correct": 0,
+    "mutants_caught": 0,
+    "mutants": 40
+   }
+  }
+ },
+ {
+  "task": "bowling",
+  "run_id": "20261031-060246",
+  "correct_candidates": 4,
+  "equivalent_mutants": 15,
+  "node3_generation": [
+   {
+    "sample": 1,
+    "usable": true,
+    "secs": 30,
+    "calls": [
+     {
+      "prompt_tokens": 1596,
+      "out_tokens": 1463,
+      "secs": 30.3,
+      "done": "stop"
+     }
+    ]
+   },
+   {
+    "sample": 2,
+    "usable": false,
+    "secs": 65,
+    "calls": [
+     {
+      "prompt_tokens": 1596,
+      "out_tokens": 3083,
+      "secs": 65.1,
+      "done": "stop"
+     }
+    ]
+   },
+   {
+    "sample": 3,
+    "usable": true,
+    "secs": 41,
+    "calls": [
+     {
+      "prompt_tokens": 1596,
+      "out_tokens": 1910,
+      "secs": 40.9,
+      "done": "stop"
+     }
+    ]
+   }
+  ],
+  "rows": {
+   "node1": {
+    "cases": 58,
+    "ran_on_final": true,
+    "interface_errors": 0,
+    "false_disputes": 0,
+    "failed_on_correct": 0,
+    "mutants_caught": 40,
+    "mutants": 40
+   },
+   "node3_1": {
+    "cases": 22,
+    "ran_on_final": true,
+    "interface_errors": 0,
+    "false_disputes": 7,
+    "failed_on_correct": 0,
+    "mutants_caught": 34,
+    "mutants": 40
+   },
+   "node3_3": {
+    "cases": 21,
+    "ran_on_final": true,
+    "interface_errors": 0,
+    "false_disputes": 0,
+    "failed_on_correct": 0,
+    "mutants_caught": 0,
+    "mutants": 40
+   }
+  }
+ },
+ {
+  "task": "calc",
+  "run_id": "20261031-070215",
+  "correct_candidates": 6,
+  "equivalent_mutants": 21,
+  "node3_generation": [
+   {
+    "sample": 1,
+    "usable": true,
+    "secs": 13,
+    "calls": [
+     {
+      "prompt_tokens": 1692,
+      "out_tokens": 628,
+      "secs": 13.1,
+      "done": "stop"
+     }
+    ]
+   },
+   {
+    "sample": 2,
+    "usable": true,
+    "secs": 22,
+    "calls": [
+     {
+      "prompt_tokens": 1692,
+      "out_tokens": 1059,
+      "secs": 22.0,
+      "done": "stop"
+     }
+    ]
+   },
+   {
+    "sample": 3,
+    "usable": true,
+    "secs": 65,
+    "calls": [
+     {
+      "prompt_tokens": 1692,
+      "out_tokens": 3045,
+      "secs": 64.6,
+      "done": "stop"
+     }
+    ]
+   }
+  ],
+  "rows": {
+   "node1": {
+    "cases": 40,
+    "ran_on_final": true,
+    "interface_errors": 0,
+    "false_disputes": 0,
+    "failed_on_correct": 0,
+    "mutants_caught": 34,
+    "mutants": 35
+   },
+   "node3_1": {
+    "cases": 42,
+    "ran_on_final": true,
+    "interface_errors": 0,
+    "false_disputes": 0,
+    "failed_on_correct": 0,
+    "mutants_caught": 0,
+    "mutants": 35
+   },
+   "node3_2": {
+    "cases": 42,
+    "ran_on_final": true,
+    "interface_errors": 0,
+    "false_disputes": 4,
+    "failed_on_correct": 0,
+    "mutants_caught": 35,
+    "mutants": 35
+   },
+   "node3_3": {
+    "cases": 30,
+    "ran_on_final": true,
+    "interface_errors": 0,
+    "false_disputes": 4,
+    "failed_on_correct": 0,
+    "mutants_caught": 33,
+    "mutants": 35
+   }
+  }
+ }
+]

@@ -31,8 +31,12 @@ Key paths:
   (`diff -q` them) because only the Z: copy is backed up.
 - Python: `/c/AI/venvs/agent_brain/Scripts/python.exe` (has pyflakes, langgraph, openai, redis).
 - vLLM log: `\\wsl.localhost\Ubuntu-24.04\home\moltjr\vllm_last.log`. Presets: **Fast** 16k
-  context (MTP, ~104 tok/s single) and **Long context** 32k (~54 tok/s single, ~270 tok/s with 6
-  requests). The window's queue switches to 32k for Ultra/MAX runs and back afterwards (~40 s each).
+  context (MTP, ~104 tok/s single) and **Long context** 32k (GPU memory 0.92, no MTP; ~53 tok/s
+  single, ~270 tok/s with 6 requests). The window's queue switches to 32k for Ultra/MAX runs and
+  back afterwards (~40 s each). To compare server settings: `scripts/tests/vllm_ab.py [config ...]`
+  (restarts vLLM per config, restores the saved settings, merges into `vllm_ab_results.json`; nothing
+  else may use Node 1 meanwhile). On 32k, MTP or `--max-num-batched-tokens 4096` shrink the KV cache
+  by 40-47% and run 2-4x slower with eight requests at once (2026-10-31).
 - Redis keys: `workflow:task:<run_id>` (hash: status, phase, profile, timings, tokens, verdict,
   spec, mutation_score...), `workflow:langgraph:001` (latest run), `workflow:active` (heartbeats;
   stale after 120 s). In Python: `config.get_redis(decode_responses=True)`,
@@ -63,6 +67,17 @@ adversary, prober in parallel), executor, verifier, condenser, retest, critic, m
 CLI: `run_langgraph_pipeline.py --goal-file F --target T --accuracy LEVEL [--no-memory --no-ingest]`.
 A running pipeline has its code loaded already; edits only affect runs started afterwards.
 
+Node 3's jobs: embeddings and memory summaries, memory relevance checks, web reading during runs,
+and chat while a run is going (the chat's Automatic model). On High+ the **example check**
+(`check_examples`, config `EXAMPLE_CHECK_BACKEND`, Node 1 by default; "node3" moves it back) writes
+a brute-force script for the plan's hand-worked values, runs it in the sandbox, and re-derives any
+disputed value with thinking. Failures skip harmlessly. Node 3 is a poor fit for writing code that
+other steps run unchecked: `scripts/tests/probe_trial.py` (probe files scored on the correct
+candidates and on AST mutants of three saved runs; Node 3 and the sandbox only) gave Node 1 114/115
+mutants caught with no false disputes, and Node 3 1 good file in 9 (2026-10-31).
+Node 1 writes **run digests** (`run_digest.py`, Redis field `digest`, shown as the Runs tab's
+Summary) whenever the window's queue is idle; a launch or a vLLM switch kills the worker.
+
 ## Procedures
 
 ### Check on a run
@@ -77,9 +92,55 @@ the record STOPPED, removes its containers. Only for runs you started or the use
 ### Before committing pipeline changes
 Run `bash scripts/run_unit_tests.sh` (pyflakes on all infrastructure files, graph build, unit tests;
 no model calls, brief sandbox use). Write a unit test with a fake `llm_chat`/`llm_complete` for any
-new pipeline behaviour (copy the pattern in `scripts/tests/*_unit.py`). For GUI or queue changes,
+new pipeline behaviour (copy the pattern in `scripts/tests/*_unit.py`). Give fakes a `**kw` (or every
+keyword `llm_chat`/`llm_complete` takes): a new keyword on the real function otherwise breaks every
+fake that lists them, as `think_tokens` once did. `chatroute_unit.py` skips its idle check while a
+real run is going, and `examples_unit.py` part 2 makes one live Node 1 call, so don't run the suite
+in the middle of a timing measurement. For GUI or queue changes,
 an end-to-end run through the window is the real test: `scripts/tests/ultra_max_e2e.py smoke`
 (Ultra, MAX and Low on small tasks; about an hour) drives a hidden ClusterWindow.
+
+### Test battery (non-cron, several levels)
+`scripts/tests/battery.py full set1` (18 runs, about 3.5 hours) or `quick set1` (Low only) queues
+five tasks (glob matcher, bowling, calculator, dependency order, free slots) through a hidden window
+and checks each result in the sandbox with `battery_checks.py` (references: fnmatch, minute brute
+force, own parsers; validated against good and deliberately wrong stubs in `tests/stubs/`). `set2`
+uses `battery2_checks.py` (semver ranges, text justify, Game of Life, CSV, TTL cache; stubs in
+`tests/stubs2/`). One run: `battery.py one set1 TASK LEVEL`; `BATTERY_TAG=_x` suffixes the target
+name and `BATTERY_EXTRA="--helper-think 8000"` adds pipeline flags. Results go to
+`battery_results_<set>.json` (set 1's first run wrote `battery_results.json`); the produced
+`<task>_<level>.py` files in `Z:\workspace` must be deleted afterwards. Use it after pipeline changes
+so fixes aren't tuned to one task.
+
+Reading results: a FAILED run whose final file still scores full marks means the pipeline rejected
+correct code, almost always a wrong hand-computed expected value in a test. Look in
+`Z:\runs\<run>\pipeline.log` for the diagnosis and BLAME lines, and run a candidate's own test with
+`ssh server@<NODE2_IP> "docker run --rm --network none -v /mnt/blackboard:/bb:ro agent-sandbox:latest
+python3 /bb/runs/<run>/a3c1/<file> --test"`. Set 1 (2026-10-31): 17/18 passed, all 18 files correct;
+the slow runs were re-test loops (now fixed in place, `inplace_unit.py`). Repeating its MAX run with
+`--helper-think 8000` changed nothing but tokens (+35%): the test writers still wrote wrong expected
+values, so it isn't a level default. Set 2 (2026-10-31): 14/18 passed, every file produced was
+correct (two runs stopped without one). Its four non-passes are fixed, each with a unit test:
+semver/low stopped on a fix too long for the window (`edits_unit.py`: SEARCH/REPLACE edits instead),
+semver/medium in the step that finishes a cut-off candidate from its notes (`finishroom_unit.py`),
+life/low re-rolled its self-test grids (`edits_unit.py`: in-place correction when only the
+expectation is blamed), and csv/high spent all 10 attempts on an ambiguous goal ("\n" as no record
+or one empty record), with the diagnosis blaming the script nine times while every candidate kept the
+reading the reference shares (`stuck_unit.py`: a repeat after a script blame now gets a decision
+that sticks). csv/ultra took 6 attempts because its test checked random inputs against the test
+writer's own parser, which had a new bug at each fix (the diagnosis rightly blamed the test).
+
+Live checks on two saved failures (`tests/data/`): `scripts/tests/inplace_live.py [1|2]`, about a
+minute with Node 1 free. Part 1 replays the in-place fix of a wrong adversarial value (must be one
+call without thinking that changes only that check); part 2 runs Low's thinking diagnosis on a
+correct glob matcher with a wrong self-test (must blame the expectation in 2 of 3 tries). Both
+passed on 2026-10-31 (part 1 twice, part 2 three of three). `scripts/tests/stuck_live.py [N]` replays
+set 2's stuck csv/high diagnosis with and without the stuck note (2N calls, ~2.5 min each);
+`stuck_live.py follow` writes two engineer candidates from an interface correction and runs the real
+acceptance test on them. On 2026-10-31: without the note, script 3/3 (the loop); with it, 4/4 broke
+the cycle (test once, script plus a correction three times), and the corrected candidates dropped
+the old failures but overcorrected a neighbouring case. The battery's csv goal now spells out "\n";
+the original wording is kept in `tests/data/csv_high_case/goal.txt` for the replay.
 
 ### Benchmark a level
 `scripts/tests/ultra_max_e2e.py bench` (Ultra + MAX on a cron parser) or `bench-max`, run in the
@@ -126,6 +187,8 @@ Commit only when the user asked for it (a standing "sync GitHub" request counts)
 | `exited with code 0 but printed lines reporting failed checks` | An independent test printed FAIL lines; it counts as failed |
 | `its container was gone; starting a fresh one` | Pre-started container missing; harmless, costs a few seconds. Frequent occurrences mean a naming clash between steps |
 | `A later step failed ..., but a version had already passed; keeping it` | The safety net saved a passing version after an error |
+| `[Node: Example Checker] -> N expected value(s) confirmed, M disputed` | Node 3's brute-force check of the plan's examples; disputes go to Node 1, which may print `Corrected ... before coding` |
+| `Node 3's script still failed ...; skipped` / `Nothing in the plan can be recomputed exactly` | The example check didn't apply or Node 3 couldn't write a working checker; the run continues unchanged |
 
 Lessons from the benchmarks (2026-10-31): the shared spec is a single point of failure (one wrong
 worked example or invented limit reaches every candidate); hand-computed expected values are the

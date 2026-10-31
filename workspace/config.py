@@ -71,6 +71,10 @@ COLLECTION_NAME = "agent_solutions"
 MEMORY_MIN_SCORE = 0.63    # cosine score needed to reuse a stored solution. In a 13-goal test with
                            # qwen3-embedding:0.6b, right matches scored 0.707 or more (average 0.768)
                            # and the best wrong match 0.566. Tune from the scores the retriever logs.
+                           # (qwen3-embedding:4b, 2026-10-31: right 0.668+, best wrong 0.484: a wider
+                           # margin but lower scores; it would need a cutoff near 0.58.)
+MEMORY_RELEVANCE_CHECK = True   # Node 3 judges each match near or above the cutoff (useful or not)
+MEMORY_RELEVANCE_MARGIN = 0.05  # matches this far below MEMORY_MIN_SCORE also get Node 3's judgment
 MEMORY_TOP_K = 3
 
 # --- vLLM on Node 1 (planner / engineer / verifier) ---------------------------
@@ -115,6 +119,9 @@ EMBED_QUERY_PREFIX = ("Instruct: Given a programming task, retrieve a stored Pyt
 EMBED_DOCUMENT_PREFIX = ""
 OLLAMA_NUM_CTX = 8192      # keep identical everywhere (incl. Restart_Node3_Worker.bat) or Ollama reloads the model
 OLLAMA_KEEP_ALIVE = -1     # sent with every request; -1 keeps models loaded indefinitely
+EXAMPLE_CHECK_BACKEND = "node1"   # who writes the example-checking script on High and above:
+                                  # "node1" (27B, no thinking; 6 of 6 correct on test plans, ~15 s) or
+                                  # "node3" (9B; 0-3 of 9). Disputes are always settled by Node 1.
 
 # --- Web research (research.py) -------------------------------------------------
 SEARXNG_URL = f"http://{NODE2_IP}:8888"    # self-hosted SearXNG (docker-compose service)
@@ -162,11 +169,16 @@ KEEP_RUNS = 30             # per-run scratch folders kept in Z:\runs
 # mutation:        deliberate small bugs check that the tests catch them; the tests get stronger.
 # vary_env:        repeat runs use other time zones, locales and working folders.
 # test_timeout:    seconds per test run.   max_checks: acceptance checks the planner may write.
+# example_check (High and above): Node 3 recomputes the plan's hand-worked expected values with a
+# brute-force script in the sandbox; Node 1 re-checks any it disagrees with before coding starts.
 # A run ends as soon as a candidate passes (and the reviewers are satisfied), or when attempts
 # or time run out.
 LEVEL_DEFAULTS = {"server": None, "spec_review": False, "reference_tests": False, "differential": False,
                   "critics": 1, "critic_proof": False, "adversary": False, "head_to_head": False,
-                  "mutation": False, "vary_env": False, "test_timeout": SANDBOX_TIMEOUT, "max_checks": 4}
+                  "mutation": False, "vary_env": False, "test_timeout": SANDBOX_TIMEOUT, "max_checks": 4,
+                  "example_check": False,
+                  # thinking budget for the tester, adversary and prober (None: the level's own)
+                  "helper_think_tokens": None}
 RUN_PROFILES = {
     "low": {"max_attempts": 3, "candidates": 2, "time_limit_s": 30 * 60, "think_engineer": "retries",
             "think_tokens": THINK_TOKENS, "diverse": False, "tester": False, "judges": 1,
@@ -176,18 +188,20 @@ RUN_PROFILES = {
                "critic_rounds": 0, "repeat_tests": 3, "exclusive": False, "research_default": False},
     "high": {"max_attempts": 10, "candidates": 4, "time_limit_s": 12 * 3600, "think_engineer": "always",
              "think_tokens": 10000, "diverse": True, "tester": True, "judges": 3,
-             "critic_rounds": 2, "repeat_tests": 3, "exclusive": True, "research_default": True},
+             "critic_rounds": 2, "repeat_tests": 3, "exclusive": True, "research_default": True,
+             "example_check": True},
     "ultra": {"max_attempts": 12, "candidates": 4, "time_limit_s": 12 * 3600, "think_engineer": "always",
               "think_tokens": 16000, "diverse": True, "tester": True, "judges": 3,
               "critic_rounds": 3, "repeat_tests": 3, "exclusive": True, "research_default": True,
               "server": "long", "spec_review": True, "reference_tests": True, "differential": True,
-              "critics": 1, "critic_proof": True, "vary_env": True, "test_timeout": 60, "max_checks": 6},
+              "critics": 1, "critic_proof": True, "vary_env": True, "test_timeout": 60, "max_checks": 6,
+              "example_check": True},
     "max": {"max_attempts": 16, "candidates": 5, "time_limit_s": 24 * 3600, "think_engineer": "always",
             "think_tokens": 16000, "diverse": True, "tester": True, "judges": 5,
             "critic_rounds": 4, "repeat_tests": 5, "exclusive": True, "research_default": True,
             "server": "long", "spec_review": True, "reference_tests": True, "differential": True,
             "critics": 2, "critic_proof": True, "adversary": True, "head_to_head": True,
-            "mutation": True, "vary_env": True, "test_timeout": 60, "max_checks": 6},
+            "mutation": True, "vary_env": True, "test_timeout": 60, "max_checks": 6, "example_check": True},
 }
 DEFAULT_ACCURACY = "low"
 LEGACY_PROFILES = {"normal": "low", "overnight": "medium"}   # names stored by older runs

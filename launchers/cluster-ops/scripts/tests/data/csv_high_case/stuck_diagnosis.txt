@@ -1,0 +1,7 @@
+1. The failed checks are `lone_lf_at_end`, `lone_crlf_at_end`, `empty_line_elsewhere_lf`, and `empty_line_elsewhere_crlf`; the script returned one or two empty records for texts consisting only of line breaks, while the test expected `[]` for a single final line break and `[[]]` for two line breaks.
+2. The goal says a line break at the very end does not start another record and that an empty line elsewhere is a record, so a lone final line break should produce no record and a non-final empty line before a final line break should produce exactly one empty record.
+3. The script is wrong because it treats the final line break as creating/terminating an empty record even when there is no earlier record or non-final empty line.
+4. The fix is to make the parser ignore a final line break as a record separator and emit an empty record only for a genuine empty line that is not merely the final line break.
+5. In particular, a text whose only line break is the final one must parse to `[]`, while a text with an earlier line break plus a final line break must parse to one empty record.
+BLAME: script
+CORRECTION: A final line break must not create a record by itself; only a non-final line break, or an empty line that exists before the final line break, produces an empty record.

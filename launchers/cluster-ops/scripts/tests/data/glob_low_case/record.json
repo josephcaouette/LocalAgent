@@ -1,0 +1,8 @@
+{
+ "goal": "Create a Python module with match(pattern, text) -> bool for shell-style wildcard matching, without using the fnmatch, glob or re modules. Rules: * matches any sequence of characters (including none); ? matches exactly one character; [abc] matches one of the listed characters and [a-c] a range; [!abc] matches one character that is NOT listed; inside brackets every character is literal (so [*] matches '*'), and a ']' right after '[' or '[!' is a literal member of the set; a '[' with no closing ']' matches a literal '['. The whole text must match, case-sensitively. Command line: python <script> PATTERN TEXT prints True or False. In --test mode check typical and tricky patterns.",
+ "spec": "",
+ "checks": "[]",
+ "interface": "",
+ "target_file": "glob_low.py",
+ "profile": "low"
+}

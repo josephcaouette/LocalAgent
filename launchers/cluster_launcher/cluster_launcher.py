@@ -47,13 +47,16 @@ PRESETS = {
     # Measured on this 4090 (WSL leaves 22.45 of 23.99 GiB free): at 16k, 0.91 holds 3.35 full
     # requests at once and 0.93 holds 3.8 but leaves only 0.14 GiB spare at startup. 20k needs
     # ~2.2 GiB more working memory, so it fits only ~1.5 requests: not worth it with best-of-N.
+    # At 32k (A/B on 31 Oct), 0.92 holds 118.9k cache tokens against 106.8k at 0.90, and eight long
+    # thinking requests finished 9% sooner. MTP there shrinks the cache to 71.5k: one request runs
+    # 34% faster, but eight at once ran 4x slower (678 preemptions), so the 32k preset leaves it off.
     "Fast (default)": {
         "model": "RedHatAI/Qwen3.8-27B-INT4", "ctx": 16384, "gpu_util": 0.92, "max_seqs": 8,
         "kv_dtype": "fp8", "attention": "TRITON_ATTN", "mtp": True, "mtp_tokens": 2,
         "cuda_graphs": True, "prefix_caching": False, "text_only": True,
         "reasoning_parser": "qwen3", "extra": ""},
     "Long context (32k, about half speed)": {
-        "model": "RedHatAI/Qwen3.8-27B-INT4", "ctx": 32768, "gpu_util": 0.90, "max_seqs": 8,
+        "model": "RedHatAI/Qwen3.8-27B-INT4", "ctx": 32768, "gpu_util": 0.92, "max_seqs": 8,
         "kv_dtype": "fp8", "attention": "TRITON_ATTN", "mtp": False, "mtp_tokens": 2,
         "cuda_graphs": True, "prefix_caching": True, "text_only": True,
         "reasoning_parser": "qwen3", "extra": ""},

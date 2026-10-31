@@ -1,0 +1,131 @@
+[
+ {
+  "config": "current (0.90, no MTP)",
+  "started": true,
+  "ready_s": 30,
+  "kv_line": "(EngineCore pid=105279) INFO 10-31 09:11:40 [kv_cache_utils.py:2327] GPU KV cache size: 106,799 tokens, Maximum concurrency for 32,768 tokens per request: 3.26x",
+  "1 single thinking": {
+   "secs": 112.8,
+   "tokens": 6000,
+   "tok_s": 53.2,
+   "preemptions": 0,
+   "peak_kv": 0.1,
+   "max_waiting": 0
+  },
+  "2 eight at once": {
+   "secs": 433.5,
+   "tokens": 112000,
+   "tok_s": 258.4,
+   "preemptions": 4,
+   "peak_kv": 1.0,
+   "max_waiting": 4
+  },
+  "3 five judges": {
+   "secs": 6.1,
+   "tokens": 766,
+   "tok_s": 126.2,
+   "preemptions": 0,
+   "peak_kv": 0.25,
+   "max_waiting": 1
+  },
+  "total_s": 552.4
+ },
+ {
+  "config": "0.92",
+  "started": true,
+  "ready_s": 30,
+  "kv_line": "(EngineCore pid=107168) INFO 10-31 09:21:30 [kv_cache_utils.py:2327] GPU KV cache size: 118,935 tokens, Maximum concurrency for 32,768 tokens per request: 3.63x",
+  "1 single thinking": {
+   "secs": 112.9,
+   "tokens": 6000,
+   "tok_s": 53.2,
+   "preemptions": 0,
+   "peak_kv": 0.09,
+   "max_waiting": 0
+  },
+  "2 eight at once": {
+   "secs": 394.1,
+   "tokens": 112000,
+   "tok_s": 284.2,
+   "preemptions": 2,
+   "peak_kv": 0.96,
+   "max_waiting": 4
+  },
+  "3 five judges": {
+   "secs": 7.0,
+   "tokens": 826,
+   "tok_s": 118.0,
+   "preemptions": 0,
+   "peak_kv": 0.23,
+   "max_waiting": 1
+  },
+  "total_s": 514.0
+ },
+ {
+  "config": "MTP + 0.92",
+  "started": true,
+  "ready_s": 32,
+  "kv_line": "(EngineCore pid=108909) INFO 10-31 09:30:43 [kv_cache_utils.py:2327] GPU KV cache size: 71,493 tokens, Maximum concurrency for 32,768 tokens per request: 2.18x",
+  "1 single thinking": {
+   "secs": 83.9,
+   "tokens": 6000,
+   "tok_s": 71.5,
+   "preemptions": 0,
+   "peak_kv": 0.25,
+   "max_waiting": 0
+  },
+  "2 eight at once": {
+   "secs": 1801.6,
+   "tokens": 98000,
+   "tok_s": 54.4,
+   "preemptions": 678,
+   "peak_kv": 1.0,
+   "max_waiting": 6
+  },
+  "3 five judges": {
+   "secs": 8.3,
+   "tokens": 951,
+   "tok_s": 115.0,
+   "preemptions": 0,
+   "peak_kv": 0.79,
+   "max_waiting": 3
+  },
+  "total_s": 1893.8
+ },
+ {
+  "config": "MTP + 0.92 + 4096 batch",
+  "started": false,
+  "log": "(EngineCore pid=116547) ERROR 10-31 10:04:07 [core.py:1510] ValueError: To serve at least one request with the model's max seq len (32768), (1.71 GiB KV cache is needed, which is larger than the available KV cache memory (1.31 GiB). Based on the available memory, the estimated maximum model length is 20800. Try increasing `gpu_memory_utilization` (which also controls CPU memory on the CPU backend) or decreasing `max_model_len` when initializing the engine. See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.\n    raise ValueError(\nValueError: To serve at least one request with the model's max seq len (32768), (1.71 GiB KV cache is needed, which is larger than the available KV cache memory (1.31 GiB). Based on the available memory, the estimated maximum model length is 20800. Try increasing `gpu_memory_utilization` (which also controls CPU memory on the CPU backend) or decreasing `max_model_len` when initializing the engine. See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.\n    raise RuntimeError(\nRuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}"
+ },
+ {
+  "config": "0.92 + 4096 batch",
+  "started": true,
+  "ready_s": 121,
+  "kv_line": "(EngineCore pid=118986) INFO 10-31 10:15:29 [kv_cache_utils.py:2327] GPU KV cache size: 63,108 tokens, Maximum concurrency for 32,768 tokens per request: 1.93x",
+  "1 single thinking": {
+   "secs": 112.7,
+   "tokens": 6000,
+   "tok_s": 53.2,
+   "preemptions": 0,
+   "peak_kv": 0.18,
+   "max_waiting": 0
+  },
+  "2 eight at once": {
+   "secs": 864.9,
+   "tokens": 112000,
+   "tok_s": 129.5,
+   "preemptions": 18,
+   "peak_kv": 0.98,
+   "max_waiting": 5
+  },
+  "3 five judges": {
+   "secs": 6.2,
+   "tokens": 753,
+   "tok_s": 121.8,
+   "preemptions": 0,
+   "peak_kv": 0.43,
+   "max_waiting": 1
+  },
+  "total_s": 983.8
+ }
+]

@@ -100,6 +100,8 @@ def main():
             id=point_id, vector=vector, payload={
                 "filename": target, "goal": goal, "summary": summary, "tags": tags, "code": code,
                 "checks": job.get("checks", []), "verdict": job.get("verdict", ""),
+                # pitfalls the run proved (corrected examples, review findings, mutation checks)
+                "lessons": [str(x) for x in job.get("lessons") or []][:8],
                 "embed_model": config.EMBED_MODEL, "updated_at": int(time.time()),
             })])
     except Exception as e:

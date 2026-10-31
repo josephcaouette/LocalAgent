@@ -132,6 +132,7 @@ class AgentState(TypedDict):
     mutation_done: bool
     retest: bool            # the diagnosis blamed only the test: fix it and re-test the same code
     retests_used: int
+    indep_last: dict        # the last independent-test diagnosis: {"role", "fails", "blame", "attempt"}
     best_passed: dict       # the last version that passed, kept while the reviewer's fixes run
     started: float
     time_limit_s: int
@@ -362,7 +363,7 @@ _SHORTENED_NOTED = set()
 
 
 def llm_complete(label, system, blocks, want_out, min_out, temperature=None, think=False, n=1,
-                 answer_min=None, with_reasoning=False):
+                 answer_min=None, with_reasoning=False, think_tokens=None):
     """Chat completion(s) with context budgeting. Returns a list of (text, finish_reason), or of
     (text, finish_reason, reasoning) with with_reasoning=True. think=True lets the model reason
     before answering. The thinking is capped (vLLM's thinking_token_budget) so at least
@@ -374,11 +375,11 @@ def llm_complete(label, system, blocks, want_out, min_out, temperature=None, thi
     for try_no in range(2):
         messages, max_tokens = fit_messages(system, blocks, want_out, min_out,
                                             extra_margin=0 if try_no == 0 else 768,
-                                            template_kwargs=kwargs, soft=THINK_TOKENS // 2 if think else 0)
+                                            template_kwargs=kwargs, soft=(think_tokens or THINK_TOKENS) // 2 if think else 0)
         extra = {"top_k": config.LLM_TOP_K, "chat_template_kwargs": kwargs}
         if think:
             room = max_tokens - (answer_min if answer_min is not None else min_out)
-            extra["thinking_token_budget"] = max(256, min(THINK_TOKENS, room))
+            extra["thinking_token_budget"] = max(256, min(think_tokens or THINK_TOKENS, room))
         try:
             resp = LLM.chat.completions.create(
                 model=MODEL_ID, messages=messages, max_tokens=max_tokens, n=n,
@@ -413,17 +414,26 @@ def llm_complete(label, system, blocks, want_out, min_out, temperature=None, thi
     raise LLMError(f"{label}: request failed")
 
 
-def llm_chat(label, system, blocks, want_out, min_out, temperature=None, think=False):
-    """One completion. If thinking used up the whole budget before answering, retry without it."""
+def llm_chat(label, system, blocks, want_out, min_out, temperature=None, think=False, think_tokens=None):
+    """One completion. Thinking that runs past its budget tends to carry on in the answer, which
+    then gets cut off; in that case answer again without thinking, from the notes so far."""
     answer_min = min_out
     if think:
-        want_out, min_out = want_out + THINK_TOKENS, min_out + 1500
-    text, finish = llm_complete(label, system, blocks, want_out, min_out, temperature, think,
-                                answer_min=answer_min)[0]
-    if think and finish == "length" and not text:
-        print(f"    [i] {label}: thinking ran out of room; answering again without thinking.")
-        text, finish = llm_complete(label, system, blocks, want_out - THINK_TOKENS,
-                                    min_out - 1500, temperature, False)[0]
+        budget = think_tokens or THINK_TOKENS          # a step may think less than the level's budget
+        want_out, min_out = want_out + budget, min_out + 1500
+    text, finish, notes = llm_complete(label, system, blocks, want_out, min_out, temperature, think,
+                                       answer_min=answer_min, with_reasoning=True,
+                                       think_tokens=think_tokens)[0]
+    if think and finish == "length":
+        print(f"    [i] {label}: ran out of room after thinking; answering again from its notes, "
+              "without thinking.")
+        if text:
+            notes += "\n\n(Then, in the answer, which was cut off:)\n" + text
+        more = [block("Your notes from thinking this through (cut short). Don't think again: give "
+                      "your answer now, in the format asked for.", notes, trim=2, keep="tail",
+                      min_chars=1500)] if notes else []
+        text, finish = llm_complete(label, system, blocks[:-1] + more + blocks[-1:],
+                                    want_out - budget, min_out - 1500, temperature, False)[0]
     return text, finish
 
 
@@ -457,6 +467,17 @@ def extract_code(raw):
     untagged = [b for b in blocks if not b[0]]
     pool = python or untagged or blocks
     return max(pool, key=lambda b: len(b[1]))[1].strip("\n"), True
+
+
+def only_expressions(code):
+    """True when 'code' is only bare values: a JSON plan or a docstring compiles as Python too,
+    then runs cleanly and prints nothing."""
+    try:
+        body = ast.parse(code).body
+    except SyntaxError:
+        return False                    # the syntax check reports it
+    literals = (ast.Constant, ast.Dict, ast.List, ast.Set, ast.Tuple, ast.JoinedStr)
+    return all(isinstance(n, ast.Expr) and isinstance(n.value, literals) for n in body)
 
 
 _UNDEFINED = ("UndefinedName", "UndefinedLocal", "UndefinedExport")
@@ -1145,20 +1166,48 @@ def memory_retriever_node(state):
         print("\n".join(lines))
         return {"memory_context": "", "memory_summary": ""}
     code_parts, summaries = [], []
+    check = getattr(config, "MEMORY_RELEVANCE_CHECK", False)
+    floor = config.MEMORY_MIN_SCORE - (getattr(config, "MEMORY_RELEVANCE_MARGIN", 0.0) if check else 0.0)
     for hit in hits:
         p = hit.payload or {}
         name = p.get("filename", "?")
-        if hit.score < config.MEMORY_MIN_SCORE:
-            lines.append(f"--> {name}: score {hit.score:.3f} (below {config.MEMORY_MIN_SCORE:.2f}, ignored)")
+        if hit.score < floor:
+            lines.append(f"--> {name}: score {hit.score:.3f} (below {floor:.2f}, ignored)")
             continue
-        lines.append(f"--> Reusing pattern from {name} (score {hit.score:.3f})")
-        summaries.append(f"- {name}: {p.get('summary', '')}")
+        verdict = memory_relevant(state["goal"], p) if check else None
+        if verdict is False or (verdict is None and hit.score < config.MEMORY_MIN_SCORE):
+            why = "Node 3: not useful for this goal" if verdict is False else f"below {config.MEMORY_MIN_SCORE:.2f}"
+            lines.append(f"--> {name}: score {hit.score:.3f} ({why}, ignored)")
+            continue
+        lines.append(f"--> Reusing pattern from {name} (score {hit.score:.3f}"
+                     f"{', Node 3 agrees it fits' if verdict else ''})")
+        lessons = [str(x) for x in p.get("lessons") or []]
+        summaries.append(f"- {name}: {p.get('summary', '')}"
+                         + "".join(f"\n  Pitfall proven when it was built: {x}" for x in lessons))
         code_parts.append(f"--- {name} (built for: {str(p.get('goal', ''))[:200]}) ---\n"
-                          f"{str(p.get('code', ''))[:8000]}")
+                          + "".join(f"# Pitfall proven when it was built: {x}\n" for x in lessons)
+                          + f"{str(p.get('code', ''))[:8000]}")
     if not hits:
         lines.append("--> No stored solutions yet.")
     print("\n".join(lines))
     return {"memory_context": "\n\n".join(code_parts), "memory_summary": "\n".join(summaries)}
+
+
+def memory_relevant(goal, payload):
+    """Node 3 judges whether a stored solution would really help with this goal (a fixed score
+    cutoff can't tell a near miss from a fit). True, False, or None if Node 3 didn't answer."""
+    prompt = ("A new programming task and a stored, verified solution from an earlier task.\n"
+              f"New task: {goal[:1500]}\n\nStored solution: {payload.get('filename', '?')}\n"
+              f"Built for: {str(payload.get('goal', ''))[:800]}\nWhat it does: {payload.get('summary', '')}\n\n"
+              "Would the stored solution be a useful reference for the new task: the same kind of problem, or "
+              'code and approach that carry over? Reply with ONLY {"useful": true or false}.')
+    try:
+        data = parse_json_object(ollama_generate(prompt, temperature=0.0, json_mode=True, timeout=60,
+                                                 num_predict=30)) or {}
+    except Exception:
+        return None
+    value = data.get("useful")
+    return value if isinstance(value, bool) else None
 
 
 def research_scout_node(state):
@@ -1284,6 +1333,8 @@ def planner_node(state):
     spec = ""
     if state["lvl"]["spec_review"]:
         spec, plan, checks, interface = review_spec(state, plan, checks, interface)
+    if state["lvl"]["example_check"]:
+        spec, checks = check_examples(state, spec, checks, interface)
     print("\n" + "=" * 20 + " ARCHITECT EXECUTION PLAN " + "=" * 20)
     print(plan)
     print("Acceptance checks:\n" + (numbered(checks) if checks else "(none parsed; the verifier will judge against the goal)"))
@@ -1294,6 +1345,157 @@ def planner_node(state):
     print("=" * 66)
     report(state, phase="planned", plan=plan, checks=checks, interface=interface, spec=spec)
     return {"plan": plan, "checks": checks, "interface": interface, "spec": spec}
+
+
+EXAMPLE_INSTRUCTIONS = (
+    "The plan above states concrete expected results: example inputs with their exact outputs, worked "
+    "out by hand, which can be wrong. Write ONE short Python 3 script, under 80 lines (standard "
+    "library only, no network, finishes within 30 seconds), that checks them:\n"
+    "- Check only the stated results. Don't build the whole program: write just enough to recompute "
+    "each stated result independently and compare it with the stated value.\n"
+    "- If a standard-library function already implements the rule, use it (the program under test may "
+    "be banned from using it; this check isn't). Otherwise use the most direct brute force that follows "
+    "the goal's rules (simple loops over every possibility, no clever shortcuts).\n"
+    "- Skip anything about wording, formatting, timing or files, and anything you can't compute exactly.\n"
+    "- Print exactly one line per checked result: `AGREE <short label>` or "
+    "`DISAGREE <short label>: stated <value>, computed <value>`. Wrap each check in try/except: if "
+    "computing it fails, print `SKIP <short label>: <error>` and go on to the next one.\n"
+    "- Reason before you write; keep comments to a few words.\n"
+    "- Don't import the script under test: it doesn't exist yet.\n"
+    "If nothing can be checked, reply with just NO-EXAMPLES. Otherwise reply with only the code in "
+    "one ```python block.")
+
+
+def check_examples(state, spec, checks, interface):
+    """High and above: a checking script (written by Node 1 without thinking, or by Node 3; see
+    config.EXAMPLE_CHECK_BACKEND) recomputes the plan's hand-worked expected values (spec examples and
+    acceptance checks) in the sandbox. Node 1 re-derives any value it disputes, with thinking, and
+    corrects the plan before a candidate copies it. The script only raises flags; any problem on the
+    way skips the step. Returns (spec, checks)."""
+    stated = "\n\n".join(x for x in (f"Spec:\n{spec}" if spec else "",
+                                      f"Acceptance checks:\n{numbered(checks)}" if checks else "") if x)
+    if not stated:
+        return spec, checks
+    backend = getattr(config, "EXAMPLE_CHECK_BACKEND", "node1")
+    who = "Node 3" if backend == "node3" else "Node 1"
+    print(f"\n[Node: Example Checker] {who} writes a script that recomputes the plan's expected values...")
+    report(state, phase="checking the plan's examples")
+    t0 = time.time()
+    prompt = f"Goal:\n{state['goal']}\n\n{stated}\n\n{EXAMPLE_INSTRUCTIONS}"
+    code, problem = "", ""
+    for try_no in (1, 2):               # one repair: a crash in the script shouldn't waste the check
+        ask = prompt if try_no == 1 else (
+            f"{prompt}\n\nYour script failed:\n{TICK3}python\n{code}\n{TICK3}\n{problem}\n"
+            f"Fix it and reply with the whole corrected script in one {TICK3}python block. Keep it under "
+            "80 lines: if it was cut off, it was too long.")
+        try:
+            raw = write_example_script(backend, ask)
+        except Exception as e:
+            print(f"-> Skipped: {who} didn't answer ({short(e)}).")
+            return spec, checks
+        if "NO-EXAMPLES" in raw and TICK3 not in raw:
+            print("-> Nothing in the plan can be recomputed exactly.")
+            return spec, checks
+        code, _ = extract_code(raw)
+        if not code.strip():
+            print(f"-> {who} returned no script; skipped.")
+            return spec, checks
+        try:
+            compile(code, "example_check.py", "exec")
+        except SyntaxError as e:
+            problem = f"It doesn't compile: line {e.lineno}: {e.msg}"
+        else:
+            undefined = static_problems(code, "example_check.py")
+            if undefined:               # cheaper and clearer than a crash in the sandbox
+                problem = "It uses names it never defines:\n" + "\n".join(undefined[:5])
+                if try_no == 1:
+                    print(f"    [i] {who}'s script failed ({problem.splitlines()[1][:160]}); asking for a fix.")
+                continue
+            res = run_example_script(state, code, f"examples{try_no}")
+            if res is None:
+                return spec, checks
+            out = res.stdout or ""
+            agree = re.findall(r"^AGREE\b.*$", out, re.M)
+            disputed = re.findall(r"^DISAGREE\b.*$", out, re.M)
+            if agree or disputed:
+                break
+            problem = (f"It printed no AGREE or DISAGREE lines (exit {res.returncode}). Its error output:\n"
+                       f"{tail((res.stderr or '').strip(), 1500)}")
+        if try_no == 1:
+            print(f"    [i] {who}'s script failed ({problem.splitlines()[0][:160]}); asking for a fix.")
+    else:
+        print(f"-> {who}'s script still failed ({problem.splitlines()[-1][:160]}); skipped.")
+        return spec, checks
+    print(f"-> {len(agree)} expected value(s) confirmed, {len(disputed)} disputed ({time.time() - t0:.0f}s).")
+    for line in disputed:
+        print(f"    {line[:240]}")
+    if not disputed:
+        return spec, checks
+    return recheck_examples(state, spec, checks, interface, disputed, code)
+
+
+def write_example_script(backend, prompt):
+    """The checking script's text, from Node 1 (no thinking; 6 of 6 correct on test plans, ~15 s) or
+    Node 3 (0-3 of 9 on the same plans, so it's off by default)."""
+    if backend == "node3":
+        return ollama_generate(prompt, temperature=0.2, timeout=180, num_predict=3000)
+    raw, _ = llm_chat("Example checker", "You write small, correct Python checking scripts.",
+                      [block("Task:", prompt)], want_out=3000, min_out=800, temperature=0.2)
+    return raw
+
+
+def run_example_script(state, code, box):
+    """Run Node 3's checking script in its own sandbox box. None if the sandbox couldn't."""
+    folder = box_dir(state, box)
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "example_check.py"), "w", encoding="utf-8", newline="\n") as f:
+        f.write(code.rstrip() + "\n")
+    try:
+        return run_in_box(state, box, ["timeout", "-k", "3", "60", "python3", "/work/example_check.py"])
+    except (InfraError, subprocess.TimeoutExpired) as e:
+        print(f"-> Skipped: the sandbox couldn't run the script ({short(e)}).")
+        return None
+    finally:
+        remove_boxes(state, [box])
+
+
+def recheck_examples(state, spec, checks, interface, disputed, script):
+    """Node 1 works out each disputed value itself and fixes only those that are wrong."""
+    print("    Node 1 re-derives the disputed values (thinking first)...")
+    instructions = (
+        'Return ONLY this JSON object: {"verdicts": [{"example": "...", "stated_is_right": true or false, '
+        '"correct": "the right value, if the stated one is wrong", "reason": "one sentence"}], '
+        '"checks": ["every acceptance check, corrected only where it states a wrong value"]}\n'
+        "An independent checking script (it can be wrong too) disagrees "
+        "with the expected values below. For each one, work the value out yourself, step by step from the "
+        "goal's rules, and decide who is right. Change nothing else.")
+    blocks = [block("Goal:", state["goal"]), block("Spec:", spec, trim=3),
+              block("Acceptance checks:", numbered(checks)), block("Interface:", interface),
+              block("Disputed values (from the script's output):", "\n".join(disputed)),
+              block("The brute-force script:", script, code=True, trim=2, min_chars=1500),
+              block("Instructions:", instructions)]
+    try:
+        raw, _ = llm_chat("Spec reviewer", SPEC_SYSTEM, blocks, want_out=1500, min_out=400, think=True)
+    except LLMError as e:
+        if not isinstance(e, ContextTooSmall):
+            raise
+        print(f"-> Re-check skipped ({short(e)}); keeping the plan as it was.")
+        return spec, checks
+    data = parse_json_object(raw) or {}
+    wrong = [v for v in data.get("verdicts") or []
+             if isinstance(v, dict) and v.get("stated_is_right") in (False, "false", "False")]
+    if not wrong:
+        print("-> Node 1 confirmed the stated values; the plan is unchanged.")
+        return spec, checks
+    fixes = "; ".join(f"{str(v.get('example', '')).strip()}: {str(v.get('correct', '')).strip()}"
+                      for v in wrong)[:1200]
+    new_checks = [str(c).strip() for c in data.get("checks") or [] if str(c).strip()]
+    changed = sum(1 for a, b in zip(checks, new_checks) if a != b)
+    if len(new_checks) == len(checks) and 0 < changed <= len(wrong) + 1:
+        checks = new_checks                 # only the checks that state a wrong value may change
+    note = f"CORRECTION (checked by running code before coding started; overrides any example above): {fixes}"
+    print(f"-> Corrected {len(wrong)} expected value(s) before coding: {fixes[:300]}")
+    return (spec + "\n\n" + note if spec else note), checks
 
 
 def as_text(value):
@@ -1334,6 +1536,8 @@ def review_spec(state, plan, checks, interface):
               block(WEB_TITLE, state["web_brief"], trim=2),
               block("Plan:", plan), block("Acceptance checks:", numbered(checks)),
               block("Interface:", interface),
+              block("Similar past solutions and the pitfalls proven when they were built:",
+                    state.get("memory_summary", ""), trim=3),
               block("Instructions:", instructions)]
     try:
         raw, _ = llm_chat("Spec reviewer", SPEC_SYSTEM, blocks, want_out=3000, min_out=800, think=True)
@@ -1410,6 +1614,68 @@ def setup_note():
             "subprocess.CompletedProcess with text stdout and stderr. Don't repeat that setup.\n")
 
 
+EDIT_BLOCK = re.compile(r"^<{7} ?SEARCH[ \t]*\n(.*?)^={7}[ \t]*\n(.*?)^>{7} ?REPLACE[ \t]*$", re.S | re.M)
+EDIT_FORMAT = ("Reply with only edits in this format, one block per change. Copy the SEARCH lines exactly from "
+               "the {what}, with enough lines to be unique; leave the part after ======= empty to delete them.\n"
+               "<<<<<<< SEARCH\n<lines copied from the {what}>\n=======\n<replacement lines>\n>>>>>>> REPLACE")
+
+
+def apply_edits(text, reply):
+    """Apply the SEARCH/REPLACE blocks in a reply to text: (new text, edits applied, problem).
+    Each SEARCH part must match exactly one place: whole lines (ignoring trailing spaces), or
+    failing that, one exact piece of text."""
+    edits = EDIT_BLOCK.findall(reply)
+    if not edits:
+        return text, 0, "came back without any edit blocks"
+    for search, replace in edits:
+        search, replace = search[:-1] if search.endswith("\n") else search, replace[:-1] if replace.endswith("\n") else replace
+        if not search.strip():
+            return text, 0, "has an edit with nothing to search for"
+        lines, want = text.split("\n"), [ln.rstrip() for ln in search.split("\n")]
+        hits = [i for i in range(len(lines) - len(want) + 1)
+                if [ln.rstrip() for ln in lines[i:i + len(want)]] == want]
+        if len(hits) == 1:
+            lines[hits[0]:hits[0] + len(want)] = replace.split("\n") if replace else []
+            text = "\n".join(lines)
+            continue
+        count = len(hits) or text.count(search)
+        if count != 1:
+            return text, 0, f"has an edit that matches {count} places"
+        text = text.replace(search, replace, 1)
+    return text, len(edits), ""
+
+
+def fix_test_in_place(state, role, system, blocks):
+    """A diagnosis blamed this test: its writer sends small SEARCH/REPLACE edits instead of a new
+    test, so the checks that already passed can't change. (A full rewrite re-rolls every hand-computed
+    expected value and tends to bring in new mistakes.) Returns the full test file, or "" to rewrite."""
+    target, name = state["target_file"], ROLE_NAMES[role]
+    old = test_body(state, role)
+    ask = ("A diagnosis found that this test itself was wrong. Fix exactly what it says is wrong: correct "
+           "the disputed expected values, or delete those checks if you aren't certain of the right value. "
+           "Change nothing else and add no new checks: every other check already passed.\n"
+           + EDIT_FORMAT.format(what="test"))
+    try:
+        raw, finish = llm_chat(name, system, blocks + [
+            block("Your previous test:", old, trim=2, code=True, min_chars=4000),
+            block("Diagnosis of the last failure:", state["test_feedback"].get(role, ""), trim=1, keep="tail"),
+            block("What happened:", state["error"], trim=1, keep="tail", min_chars=1000),
+            block("Task:", ask)], want_out=2000, min_out=600, temperature=0.2)
+    except ContextTooSmall:
+        return ""
+    new, n, problem = apply_edits(old, raw) if finish != "length" else (old, 0, "was cut off")
+    if not problem and new.strip() == old.strip():
+        problem = "changed nothing"
+    full = ""
+    if not problem:
+        full, problem = test_problem(target, role, new)
+    if problem:
+        print(f"    [i] {name}: the in-place fix {problem}; writing the test again instead.")
+        return ""
+    print(f"    {name}: fixed the test in place ({n} edit{'' if n == 1 else 's'}; the other checks are unchanged).")
+    return full
+
+
 def write_test(state, role="acceptance"):
     """A separate call writes an independent test from the goal, spec, checks and interface only
     (it never sees the code). "acceptance" checks the goal (on Ultra and MAX also against a simple
@@ -1461,6 +1727,10 @@ def write_test(state, role="acceptance"):
         block("Acceptance checks:", numbered(state["checks"]) or "(none; test the goal directly)"),
         block("Interface:", state["interface"] or "(not specified; infer the obvious interface from the goal)"),
     ]
+    if state["tests"].get(role) and state["test_feedback"].get(role):
+        fixed = fix_test_in_place(state, role, system, blocks)
+        if fixed:
+            return fixed
     if state["tests"].get(role):
         update = "Update this test so it covers every acceptance check above. Keep the parts that are right."
         feedback = state["test_feedback"].get(role, "")
@@ -1473,7 +1743,8 @@ def write_test(state, role="acceptance"):
     blocks.append(block("Instructions:", instructions))
     try:
         # answer room first (min_out), so the thinking can't squeeze the test until it's cut off
-        raw, finish = llm_chat(name, system, blocks, want_out=7000, min_out=5000, think=True)
+        raw, finish = llm_chat(name, system, blocks, want_out=7000, min_out=5000, think=True,
+                               think_tokens=state["lvl"].get("helper_think_tokens"))
         if finish == "length":
             print(f"    [i] {name}: the test was cut off; writing it again without thinking.")
             raw, finish = llm_chat(name, system, blocks, want_out=8000, min_out=3000, think=False)
@@ -1577,7 +1848,8 @@ def write_probe(state):
               block("Instructions:", instructions)]
     try:
         # answer room first: 20-40 cases need several thousand tokens after the thinking
-        raw, finish = llm_chat("Prober", PROBER_SYSTEM, blocks, want_out=6000, min_out=4000, think=True)
+        raw, finish = llm_chat("Prober", PROBER_SYSTEM, blocks, want_out=6000, min_out=4000, think=True,
+                               think_tokens=state["lvl"].get("helper_think_tokens"))
         if finish == "length":
             print("    [i] Prober: the cases were cut off; writing them again without thinking.")
             raw, finish = llm_chat("Prober", PROBER_SYSTEM, blocks, want_out=7000, min_out=3000, think=False)
@@ -1598,6 +1870,45 @@ def write_probe(state):
         print("    [!] Prober: the probe file is incomplete (needs CASES and run()).")
         return ""
     return full
+
+
+def engineer_edits(state, system, blocks, think, n, reason="too long"):
+    """SEARCH/REPLACE edits to the previous version instead of a whole new file, when
+    - reason "too long": the whole file doesn't fit in this context window (the prompt carries the whole
+      previous version, and the answer would need it all again);
+    - reason "expectation": the diagnosis blamed only the self-test's expected values, and a rewrite
+      re-rolls every hand-computed value (it tends to bring in new mistakes).
+    Returns replies shaped like llm_complete's (raw, finish, notes), where raw holds the edited file,
+    and {k: problem} for replies whose edits didn't apply."""
+    if reason == "expectation":
+        ask = ("The diagnosis says the code is right and the self-test's hand-computed expected values are "
+               "wrong. Correct exactly the expected values it names, after working each one out yourself "
+               "from the goal, or delete those checks if you aren't certain of the right value. Change "
+               "nothing else: the rest of the file already works.\n")
+    else:
+        ask = ("The file is too long to send back whole, so change it with edits. Fix the problem while "
+               "still meeting the goal and every acceptance check. If a failing self-test compares against "
+               "a hand-computed expected value, first check that value against the goal and standard "
+               "behaviour; fix the expectation if it's the expectation that's wrong. Don't delete required "
+               "functionality just to make the error go away.\n")
+    ask += EDIT_FORMAT.format(what="previous version")
+    want_out, min_out, answer_min = 4000, 1500, 1500
+    if think:
+        want_out, min_out = want_out + THINK_TOKENS, min_out + 1500
+    replies = llm_complete("Engineer, edits", system, blocks[:-1] + [block("Instructions:", ask)], want_out,
+                           min_out, think=think, n=n, answer_min=answer_min, with_reasoning=True)
+    out, problems = [], {}
+    for k, (raw, _finish, notes) in enumerate(replies, 1):
+        code, count, problem = apply_edits(state["code"], raw)   # a cut-off reply keeps its complete edits
+        if not problem and code.strip() == state["code"].strip():
+            problem = "changed nothing"
+        if problem:
+            problems[k] = problem
+            out.append(("", "stop", notes))
+        else:
+            print(f"    Candidate {k}: {count} edit{'' if count == 1 else 's'} to the previous version.")
+            out.append((f"{TICK3}python\n{code}\n{TICK3}", "stop", notes))
+    return out, problems
 
 
 def engineer_node(state):
@@ -1673,7 +1984,7 @@ def engineer_node(state):
     base_tokens = len(state["code"] if fixing else existing) // 3
     min_out = max(1200, base_tokens + 300)
     want_out = max(min_out, base_tokens + 800, min(config.ENGINEER_MAX_OUTPUT, CONTEXT_TOKENS // 2))
-    answer_min = min_out
+    answer_min = file_min = min_out
     if think:
         # The file always keeps room for its full size; thinking gets whatever is left, up to
         # the level's budget. In a 16k context that caps thinking near 5,000 tokens; with the
@@ -1685,14 +1996,32 @@ def engineer_node(state):
 
     def hint(k):
         return [block("Approach for this version:", APPROACHES[(k - 1) % len(APPROACHES)])] if diverse else []
+    edit_problems = {}
     if diverse:
         def one(k):
             return llm_complete("Engineer", system, blocks + hint(k), want_out, min_out,
                                 think=think, n=1, answer_min=answer_min, with_reasoning=True)[0]
         replies = list(_llm_pool.map(one, range(1, n + 1)))
     else:
-        replies = llm_complete("Engineer", system, blocks, want_out, min_out,
-                               think=think, n=n, answer_min=answer_min, with_reasoning=True)
+        # Only the self-test's expected values were blamed: one candidate corrects them in place, the
+        # others rewrite the file in case the diagnosis is wrong.
+        in_place = (fixing and n >= 2 and state["code"]
+                    and re.search(r"^BLAME:\s*expectation\b", state["error"], re.I | re.M))
+        try:
+            edit_future = None
+            if in_place:
+                print("    Candidate 1 corrects the blamed expected values in place; the others rewrite the file.")
+                edit_future = _llm_pool.submit(engineer_edits, state, system, blocks, think, 1, "expectation")
+            replies = llm_complete("Engineer", system, blocks, want_out, min_out, think=think,
+                                   n=n - 1 if in_place else n, answer_min=answer_min, with_reasoning=True)
+            if edit_future is not None:
+                first, edit_problems = edit_future.result()
+                replies = first + replies
+        except ContextTooSmall as e:
+            if not (fixing and state["code"]):
+                raise
+            print(f"    [i] Engineer: {short(e)}; asking for edits to the previous version instead.")
+            replies, edit_problems = engineer_edits(state, system, blocks, think, n)
     cut = [i for i, (_raw, finish, _notes) in enumerate(replies) if think and finish == "length"]
     if cut:
         # Thinking that runs past its budget spills into the answer, which then gets cut off.
@@ -1706,8 +2035,15 @@ def engineer_node(state):
                 notes += "\n\n(Then, in the answer, which was cut off:)\n" + raw
             more = [block("Your notes from thinking this through (cut short). Don't think again: write "
                           "the complete file now.", notes, trim=2, keep="tail", min_chars=2000)] if notes else []
-            return llm_complete("Engineer", system, blocks + hint(i + 1) + more, want_out - THINK_TOKENS,
-                                answer_min, think=False, with_reasoning=True)[0]
+            # Room to spare when it fits, but at least the file's own size: the notes take room that
+            # the first call kept for thinking. A rescue must never stop the run (set 2's semver run
+            # on Medium stopped here while two good candidates waited).
+            try:
+                return llm_complete("Engineer", system, blocks + hint(i + 1) + more, want_out - THINK_TOKENS,
+                                    file_min, think=False, with_reasoning=True)[0]
+            except ContextTooSmall as e:
+                print(f"    [i] Candidate {i + 1} can't be finished from its notes ({short(e)}); it stays cut off.")
+                return replies[i]
         for i, reply in zip(cut, list(_llm_pool.map(finish_one, cut))):
             replies[i] = reply
     replies = [(raw, finish) for raw, finish, _notes in replies]
@@ -1716,13 +2052,21 @@ def engineer_node(state):
     for k, (raw, finish) in enumerate(replies, 1):
         code, _ = extract_code(raw)
         cand = {"k": k, "code": code, "status": "coded", "error": "", "independent": diverse}
-        if finish == "length":
+        if k in edit_problems:
+            cand.update(status="no_code", error=(
+                f"Your edits to the previous version couldn't be applied: the reply {edit_problems[k]}. "
+                "Copy each SEARCH part exactly from the previous version, with enough lines to be unique."))
+        elif finish == "length":
             cand.update(status="truncated", error=(
                 "Your previous answer was cut off at the output limit, so the file was incomplete. "
                 "Write a more compact version: fewer comments, no repeated code, same functionality."))
         elif not code.strip():
             cand.update(status="no_code", error=f"Your answer contained no code. Reply with the "
                                                 f"complete file in a {TICK3}python block.")
+        elif "--test" not in code or only_expressions(code):   # a plan or notes, not a script
+            cand.update(status="no_code", error=(
+                "Your answer didn't contain the script: what came back has no --test mode (it may "
+                f"have been a plan or notes). Reply with the complete file in a {TICK3}python block."))
         else:
             try:
                 compile(code, target, "exec")
@@ -2192,6 +2536,20 @@ def failure_consensus(state, role="self"):
     return count, all(ind for s, ind in sigs if s == top), top
 
 
+_GENERIC_FAIL = re.compile(r"^(Traceback \(most recent call last\):|FAILED( \(.*\))?|FAIL|ERROR|AssertionError)$",
+                           re.IGNORECASE)
+
+
+def indep_fail_lines(state, role):
+    """The specific failure lines the candidates' runs of one independent test printed (no repeats,
+    no bare 'Traceback' or summary lines, which every failure shares)."""
+    lines = []
+    for c in state["candidates"]:
+        if c.get("failed_test") == role:
+            lines += failure_lines(c.get("tests_out", {}).get(role, (0, "", "", 0))[1] or "", 1500).splitlines()
+    return list(dict.fromkeys(s for s in (ln.strip() for ln in lines) if s and not _GENERIC_FAIL.match(s)))
+
+
 def consensus_note(state, role="self"):
     """A sentence for the diagnosis when several candidates failed in exactly the same way."""
     count, independent, lines = failure_consensus(state, role)
@@ -2214,6 +2572,11 @@ def error_condenser_node(state):
         return diagnose_independent_failure(state)
     if state["judges"] > 1 and state["failure_kind"] == "runtime":
         return diagnose_deep(state)
+    if (state["failure_kind"] == "runtime" and config.HELPER_BACKEND == "node1"
+            and "report failures:" in raw_error and "Traceback" not in raw_error):
+        # Low and Medium: checks failed without a crash, so the code or a hand-computed expected
+        # value is wrong. Telling which means working the value out, which needs a little thinking.
+        return diagnose_deep(state, think_tokens=min(THINK_TOKENS, LOW_DIAGNOSIS_THINK))
     where = "Node 1" if config.HELPER_BACKEND == "node1" else "Node 3"
     print(f"\n[Node: Error Condenser] Diagnosing the failure on {where} "
           f"(attempt {state['attempt'] - 1})...")
@@ -2249,11 +2612,15 @@ def error_condenser_node(state):
     return {"error": f"DIAGNOSIS:\n{diagnosis}\n\nRAW ERROR (tail):\n{tail(raw_error, 2500)}"}
 
 
-def diagnose_deep(state):
-    """High and above, the script's own test failed: think it through with the spec, and with a note
-    when several candidates failed identically. Expected values written by hand (in the self-test,
-    the checks or the spec's examples) are often what's wrong. When independently written
-    candidates all agree, a corrected expected value is added to the spec for every later step."""
+LOW_DIAGNOSIS_THINK = 3000    # Low and Medium: thinking for a failed check (no crash) in the self-test
+
+
+def diagnose_deep(state, think_tokens=None):
+    """High and above, the script's own test failed (Low and Medium: a check failed without a
+    crash): think it through with the spec, and with a note when several candidates failed
+    identically. Expected values written by hand (in the self-test, the checks or the spec's
+    examples) are often what's wrong. When independently written candidates all agree, a
+    corrected expected value is added to the spec for every later step."""
     attempt = state["attempt"] - 1
     print(f"\n[Node: Error Condenser] Diagnosing the failure (thinking first, attempt {attempt})...")
     report(state, phase=f"diagnosing (attempt {attempt}/{state['max_attempts']})")
@@ -2283,7 +2650,7 @@ def diagnose_deep(state):
              block("Failing code:", state["code"], trim=2, code=True, min_chars=3000),
              block("Error output:", state["error"], trim=1, keep="tail", min_chars=1500),
              block("Instructions:", ask)],
-            want_out=700, min_out=200, think=True)
+            want_out=700, min_out=200, think=True, think_tokens=think_tokens)
     except LLMError as e:
         if not isinstance(e, ContextTooSmall):
             raise
@@ -2318,6 +2685,18 @@ def diagnose_independent_failure(state):
            "3. The exact fix (to the script, to the test, or to both).\n"
            "Keep it under 6 sentences and write no code. End with one line that is exactly one of: "
            "BLAME: script / BLAME: test / BLAME: both")
+    attempt = state["attempt"] - 1
+    fails = indep_fail_lines(state, role)
+    # The same checks still fail after a diagnosis that blamed the script: the candidates read the
+    # goal differently from the test, and saying it again won't change that (set 2's csv run on High
+    # blamed the script nine times while every candidate kept the reading the reference agrees with).
+    last = state.get("indep_last") or {}
+    stuck = ([ln for ln in fails if ln in set(last.get("fails") or [])]
+             if last.get("role") == role and last.get("blame") in ("script", "both") else [])
+    if stuck:
+        print(f"    {len(stuck)} of these checks failed the same way after attempt {last['attempt']}'s "
+              "diagnosis blamed the script; asking for a decision that sticks.")
+        ask += STUCK_NOTE.format(attempt=last["attempt"], lines=head("\n".join(stuck), 1500))
     note, _count, _independent = consensus_note(state, role)
     if note:
         print(f"    {note.splitlines()[0]}")
@@ -2351,8 +2730,32 @@ def diagnose_independent_failure(state):
                        + f"RAW ERROR (tail):\n{tail(state['error'], 2500)}",
               "test_feedback": feedback,
               # Only the test is wrong: fix it and re-test the same code instead of rewriting it.
-              "retest": blame == "test" and state["retests_used"] < MAX_RETESTS}
+              "retest": blame == "test" and state["retests_used"] < MAX_RETESTS,
+              "indep_last": {"role": role, "fails": fails, "blame": blame, "attempt": attempt}}
+    corr = re.search(r"CORRECTION:\s*(.+)", diagnosis)
+    if stuck and corr and blame in ("script", "both"):
+        # The script really must change: say so in the interface, which the engineer implements
+        # exactly and every test writer reads, rather than in one more diagnosis.
+        fix = corr.group(1).strip()[:600]
+        line = (f"\n\nCORRECTION (found while testing attempt {attempt}; it overrides anything above "
+                f"that it contradicts): {fix}")
+        update["interface"] = (state["interface"] + line).strip()
+        if state["spec"]:
+            update["spec"] = state["spec"] + line
+        print(f"-> Added to the interface for every later step: {fix[:200]}")
+        report(state, **{k: update[k] for k in ("interface", "spec") if k in update})
     return update
+
+
+STUCK_NOTE = (
+    "\nThe diagnosis of attempt {attempt} blamed the script for these same failures, but the candidates "
+    "written after it, with that diagnosis in hand, still fail them in exactly the same way:\n{lines}\n"
+    "So the candidates read the goal differently from the test here, and repeating the diagnosis won't "
+    "change that. Decide which reading the goal supports. If its wording allows the candidates' reading, "
+    "blame the test: only the test can be brought in line without another failed attempt. Blame the "
+    "script only if the goal clearly rules the candidates' reading out, and then add one last line: "
+    "CORRECTION: <the rule the script must follow in these cases, in one sentence>. It goes into the "
+    "interface, which the engineer implements exactly.")
 
 
 CRITIC_SYSTEM = ("You are a meticulous senior code reviewer. You look for real bugs that tests "
@@ -2835,6 +3238,24 @@ def keep_passed_version(latest, error):
         return False
 
 
+def verified_lessons(state):
+    """Pitfalls this run proved, kept with the solution in memory for similar future tasks. Only
+    machine-checked facts: expected values corrected by running code, review findings shown by a
+    failing test (and confirmed by the referee), and checks added by mutation testing. A step's
+    unverified opinion (a diagnosis, say) is never stored: it can be wrong."""
+    lessons = []
+    for m in re.finditer(r"CORRECTION \([^)]*\):\s*(.+)", state.get("spec") or ""):
+        lessons.append("An expected value worked out by hand was wrong; the corrected one: " + m.group(1).strip())
+    for item in state.get("regression") or []:
+        name = str(item.get("name", ""))
+        kind, _, what = name.partition(": ")
+        if kind.startswith("review"):
+            lessons.append("A reviewer proved this bug in a version that passed the tests: " + what)
+        elif kind.startswith("mutation"):
+            lessons.append("The tests first missed this kind of mistake (mutation testing): " + what)
+    return [x[:300] for x in dict.fromkeys(lessons)][:8]
+
+
 def dispatch_ingest(state, result_file=""):
     """Store the verified script in Qdrant memory in a detached background process."""
     worker = os.path.join(config.WORKSPACE, "background_ingest.py")
@@ -2845,7 +3266,8 @@ def dispatch_ingest(state, result_file=""):
         return
     job_path = os.path.join(config.RUNS_DIR, state["run_id"], "ingest_job.json")
     job = {"target_file": state["target_file"], "goal": state["goal"], "checks": state["checks"],
-           "verdict": state["verdict"], "task_key": state["task_key"], "code_file": result_file}
+           "verdict": state["verdict"], "task_key": state["task_key"], "code_file": result_file,
+           "lessons": verified_lessons(state)}
     try:
         with open(job_path, "w", encoding="utf-8") as f:
             json.dump(job, f)
@@ -2988,6 +3410,8 @@ def parse_args(argv):
     p.add_argument("--no-memory", action="store_true",
                    help="don't show past solutions as examples (for from-scratch benchmarks)")
     p.add_argument("--no-ingest", action="store_true", help="don't store the result in long-term memory")
+    p.add_argument("--helper-think", type=int, default=None,
+                   help="thinking budget for the tester, adversary and prober (tests and benchmarks)")
     return p.parse_args(argv)
 
 
@@ -3001,6 +3425,10 @@ def describe_level(name, p):
         parts.append(f"thinking up to {p['think_tokens']} tokens")
     if p["spec_review"]:
         parts.append("spec review")
+    if p.get("example_check"):
+        parts.append("examples checked by running code")
+    if p.get("helper_think_tokens"):
+        parts.append(f"test writers think up to {p['helper_think_tokens']} tokens")
     if p["tester"]:
         parts.append("independent tests" + (" with a reference" if p["reference_tests"] else ""))
     if p["adversary"]:
@@ -3055,6 +3483,8 @@ def main(argv=None):
     NO_MEMORY, NO_INGEST = args.no_memory, args.no_ingest
     profile_name = args.accuracy or ("medium" if args.overnight else config.DEFAULT_ACCURACY)
     profile = config.level_settings(profile_name)
+    if args.helper_think:
+        profile["helper_think_tokens"] = args.helper_think
     THINK_TOKENS = profile["think_tokens"]
     write_pid_file(run_id)
     state: AgentState = {
@@ -3067,7 +3497,8 @@ def main(argv=None):
         "critic_rounds": profile["critic_rounds"], "critic_used": 0,
         "repeat_tests": profile["repeat_tests"], "interface": "", "spec": "", "tests": {},
         "test_checks": {}, "test_feedback": {}, "failed_test": "", "regression": [], "probe": "",
-        "probe_verdicts": {}, "mutation_done": False, "retest": False, "retests_used": 0, "best_passed": {},
+        "probe_verdicts": {}, "mutation_done": False, "retest": False, "retests_used": 0, "indep_last": {},
+        "best_passed": {},
         "started": time.time(), "time_limit_s": profile["time_limit_s"],
         "existing_code": "", "memory_context": "", "memory_summary": "", "research_brief": "",
         "web_brief": "", "plan": "", "checks": [], "candidates": [], "winner": 0, "code": "",
