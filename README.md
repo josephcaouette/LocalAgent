@@ -192,6 +192,12 @@ Measured on this 4090. WSL leaves 22.45 of 23.99 GiB free, so 0.95 can't start:
 | **0.92** | **58,982 tokens** | **3.6** | 0.38 GiB |
 | 0.93 | 62,259 tokens | 3.8 | 0.14 GiB (fragile) |
 
+The **Long context (32k)** preset (GPU memory 0.90, no speculative decoding) holds **106,799
+tokens** of KV cache, 3.26 full 32k requests at once: more than Fast, because there's no draft
+model taking memory. It generates about 54 tokens/s for one request (Fast: ~104) and about 230
+tokens/s in total with five at once (Fast: ~290), so it's half speed for chat but only about 20%
+slower when a High run writes four candidates and a test together.
+
 Node 1's monitors run on the Intel graphics, not the 4090, which is why vLLM sees almost all 24 GB.
 Keep it that way: a monitor on the 4090 would use some of its memory.
 
@@ -233,7 +239,7 @@ Older runs stored "normal" (now Low) and "overnight" (now Medium).
 |---|---|---|---|
 | Attempts x candidates | 3 x 2 | 8 x 3 | 10 x 4, each told to take a **different approach** |
 | Engineer thinks | when fixing | always | always |
-| Thinking per call | up to 5,000 tokens | up to 5,000 | up to 10,000 (as much as the 16k context allows) |
+| Thinking per call | up to 5,000 tokens | up to 5,000 | up to 10,000; the engineer gets what's left after room for a full file (about 5,000 in a 16k context) |
 | Static check | yes | yes | yes |
 | **Independent tester** | - | - | A separate call writes its own acceptance test from the goal, checks and interface, without seeing the code. Candidates must pass it as well as their own test |
 | Verifier | 1 vote | 1 vote | The best candidate needs a majority of **3 independent votes** |
@@ -254,6 +260,23 @@ Older runs stored "normal" (now Low) and "overnight" (now Medium).
 - **Diverse candidates:** best-of-4 compares real alternatives instead of near-copies.
 - **Panel and critic:** the panel makes a lucky pass from a single judge unlikely, and the critic
   reads the winner for problems no test exercised.
+
+**High works best on the 32k server.** In 16k, the prompt, High's thinking and a long file don't all
+fit, so long files get cut off and thinking is squeezed. With the **Long context (32k)** preset on
+the Model server tab they fit. Measured on the same task (a cron schedule parser of 300-500 lines,
+from scratch, no memory examples), one run each:
+
+| | Fast preset (16k) | Long context preset (32k) |
+|---|---|---|
+| Result | passed on attempt 2 | passed on attempt 1 |
+| Time | 19.9 min | 13.8 min |
+| Candidates cut off | 2 of 8 | 0 of 4 |
+| First passing version correct | no (the critic caught a bug, fixed in round 2) | yes |
+| Tokens generated | 164,000 | 98,000 |
+
+Both final versions matched a brute-force reference on 52 test cases. To use it: on the Model
+server tab choose **Long context (32k)**, press **Apply preset** and **Restart vLLM**; switch back
+to **Fast** afterwards for quicker Low and Medium runs and chat.
 
 **On every level.**
 
@@ -289,7 +312,10 @@ Older runs stored "normal" (now Low) and "overnight" (now Medium).
 6. **Verifier** (thinks first): scores every candidate that passed from 0-10 against the checks. The
    best one wins; on a tie, the shorter code. On High the winner needs a majority of three votes.
 7. **If none pass:** the **diagnosis** step works out what failed (including whether the code, its
-   own test, or the independent test is wrong) and the engineer tries again.
+   own test, or the independent test is wrong) and the engineer tries again. Lines that report
+   failures are always shown to it, wherever they appear in the output. If only the independent
+   test was wrong, the tester fixes it and the **same candidates are tested again** without being
+   rewritten (up to 3 times per run).
 8. **Critic (High):** reviews the passing version; real problems send it back with new checks.
 9. **On a pass:**
    - the old file goes to `workspace\.history\` (20 kept per file);
@@ -381,7 +407,7 @@ runs the queue starts at once.
 
 | Setting | Value | Meaning |
 |---|---|---|
-| `ENGINEER_MAX_OUTPUT` | 8000 | Longest file the engineer may write, in tokens (~800-1,000 lines) |
+| `ENGINEER_MAX_OUTPUT` | 12000 | Longest file the engineer may write, in tokens. A file is also kept to half the context window: 8,192 tokens (about 600-800 lines) with the 16k server, the full 12,000 with the 32k preset |
 | `LLM_TEMPERATURE`, `LLM_TOP_P`, `LLM_TOP_K` | 0.7, 0.8, 20 | How adventurous word choice is (the model maker's values). Lower is more predictable. Thinking calls use 0.6 / 0.95. The randomness is what makes candidates differ |
 | `THINK_PLANNER`, `THINK_VERIFIER` | True | Let those steps think first |
 | `THINK_TOKENS` | 5000 | Default thinking budget (Low and Medium use it; High sets its own) |
@@ -459,7 +485,8 @@ Measured on 2026-10-30:
     after an hour.
 - **Where each run's time went** is recorded per step. For a High run on a small task (7.2 min):
   planning 82 s, writing 204 s (4 candidates and the independent test at once), testing 5 s,
-  checking 22 s, review 118 s.
+  checking 22 s, review 118 s. For the cron benchmark on the 32k preset (13.8 min): planning 204 s,
+  writing 318 s, testing 14 s, checking 101 s, review 189 s.
 
 ## Web dashboard
 

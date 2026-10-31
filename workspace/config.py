@@ -79,7 +79,8 @@ LLM_BASE_URL = "http://127.0.0.1:8001"   # not "localhost": Windows tries IPv6 f
 LLM_MODEL = "RedHatAI/Qwen3.8-27B-INT4"   # if vLLM serves another model, the pipeline uses that one
 LLM_FALLBACK_CONTEXT = 8192    # used only if vLLM doesn't report max_model_len
 LLM_TIMEOUT = 1200             # seconds per request (two runs share the GPU, so allow slow ones)
-ENGINEER_MAX_OUTPUT = 8000     # upper limit on tokens for one generated file
+ENGINEER_MAX_OUTPUT = 12000    # upper limit on tokens for one generated file; a file is also kept to
+                               # half the context window (8,192 tokens at 16k, so this matters at 32k)
 LLM_ENABLE_THINKING = False    # Qwen3.x reasons step by step before answering unless this is off.
                                # Off is several times faster; models without the switch ignore it.
 LLM_TEMPERATURE = 0.7          # sampling values from the Qwen3.8 model card (non-thinking mode)

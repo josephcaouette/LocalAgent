@@ -19,8 +19,9 @@ Flow:
                   and go back to the engineer, up to two rounds)
     -> finalize  (on pass: back up the old file to .history, promote the winner, store in memory)
 Crashes go through a diagnosis step back to the engineer (for a failed independent test it
-also decides whether the script or the test is wrong); verifier rejections go straight back.
-The live workspace file only changes on a pass.
+also decides whether the script or the test is wrong; if only the test is wrong, the tester fixes
+it and the same candidates are re-tested without a rewrite); verifier rejections go straight
+back. The live workspace file only changes on a pass.
 
 Several runs can go at once (the GUI's queue runs config.MAX_PARALLEL_RUNS): each has its own
 run folder, PID file (%TEMP%\\agent_pipeline_<run>.pid) and Redis record, and sends a heartbeat
@@ -119,6 +120,8 @@ class AgentState(TypedDict):
     indep_test: str         # the independent acceptance test ("" = none)
     indep_checks: list      # the checks it was written for
     test_feedback: str      # a diagnosis saying the independent test itself was wrong
+    retest: bool            # the diagnosis blamed only the test: fix it and re-test the same code
+    retests_used: int
     best_passed: dict       # the last version that passed, kept while the reviewer's fixes run
     started: float
     time_limit_s: int
@@ -1276,9 +1279,10 @@ def engineer_node(state):
     want_out = max(min_out, base_tokens + 800, min(config.ENGINEER_MAX_OUTPUT, CONTEXT_TOKENS // 2))
     answer_min = min_out
     if think:
-        # Thinking stops early enough to leave room for a realistic file (6,500 tokens is about
-        # 500-600 lines); otherwise a long budget squeezes the code until it's cut off.
-        answer_min = max(min_out, min(6500, want_out))
+        # The file always keeps room for its full size; thinking gets whatever is left, up to
+        # the level's budget. In a 16k context that caps thinking near 5,000 tokens; with the
+        # 32k preset a full file and the whole budget both fit.
+        answer_min = want_out
         want_out, min_out = want_out + THINK_TOKENS, min_out + 2000
     system = engineer_system(state)
     if diverse:
@@ -1354,6 +1358,40 @@ def engineer_node(state):
         return fail(state, first["status"], msg, candidates=candidates,
                     code=first["code"] if first["status"] in ("syntax", "static") else state["code"], **tests)
     return {"candidates": candidates, "status": "CODED", "error": "", "failure_kind": "", **tests}
+
+
+MAX_RETESTS = 3     # re-tests of unchanged code after a blamed test, per run
+
+
+def retest_node(state):
+    """The diagnosis said only the independent test was wrong: the tester fixes it, and the same
+    candidates are tested again in this attempt's folders (no rewrite of code that was right)."""
+    prev, attempt, target = state["attempt"] - 1, state["attempt"], state["target_file"]
+    coded = [c for c in state["candidates"] if c["status"] == "coded"]
+    print(f"\n[Node: Re-test] The independent test was wrong; the tester fixes it and the same "
+          f"{len(coded)} candidate(s) are tested again ({attempt_label(state)}).")
+    report(state, phase=f"fixing the independent test ({attempt_label(state)})", attempt=attempt)
+    try:
+        prewarm_containers(state, attempt, state["num_candidates"])
+    except OSError:
+        pass
+    new_test = write_independent_test(state)
+    if not new_test:
+        print("    The tester couldn't fix the test; the engineer takes over instead.")
+        discard_containers(state, attempt, state["num_candidates"])
+        return {"status": "RETEST_SKIPPED", "retest": False, "retests_used": state["retests_used"] + 1}
+    for c in coded:
+        src, dst = cand_dir(state, prev, c["k"]), cand_dir(state, attempt, c["k"])
+        os.makedirs(dst, exist_ok=True)
+        shutil.copyfile(os.path.join(src, target), os.path.join(dst, target))
+        with open(os.path.join(dst, INDEP_FILE), "w", encoding="utf-8", newline="\n") as f:
+            f.write(new_test)
+    tests = {"indep_test": new_test, "indep_checks": list(state["checks"]), "test_feedback": "",
+             "retest": False, "retests_used": state["retests_used"] + 1}
+    body_lines = len(new_test.splitlines()) - len(test_header(target).splitlines())
+    print(f"    Corrected independent test ready ({body_lines} lines).")
+    return dict(sandbox_executor_node(dict(state, **tests)), **{k: v for k, v in tests.items()
+                                                                 if k != "retest"}, retest=False)
 
 
 def sandbox_executor_node(state):
@@ -1592,7 +1630,9 @@ def diagnose_independent_failure(state):
     blame = m.group(1).lower() if m else "script"
     print(f"-> Diagnosis (Node 1, blame: {blame}):\n{diagnosis}")
     update = {"error": f"DIAGNOSIS:\n{diagnosis}\n\nRAW ERROR (tail):\n{tail(state['error'], 2500)}",
-              "test_feedback": diagnosis if blame in ("test", "both") else ""}
+              "test_feedback": diagnosis if blame in ("test", "both") else "",
+              # Only the test is wrong: fix it and re-test the same code instead of rewriting it.
+              "retest": blame == "test" and state["retests_used"] < MAX_RETESTS}
     return update
 
 
@@ -1770,6 +1810,18 @@ def route_after_verifier(state):
     return "finalize" if out_of_budget(state) else "engineer"
 
 
+def route_after_condenser(state):
+    return "retest" if state["retest"] else "engineer"
+
+
+def route_after_retest(state):
+    if state["status"] == "EXECUTED":
+        return "verifier"
+    if state["status"] == "RETEST_SKIPPED":
+        return "finalize" if out_of_budget(state) else "engineer"
+    return "finalize" if out_of_budget(state) else "condenser"
+
+
 def route_after_critic(state):
     if state["status"] == "CRITIQUED" and not out_of_budget(state):
         return "engineer"
@@ -1803,6 +1855,7 @@ def build_graph():
     g.add_node("verifier", timed("checking", verifier_node))
     g.add_node("condenser", timed("diagnosis", error_condenser_node))
     g.add_node("critic", timed("review", critic_node))
+    g.add_node("retest", timed("re-test", retest_node))
     g.add_node("finalize", finalize_node)
     for first in ("retriever", "scout", "web"):     # these three run in parallel
         g.add_edge(START, first)
@@ -1812,7 +1865,8 @@ def build_graph():
     g.add_conditional_edges("executor", route_after_executor, ["verifier", "condenser", "finalize"])
     g.add_conditional_edges("verifier", route_after_verifier, ["finalize", "engineer", "critic"])
     g.add_conditional_edges("critic", route_after_critic, ["engineer", "finalize"])
-    g.add_edge("condenser", "engineer")
+    g.add_conditional_edges("condenser", route_after_condenser, ["retest", "engineer"])
+    g.add_conditional_edges("retest", route_after_retest, ["verifier", "condenser", "engineer", "finalize"])
     g.add_edge("finalize", END)
     return g.compile()
 
@@ -1891,7 +1945,7 @@ def main(argv=None):
         "diverse": profile["diverse"], "tester": profile["tester"], "judges": profile["judges"],
         "critic_rounds": profile["critic_rounds"], "critic_used": 0,
         "repeat_tests": profile["repeat_tests"], "interface": "", "indep_test": "", "indep_checks": [],
-        "test_feedback": "", "best_passed": {},
+        "test_feedback": "", "retest": False, "retests_used": 0, "best_passed": {},
         "started": time.time(), "time_limit_s": profile["time_limit_s"],
         "existing_code": "", "memory_context": "", "memory_summary": "", "research_brief": "",
         "web_brief": "", "plan": "", "checks": [], "candidates": [], "winner": 0, "code": "",
