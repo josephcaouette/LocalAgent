@@ -50,6 +50,7 @@ import textwrap
 import threading
 import time
 import traceback
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict
 
@@ -311,9 +312,11 @@ def cut(text, n_chars, keep):
     return text[:n_chars] + "\n" + note if keep == "head" else note + "\n" + text[-n_chars:]
 
 
-def fit_messages(system, blocks, want_out, min_out, extra_margin=0, template_kwargs=None):
+def fit_messages(system, blocks, want_out, min_out, extra_margin=0, template_kwargs=None, soft=0):
     """Shorten trimmable sections until prompt + answer fit in the context window.
-    Returns (messages, max_tokens)."""
+    `soft` tokens of want_out are optional (thinking beyond its floor): extras such as attachments,
+    web notes and past examples (trim 4 and up) are cut first, but before the important sections
+    (spec, failure report) are cut, the thinking gives way. Returns (messages, max_tokens)."""
     blocks = [dict(b) for b in blocks]
     shortened = []
     for _ in range(16):
@@ -325,6 +328,10 @@ def fit_messages(system, blocks, want_out, min_out, extra_margin=0, template_kwa
             max_tokens = want_out
             break
         candidates = [b for b in blocks if b["trim"] > 0 and len(b["text"]) > b["min"]]
+        extras = [b for b in candidates if b["trim"] >= 4]
+        if not extras and soft and room >= want_out - soft:
+            max_tokens = room                       # less thinking, nothing important cut
+            break
         if not candidates:
             if room >= min_out:
                 max_tokens = room
@@ -333,7 +340,8 @@ def fit_messages(system, blocks, want_out, min_out, extra_margin=0, template_kwa
                 f"the prompt needs {used} tokens plus at least {min_out} for the answer, "
                 f"but the model's context window is {CONTEXT_TOKENS} tokens")
         b = max(candidates, key=lambda x: x["trim"])
-        new_len = max(b["min"], len(b["text"]) - int((want_out - room) * 3.5) - 200)
+        target = want_out if extras else want_out - soft
+        new_len = max(b["min"], len(b["text"]) - int((target - room) * 3.5) - 200)
         if new_len < 300 and b["min"] == 0:
             new_len = 0
         if new_len <= b["min"]:
@@ -354,11 +362,11 @@ _SHORTENED_NOTED = set()
 
 
 def llm_complete(label, system, blocks, want_out, min_out, temperature=None, think=False, n=1,
-                 answer_min=None):
-    """Chat completion(s) with context budgeting. Returns a list of (text, finish_reason).
-    think=True lets the model reason before answering; its reasoning is not returned. The
-    thinking is capped (vLLM's thinking_token_budget) so at least answer_min tokens stay free
-    for the answer itself."""
+                 answer_min=None, with_reasoning=False):
+    """Chat completion(s) with context budgeting. Returns a list of (text, finish_reason), or of
+    (text, finish_reason, reasoning) with with_reasoning=True. think=True lets the model reason
+    before answering. The thinking is capped (vLLM's thinking_token_budget) so at least
+    answer_min tokens stay free for the answer itself."""
     kwargs = {"enable_thinking": bool(think)}
     if temperature is None:
         temperature = 0.6 if think else config.LLM_TEMPERATURE
@@ -366,7 +374,7 @@ def llm_complete(label, system, blocks, want_out, min_out, temperature=None, thi
     for try_no in range(2):
         messages, max_tokens = fit_messages(system, blocks, want_out, min_out,
                                             extra_margin=0 if try_no == 0 else 768,
-                                            template_kwargs=kwargs)
+                                            template_kwargs=kwargs, soft=THINK_TOKENS // 2 if think else 0)
         extra = {"top_k": config.LLM_TOP_K, "chat_template_kwargs": kwargs}
         if think:
             room = max_tokens - (answer_min if answer_min is not None else min_out)
@@ -391,9 +399,17 @@ def llm_complete(label, system, blocks, want_out, min_out, temperature=None, thi
                 t = TOKENS.setdefault(role, {"in": 0, "out": 0})
                 t["in"] += resp.usage.prompt_tokens or 0
                 t["out"] += resp.usage.completion_tokens or 0
-        # If vLLM has no reasoning parser, drop any reasoning text left in the answer.
-        return [(re.sub(r"<think>.*?</think>", "", c.message.content or "", flags=re.DOTALL).strip(),
-                 c.finish_reason) for c in resp.choices]
+        results = []
+        for c in resp.choices:
+            content = c.message.content or ""
+            thought = getattr(c.message, "reasoning_content", None) or getattr(c.message, "reasoning", None) or ""
+            if think and c.finish_reason == "length":     # where the room went: thinking or the answer?
+                print(f"    [i] {label}: cut off at {max_tokens} tokens: about {len(thought) // 4} of "
+                      f"thinking (budget {extra['thinking_token_budget']}), {len(content) // 3} of answer.")
+            # If vLLM has no reasoning parser, drop any reasoning text left in the answer.
+            text = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
+            results.append((text, c.finish_reason, thought) if with_reasoning else (text, c.finish_reason))
+        return results
     raise LLMError(f"{label}: request failed")
 
 
@@ -470,6 +486,7 @@ import sys as _sys
 _spec = _ilu.spec_from_file_location("target_module", "/work/{target}")
 target = _ilu.module_from_spec(_spec)
 _sys.modules["target_module"] = target
+_sys.modules["target"] = target          # so `import target` works too
 _spec.loader.exec_module(target)
 
 
@@ -484,6 +501,10 @@ def run_script(*args, input=None, timeout=15):
 
 def test_header(target):
     return TEST_HEADER.replace("{target}", target)
+
+
+# Modules proof and regression snippets may use without importing them (short snippets often forget).
+SNIPPET_IMPORTS = "import collections, datetime, itertools, json, math, os, random, re, string, sys, time\n"
 
 
 # Independent tests by role. Each is written without seeing the code; regression_test.py collects
@@ -510,7 +531,7 @@ def regression_file(state):
     """One file that runs every kept regression check, reporting each, and fails if any fails."""
     if not state["regression"]:
         return ""
-    parts = [test_header(state["target_file"]),
+    parts = [test_header(state["target_file"]), SNIPPET_IMPORTS,
              "_failures = []\n\n\ndef _check(name, fn):\n    try:\n        fn()\n        print('PASS:', name)\n"
              "    except Exception as e:  # report every check, then fail at the end\n"
              "        _failures.append(name)\n        print('FAIL:', name, '-', type(e).__name__, e)\n"]
@@ -537,7 +558,8 @@ def write_test_files(state, folder, tests=None, regression=None):
 
 def snippet_ok(code):
     """A reviewer or tester snippet compiles when wrapped in a function (and uses no undefined names)."""
-    wrapped = test_header("x.py") + "def _f():\n" + textwrap.indent(code.strip() or "pass", "    ") + "\n"
+    wrapped = (test_header("x.py") + SNIPPET_IMPORTS + "def _f():\n"
+               + textwrap.indent(code.strip() or "pass", "    ") + "\n")
     try:
         compile(wrapped, "snippet", "exec")
     except SyntaxError:
@@ -1021,6 +1043,20 @@ def run_error(res, elapsed, what, limit=None):
     return ""
 
 
+_REPORTED_FAIL = re.compile(r"\s*FAIL(?:ED)?\b")
+_NO_FAILS = re.compile(r"\s*FAIL(?:ED)?\s*[:=]?\s*0\s*$")
+
+
+def reported_failures(out, what):
+    """'' unless a test that exited 0 printed lines starting with FAIL: it still failed. (Testers
+    sometimes print FAIL lines and forget the exit code.)"""
+    lines = [ln for ln in out.splitlines() if _REPORTED_FAIL.match(ln) and not _NO_FAILS.match(ln)]
+    if not lines:
+        return ""
+    return (f"{what} exited with code 0 but printed lines reporting failed checks, so it counts as "
+            f"failed:\n{head(chr(10).join(lines), 2000)}\nSTDOUT (tail):\n{tail(out, 1500)}")
+
+
 def test_files_in(folder):
     """The independent test files present in a candidate folder, in the order they run."""
     order = [(role, name) for role, name in TEST_FILES.items()] + [("regression", REGRESSION_FILE)]
@@ -1041,7 +1077,8 @@ def run_all_tests(state, box, target, files, env=None, workdir=None, prepared=Fa
         t0 = time.time()
         r = run_in_box(state, box, file_command(state, name), env, workdir, prepared)
         outputs[role] = (r.returncode, r.stdout or "", r.stderr or "", time.time() - t0)
-        e = run_error(r, time.time() - t0, TEST_LABELS[role].capitalize(), test_timeout(state))
+        e = (run_error(r, time.time() - t0, TEST_LABELS[role].capitalize(), test_timeout(state))
+             or reported_failures(r.stdout or "", TEST_LABELS[role].capitalize()))
         if e:
             if role == "regression":
                 return ("The script's own --test passed, but it fails checks that were proven earlier in "
@@ -1283,8 +1320,13 @@ def review_spec(state, plan, checks, interface):
         "- spec: the exact behaviour the script must have: inputs and their formats, outputs, error "
         "cases (what is raised or printed, and exit codes), and how every rule in the goal applies, "
         "including any standard conventions the goal relies on (state each convention precisely). "
-        "List the tricky cases with their exact expected behaviour, but only results you are certain "
-        "of; mark anything you are unsure about as ASSUMPTION. Be concise.\n"
+        "List the tricky cases with their exact expected behaviour. Work out every expected value step "
+        "by step while thinking (for a sequence, test each candidate value in order against every rule) "
+        "and give only results you verified that way; when one is laborious to verify by hand (dates "
+        "across months, long sequences), choose a simpler case. Mark anything you are unsure about as "
+        "ASSUMPTION. An assumption may settle what the goal leaves open, but must never make valid "
+        "input fail or narrow what the goal asks for: any limit you set (time span, size, number of "
+        "steps) must be generous enough for the rarest valid input. Be concise.\n"
         f"- steps, checks, interface: the plan's, corrected where they are wrong, ambiguous or "
         f"incomplete. Up to {state['lvl']['max_checks']} checks, each observable in the --test output.\n"
         "Judge everything against the goal itself: the plan may be wrong.")
@@ -1431,10 +1473,10 @@ def write_test(state, role="acceptance"):
     blocks.append(block("Instructions:", instructions))
     try:
         # answer room first (min_out), so the thinking can't squeeze the test until it's cut off
-        raw, finish = llm_chat(name, system, blocks, want_out=5000, min_out=4000, think=True)
+        raw, finish = llm_chat(name, system, blocks, want_out=7000, min_out=5000, think=True)
         if finish == "length":
             print(f"    [i] {name}: the test was cut off; writing it again without thinking.")
-            raw, finish = llm_chat(name, system, blocks, want_out=6000, min_out=3000, think=False)
+            raw, finish = llm_chat(name, system, blocks, want_out=8000, min_out=3000, think=False)
     except ContextTooSmall as e:
         print(f"    [!] {name}: {short(e)}; continuing without this test this attempt.")
         return ""
@@ -1442,17 +1484,38 @@ def write_test(state, role="acceptance"):
     if finish == "length" or not code.strip():
         print(f"    [!] {name}: no complete test came back; continuing without it this attempt.")
         return ""
+    full, problem = test_problem(target, role, code)
+    if problem:
+        # One quick repair: a typo shouldn't cost a whole attempt.
+        print(f"    [i] {name}: the test {problem}; asking for a corrected version.")
+        try:
+            raw, finish = llm_chat(name, system, blocks + [
+                block("Your test:", code, code=True, trim=2),
+                block("Problem:", f"The test {problem}. Fix it and return the whole test.")],
+                want_out=8000, min_out=3000, think=False)
+        except ContextTooSmall:
+            raw, finish = "", "length"
+        code, _ = extract_code(raw)
+        full, problem = test_problem(target, role, code) if code.strip() and finish != "length" else ("", "came back incomplete")
+        if problem:
+            print(f"    [!] {name}: the test {problem}; skipping it this attempt.")
+            return ""
+    return full
+
+
+def test_problem(target, role, code):
+    """(full test file, '' or what's wrong with it) for an independent test's code."""
     full = test_header(target) + code.strip() + "\n"
+    shift = len(test_header(target).splitlines())       # report lines as the writer numbered them
     try:
         compile(full, TEST_FILES[role], "exec")
     except SyntaxError as e:
-        print(f"    [!] {name}: the test doesn't compile (line {e.lineno}: {e.msg}); skipping it this attempt.")
-        return ""
+        return full, f"doesn't compile (line {(e.lineno or shift) - shift}: {e.msg})"
     problems = static_problems(full, TEST_FILES[role])
     if problems:
-        print(f"    [!] {name}: the test uses undefined names ({problems[0]}); skipping it this attempt.")
-        return ""
-    return full
+        first = re.sub(r"line (\d+)", lambda m: f"line {int(m.group(1)) - shift}", problems[0], count=1)
+        return full, f"uses a name it never defines ({first})"
+    return full, ""
 
 
 PROBE_FILE = "probe_cases.py"
@@ -1501,6 +1564,10 @@ def write_probe(state):
           "- def run(case): call the script on one case through `target` (or `run_script` for "
           "command-line behaviour) and return the result as plain data. Don't assert or check "
           "anything: the pipeline compares the results; exceptions are recorded automatically.\n"
+          "- Return only what the goal or spec defines: values, exception types, exit codes, and "
+          "output the spec fixes exactly. Never return free-form text such as error messages, usage "
+          "or help text, which may legitimately differ between correct implementations (for a "
+          "command, return its exit code and, only if its output format is specified, the output).\n"
           f"Stay within the interface. All cases together must run in a few seconds. Use the Python "
           f"{config.SANDBOX_PYTHON} standard library only.\n"
           f"Reply with only the code in one {TICK3}python block.")
@@ -1509,7 +1576,11 @@ def write_probe(state):
               block("Interface:", state["interface"] or "(infer the obvious interface from the goal)"),
               block("Instructions:", instructions)]
     try:
-        raw, finish = llm_chat("Prober", PROBER_SYSTEM, blocks, want_out=3000, min_out=2000, think=True)
+        # answer room first: 20-40 cases need several thousand tokens after the thinking
+        raw, finish = llm_chat("Prober", PROBER_SYSTEM, blocks, want_out=6000, min_out=4000, think=True)
+        if finish == "length":
+            print("    [i] Prober: the cases were cut off; writing them again without thinking.")
+            raw, finish = llm_chat("Prober", PROBER_SYSTEM, blocks, want_out=7000, min_out=3000, think=False)
     except ContextTooSmall as e:
         print(f"    [!] Prober: {short(e)}; candidates won't be compared this run.")
         return ""
@@ -1606,29 +1677,45 @@ def engineer_node(state):
     if think:
         # The file always keeps room for its full size; thinking gets whatever is left, up to
         # the level's budget. In a 16k context that caps thinking near 5,000 tokens; with the
-        # 32k preset a full file and the whole budget both fit.
-        answer_min = want_out
+        # 32k preset a full file and the whole budget both fit. A fix keeps room for the file
+        # it starts from plus half again, not the largest file allowed.
+        answer_min = min(want_out, max(min_out, base_tokens * 3 // 2 + 1000)) if fixing else want_out
         want_out, min_out = want_out + THINK_TOKENS, min_out + 2000
     system = engineer_system(state)
+
+    def hint(k):
+        return [block("Approach for this version:", APPROACHES[(k - 1) % len(APPROACHES)])] if diverse else []
     if diverse:
         def one(k):
-            hint = block("Approach for this version:", APPROACHES[(k - 1) % len(APPROACHES)])
-            return llm_complete("Engineer", system, blocks + [hint], want_out, min_out,
-                                think=think, n=1, answer_min=answer_min)[0]
+            return llm_complete("Engineer", system, blocks + hint(k), want_out, min_out,
+                                think=think, n=1, answer_min=answer_min, with_reasoning=True)[0]
         replies = list(_llm_pool.map(one, range(1, n + 1)))
     else:
         replies = llm_complete("Engineer", system, blocks, want_out, min_out,
-                               think=think, n=n, answer_min=answer_min)
-    if think and all(finish == "length" for _, finish in replies):
-        print("    [i] Every candidate ran out of room after thinking; rewriting them without "
-              "thinking in this same attempt.")
-        replies = llm_complete("Engineer", system, blocks, want_out - THINK_TOKENS, answer_min,
-                               think=False, n=n)
+                               think=think, n=n, answer_min=answer_min, with_reasoning=True)
+    cut = [i for i, (_raw, finish, _notes) in enumerate(replies) if think and finish == "length"]
+    if cut:
+        # Thinking that runs past its budget spills into the answer, which then gets cut off.
+        # Finish those candidates from their own notes, without thinking again.
+        print(f"    [i] {len(cut)} of {len(replies)} candidate(s) ran out of room after thinking; finishing "
+              "them from their own notes, without thinking again.")
+
+        def finish_one(i):
+            raw, _finish, notes = replies[i]
+            if raw:                         # the reasoning often carries on into the cut-off answer
+                notes += "\n\n(Then, in the answer, which was cut off:)\n" + raw
+            more = [block("Your notes from thinking this through (cut short). Don't think again: write "
+                          "the complete file now.", notes, trim=2, keep="tail", min_chars=2000)] if notes else []
+            return llm_complete("Engineer", system, blocks + hint(i + 1) + more, want_out - THINK_TOKENS,
+                                answer_min, think=False, with_reasoning=True)[0]
+        for i, reply in zip(cut, list(_llm_pool.map(finish_one, cut))):
+            replies[i] = reply
+    replies = [(raw, finish) for raw, finish, _notes in replies]
 
     candidates = []
     for k, (raw, finish) in enumerate(replies, 1):
         code, _ = extract_code(raw)
-        cand = {"k": k, "code": code, "status": "coded", "error": ""}
+        cand = {"k": k, "code": code, "status": "coded", "error": "", "independent": diverse}
         if finish == "length":
             cand.update(status="truncated", error=(
                 "Your previous answer was cut off at the output limit, so the file was incomplete. "
@@ -1656,6 +1743,13 @@ def engineer_node(state):
             print(f"    Candidate {k}: {len(code.splitlines())} lines, staged at {folder}")
         else:
             print(f"    Candidate {k}: {cand['status']} ({cand['error'].splitlines()[0][:100]})")
+            try:                            # keep the reply for inspection
+                folder = cand_dir(state, attempt, k)
+                os.makedirs(folder, exist_ok=True)
+                with open(os.path.join(folder, "model_reply.txt"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(raw)
+            except OSError:
+                pass
         candidates.append(cand)
 
     # Independent tests and the probe file: keep the old ones if new ones couldn't be written.
@@ -1701,23 +1795,28 @@ def retest_node(state):
     candidates are tested again in this attempt's folders (no rewrite of code that was right)."""
     prev, attempt, target = state["attempt"] - 1, state["attempt"], state["target_file"]
     role = state["failed_test"] if state["failed_test"] in TEST_FILES else "acceptance"
-    coded = [c for c in state["candidates"] if c["status"] == "coded"]
+    # Only candidates that got as far as the blamed test (their own test passed) are worth re-testing.
+    coded = [c for c in state["candidates"] if c["status"] == "coded" and c.get("failed_test", "") in (role, "")]
+    if not coded:
+        return {"status": "RETEST_SKIPPED", "retest": False, "retests_used": state["retests_used"] + 1}
     print(f"\n[Node: Re-test] {TEST_LABELS[role].capitalize()} was wrong; the {ROLE_NAMES[role].lower()} "
           f"fixes it and the same {len(coded)} candidate(s) are tested again ({attempt_label(state)}).")
     report(state, phase=f"fixing {TEST_LABELS[role]} ({attempt_label(state)})", attempt=attempt)
+    new_test = write_test(state, role)
+    if not new_test:
+        # No containers were started for this attempt yet, so the engineer can use its number.
+        print(f"    The {ROLE_NAMES[role].lower()} couldn't fix the test; the engineer takes over instead.")
+        return {"status": "RETEST_SKIPPED", "retest": False, "retests_used": state["retests_used"] + 1}
     try:
         prewarm_containers(state, attempt, state["num_candidates"])
     except OSError:
         pass
-    new_test = write_test(state, role)
-    if not new_test:
-        print(f"    The {ROLE_NAMES[role].lower()} couldn't fix the test; the engineer takes over instead.")
-        discard_containers(state, attempt, state["num_candidates"])
-        return {"status": "RETEST_SKIPPED", "retest": False, "retests_used": state["retests_used"] + 1}
     tests, test_checks = dict(state["tests"], **{role: new_test}), dict(state["test_checks"], **{role: list(state["checks"])})
     feedback = {r: t for r, t in state["test_feedback"].items() if r != role}
+    keep = {c["k"] for c in coded}
+    candidates = [c if c["k"] in keep else dict(c, status="failed_before") for c in state["candidates"]]
     updates = {"tests": tests, "test_checks": test_checks, "test_feedback": feedback,
-               "retests_used": state["retests_used"] + 1}
+               "retests_used": state["retests_used"] + 1, "candidates": candidates}
     view = dict(state, **updates)
     for c in coded:
         src, dst = cand_dir(state, prev, c["k"]), cand_dir(state, attempt, c["k"])
@@ -1728,11 +1827,13 @@ def retest_node(state):
             with open(os.path.join(dst, PROBE_FILE), "w", encoding="utf-8", newline="\n") as f:
                 f.write(state["probe"])
     print(f"    Corrected test ready ({len(new_test.splitlines()) - len(test_header(target).splitlines())} lines).")
-    return dict(sandbox_executor_node(view), **updates, retest=False)
+    result = sandbox_executor_node(view)              # its candidates carry the new test results
+    return dict(result, **{k: v for k, v in updates.items() if k != "candidates"}, retest=False)
 
 
 REFEREE_SYSTEM = ("You are an impartial referee. You decide, strictly from the goal and the "
                   "specification, which of several answers is correct. Reply with JSON only.")
+ALL_ACCEPTABLE = "\x00all"     # a referee verdict: every answer to that case is fine
 
 
 def probe_results(res):
@@ -1778,17 +1879,22 @@ def compare_candidates(state, passed):
     if not disputed:
         print(f"    Comparing candidates: all {len(keys)} agree on all {len(cases)} probe cases.")
         return {}, {}
-    print(f"    Comparing candidates: they disagree on {len(disputed)} of {len(cases)} probe cases; "
-          "asking the referee.")
+    print(f"    Comparing candidates: they disagree on {len(disputed)} of {len(cases)} probe cases.")
     verdicts, known = {}, state["probe_verdicts"]
     ask = []
     for i, answers in disputed[:10]:
-        decided = [a for a in answers if known.get(f"{i}|{a}") is True]
-        if decided:
-            verdicts[i] = decided[0]
-        else:
-            ask.append((i, answers))
+        states = [known.get(f"{i}|{a}") for a in answers]
+        if None in states:
+            ask.append((i, answers))          # a new answer: the referee decides again
+        elif all(states):
+            verdicts[i] = ALL_ACCEPTABLE      # every answer here was already judged acceptable
+        elif any(states):
+            verdicts[i] = next(a for a, ok in zip(answers, states) if ok)
+        # (all known wrong: nobody to prefer, so nobody fails on it)
+    if len(ask) < len(disputed[:10]):
+        print(f"    {len(disputed[:10]) - len(ask)} of them were already decided in an earlier attempt.")
     if ask:
+        print(f"    Asking the referee about {len(ask)} case(s).")
         lines = []
         for i, answers in ask:
             opts = "\n".join(f"   {chr(65 + j)}) {a[:400]}   (candidate{'s' if len(ks) > 1 else ''} "
@@ -1797,8 +1903,10 @@ def compare_candidates(state, passed):
         instructions = (
             'Reply with ONLY: {"verdicts": [{"case": <number>, "correct": "A", "reason": "..."}]}\n'
             "For each case, work out from the goal and spec what the result must be, then name the "
-            "letter of the correct answer, or \"none\" if no answer is right. An answer {\"raised\": X} "
-            "means the script raised exception X. Don't favour an answer because more candidates gave it.")
+            "letter of the correct answer, \"none\" if no answer is right, or \"all\" if the answers "
+            "differ only in details the goal and spec leave open (such as the wording of an error "
+            "message), so every answer is acceptable. An answer {\"raised\": X} means the script raised "
+            "exception X. Don't favour an answer because more candidates gave it.")
         blocks = [block("Goal:", state["goal"]), block("Spec:", state["spec"], trim=3),
                   block("Interface:", state["interface"]),
                   block("How each case was run:", state["probe"][len(test_header(state['target_file'])):]
@@ -1812,14 +1920,21 @@ def compare_candidates(state, passed):
             data = {}
         for v in data.get("verdicts") or []:
             try:
-                i, letter = int(v.get("case")), str(v.get("correct", "")).strip().upper()[:1]
+                i, choice = int(v.get("case")), str(v.get("correct", "")).strip().strip('"').lower()
             except (TypeError, ValueError):
                 continue
             match = next(((i2, a) for i2, a in ask if i2 == i), None)
-            if match and letter and letter != "N" and ord(letter) - 65 < len(match[1]):
-                verdicts[i] = list(match[1])[ord(letter) - 65]
-                print(f"    Referee, case {i}: answer {letter} is right. {str(v.get('reason', ''))[:200]}")
-            elif match:
+            if not match:
+                continue
+            reason = str(v.get("reason", ""))[:200]
+            if choice in ("all", "any", "both", "either"):
+                verdicts[i] = ALL_ACCEPTABLE
+                print(f"    Referee, case {i}: every answer is acceptable (they differ only where the goal "
+                      f"leaves room). {reason}")
+            elif len(choice) == 1 and choice.isalpha() and ord(choice) - 97 < len(match[1]):
+                verdicts[i] = list(match[1])[ord(choice) - 97]
+                print(f"    Referee, case {i}: answer {choice.upper()} is right. {reason}")
+            else:
                 print(f"    Referee, case {i}: no answer is right; nobody fails on this case.")
     updates, failures = {}, {}
     for i, answers in disputed:
@@ -1827,7 +1942,9 @@ def compare_candidates(state, passed):
         if right is None:
             continue
         for a in answers:
-            updates[f"{i}|{a}"] = (a == right)
+            updates[f"{i}|{a}"] = (right == ALL_ACCEPTABLE or a == right)
+        if right == ALL_ACCEPTABLE:
+            continue
         for a, ks in answers.items():
             if a != right:
                 for k in ks:
@@ -1935,7 +2052,8 @@ def head_to_head(state, a, b):
                   block("Instructions:", instructions)]
         try:
             raw, _ = llm_chat("Head-to-head", HEAD_SYSTEM, blocks, want_out=600, min_out=150, think=True)
-        except ContextTooSmall:
+        except LLMError as e:              # no answer: the ranking by score stands
+            print(f"    Head-to-head: no answer ({short(e)}).")
             return None, ""
         data = parse_json_object(raw) or {}
         letter = str(data.get("better", "")).strip().upper()[:1]
@@ -2054,11 +2172,48 @@ def verifier_node(state):
                 execution_output=best["stdout"], execution_stderr=best["stderr"])
 
 
+def failure_consensus(state, role="self"):
+    """How many candidates failed `role` (their own --test, or an independent test) with exactly the
+    same failure lines: (count, independent, lines). Candidates written independently rarely share a
+    bug, but they all copy a wrong expected value from the plan or spec."""
+    sigs = []
+    for c in state["candidates"]:
+        if c.get("failed_test") != role:
+            continue
+        out = c.get("stdout", "") if role == "self" else c.get("tests_out", {}).get(role, (0, "", "", 0))[1]
+        sig = failure_lines(out or "", 1500).strip()
+        if sig:
+            sigs.append((sig, bool(c.get("independent"))))
+    if len(sigs) < 2:
+        return 0, False, ""
+    top, count = Counter(s for s, _ in sigs).most_common(1)[0]
+    if count < 2:
+        return 0, False, ""
+    return count, all(ind for s, ind in sigs if s == top), top
+
+
+def consensus_note(state, role="self"):
+    """A sentence for the diagnosis when several candidates failed in exactly the same way."""
+    count, independent, lines = failure_consensus(state, role)
+    if not count:
+        return "", 0, False
+    ran = sum(1 for c in state["candidates"] if c.get("rc") is not None)
+    who = f"All {count} candidates" if count == ran else f"{count} of {ran} candidates"
+    note = (f"{who}{', written independently with different approaches,' if independent else ''} failed "
+            f"with exactly the same result:\n{lines}\n"
+            + ("Independent implementations rarely share a bug, but they all copy expected values from "
+               "the plan, spec or test, so check the expected value first." if independent else
+               "They share most of their code, so this alone doesn't show who is wrong."))
+    return note, count, independent
+
+
 def error_condenser_node(state):
     raw_error = state["error"]
     indep = state["failure_kind"] == "indep" and bool(state["tests"].get(state["failed_test"]))
     if indep:
         return diagnose_independent_failure(state)
+    if state["judges"] > 1 and state["failure_kind"] == "runtime":
+        return diagnose_deep(state)
     where = "Node 1" if config.HELPER_BACKEND == "node1" else "Node 3"
     print(f"\n[Node: Error Condenser] Diagnosing the failure on {where} "
           f"(attempt {state['attempt'] - 1})...")
@@ -2094,6 +2249,61 @@ def error_condenser_node(state):
     return {"error": f"DIAGNOSIS:\n{diagnosis}\n\nRAW ERROR (tail):\n{tail(raw_error, 2500)}"}
 
 
+def diagnose_deep(state):
+    """High and above, the script's own test failed: think it through with the spec, and with a note
+    when several candidates failed identically. Expected values written by hand (in the self-test,
+    the checks or the spec's examples) are often what's wrong. When independently written
+    candidates all agree, a corrected expected value is added to the spec for every later step."""
+    attempt = state["attempt"] - 1
+    print(f"\n[Node: Error Condenser] Diagnosing the failure (thinking first, attempt {attempt})...")
+    report(state, phase=f"diagnosing (attempt {attempt}/{state['max_attempts']})")
+    note, count, independent = consensus_note(state, "self")
+    if note:
+        print(f"    {note.splitlines()[0]}")
+    ask = ("Give a concise diagnosis:\n"
+           "1. Which check failed, or the exact line and exception type.\n"
+           "2. Who is wrong, judged against the goal: the code, or the expected value it was compared "
+           "with? Expected values written by hand (in the self-test, the acceptance checks or the spec's "
+           "examples) are often wrong, so work the expected result out yourself, step by step from the "
+           "goal's rules, before deciding.\n"
+           "3. Root cause, and the exact fix (to the code, or to the expected value).\n"
+           "Keep it under 8 sentences and write no code. End with one line that is exactly one of: "
+           "BLAME: code / BLAME: expectation / BLAME: both\n"
+           "If an expected value given in the spec or the acceptance checks is wrong, add one last line: "
+           "CORRECTION: <the corrected expected value, in one sentence>")
+    try:
+        diagnosis, _ = llm_chat(
+            "Condenser", "You are an expert Python debugger. You are impartial between the code and the "
+                         "expected values it is tested against; only the goal decides who is right.",
+            [block("What the script should do:", state["goal"]),
+             block("Spec (reviewed, but its worked examples were computed by hand; the goal wins):",
+                   state["spec"], trim=3),
+             block("Acceptance checks:", numbered(state["checks"])),
+             block("What the candidates have in common:", note),
+             block("Failing code:", state["code"], trim=2, code=True, min_chars=3000),
+             block("Error output:", state["error"], trim=1, keep="tail", min_chars=1500),
+             block("Instructions:", ask)],
+            want_out=700, min_out=200, think=True)
+    except LLMError as e:
+        if not isinstance(e, ContextTooSmall):
+            raise
+        print(f"-> Condenser skipped ({short(e)}); the engineer gets the raw error.")
+        return {}
+    m = re.search(r"BLAME:\s*(code|expectation|both)", diagnosis, re.IGNORECASE)
+    blame = m.group(1).lower() if m else "code"
+    print(f"-> Diagnosis (Node 1, blame: {blame}):\n{diagnosis}")
+    update = {"error": f"DIAGNOSIS:\n{diagnosis}\n\n" + (f"NOTE: {note}\n\n" if note else "")
+                       + f"RAW ERROR (tail):\n{tail(state['error'], 2500)}"}
+    corr = re.search(r"CORRECTION:\s*(.+)", diagnosis)
+    if corr and blame in ("expectation", "both") and count >= 2 and independent and state["spec"]:
+        fix = corr.group(1).strip()[:600]
+        update["spec"] = (state["spec"] + f"\n\nCORRECTION (found while testing attempt {attempt}; it "
+                          f"overrides any example above and any acceptance check it contradicts): {fix}")
+        print(f"-> Corrected the spec for every later step: {fix[:200]}")
+        report(state, spec=update["spec"])
+    return update
+
+
 def diagnose_independent_failure(state):
     """The script's own test passed but an independent test failed: decide, against the goal,
     whether the script, the test or both are wrong. A wrong test goes back to its writer."""
@@ -2108,13 +2318,18 @@ def diagnose_independent_failure(state):
            "3. The exact fix (to the script, to the test, or to both).\n"
            "Keep it under 6 sentences and write no code. End with one line that is exactly one of: "
            "BLAME: script / BLAME: test / BLAME: both")
+    note, _count, _independent = consensus_note(state, role)
+    if note:
+        print(f"    {note.splitlines()[0]}")
     try:
         diagnosis, _ = llm_chat(
             "Condenser", "You are an expert Python debugger and test reviewer. You are impartial "
                          "between the script and its test; only the goal decides who is right.",
             [block("What the script should do:", state["goal"]),
-             block("Spec (reviewed; the goal wins if they disagree):", state["spec"], trim=3),
+             block("Spec (reviewed, but its worked examples were computed by hand; the goal wins):",
+                   state["spec"], trim=3),
              block("Acceptance checks:", numbered(state["checks"])),
+             block("What the candidates have in common:", note),
              block("Interface:", state["interface"]),
              block("Script:", state["code"], trim=2, code=True, min_chars=3000),
              block(f"{TEST_LABELS[role].capitalize()}:", test_body(state, role), trim=3, code=True, min_chars=2000),
@@ -2132,7 +2347,8 @@ def diagnose_independent_failure(state):
     feedback = dict(state["test_feedback"])
     if blame in ("test", "both"):
         feedback[role] = diagnosis
-    update = {"error": f"DIAGNOSIS:\n{diagnosis}\n\nRAW ERROR (tail):\n{tail(state['error'], 2500)}",
+    update = {"error": f"DIAGNOSIS:\n{diagnosis}\n\n" + (f"NOTE: {note}\n\n" if note else "")
+                       + f"RAW ERROR (tail):\n{tail(state['error'], 2500)}",
               "test_feedback": feedback,
               # Only the test is wrong: fix it and re-test the same code instead of rewriting it.
               "retest": blame == "test" and state["retests_used"] < MAX_RETESTS}
@@ -2151,7 +2367,8 @@ CRITIC_FOCUS = [
 
 def proof_file(state, code):
     """A reviewer's proof snippet as a runnable file: it fails (AssertionError) if the problem exists."""
-    return (test_header(state["target_file"]) + "\n\ndef _proof():\n" + textwrap.indent(code.strip(), "    ")
+    return (test_header(state["target_file"]) + SNIPPET_IMPORTS + "\n\ndef _proof():\n"
+            + textwrap.indent(code.strip(), "    ")
             + "\n\n\n_proof()\nprint('PASS: the problem was not shown')\n")
 
 
@@ -2259,7 +2476,8 @@ def critique(state, focus, label, proof):
         block("Script:", state["code"], trim=1, code=True, min_chars=4000),
         block("Instructions:", instructions),
     ]
-    raw, _ = llm_chat(label, CRITIC_SYSTEM, blocks, want_out=1800 if proof else 900, min_out=300, think=True)
+    raw, _ = llm_chat(label, CRITIC_SYSTEM, blocks, want_out=3500 if proof else 900,
+                      min_out=1500 if proof else 300, think=True)
     data = parse_json_object(raw) or {}
     return [i for i in data.get("issues") or [] if isinstance(i, dict) and str(i.get("problem") or "").strip()]
 
@@ -2270,7 +2488,7 @@ def critic_node(state):
     Ultra and MAX every claim must be proven by a test, and proven tests are kept as regression checks."""
     rnd = state["critic_used"] + 1
     n_critics, proof = state["lvl"]["critics"], state["lvl"]["critic_proof"]
-    print(f"\n[Node: Critic] {'Two reviewers look' if n_critics > 1 else 'Reviewing'} the passing version "
+    print(f"\n[Node: Critic] {'Two reviewers look at' if n_critics > 1 else 'Reviewing'} the passing version "
           f"for bugs the tests missed (round {rnd} of {state['critic_rounds']}, thinking first"
           f"{'; claims must be proven' if proof else ''})...")
     report(state, phase=f"reviewing (round {rnd}/{state['critic_rounds']})")
@@ -2287,7 +2505,11 @@ def critic_node(state):
         print(f"    {str(i.get('severity', '?')).upper()}: {i.get('problem')}")
     if major and proof:
         print(f"    Checking {len(major)} major claim(s) by running their tests against the passing version...")
-        major = prove_findings(state, major, f"proofs-r{rnd}")
+        try:
+            major = prove_findings(state, major, f"proofs-r{rnd}")
+        except (LLMError, InfraError) as e:
+            print(f"-> Couldn't check the claims ({short(e)}); keeping the version that passed.")
+            return {"critic_used": rnd}
     if not major:
         print("-> No major problems " + ("proven" if proof and issues else "found") + "; keeping this version.")
         return {"critic_used": rnd}
@@ -2545,17 +2767,25 @@ def run_stats(state):
                 "regression_checks": len(state.get("regression") or [])}
 
 
+_FINALIZE_STARTED = threading.Event()
+
+
 def finalize_node(state):
+    _FINALIZE_STARTED.set()
     target = state["target_file"]
     if state["status"] != "PASSED" and state["best_passed"]:
-        # High: the reviewer's fixes didn't pass in time, so keep the version that did pass.
+        # High and above: the reviewer's fixes didn't pass in time (or a later step failed), so keep
+        # the version that did pass.
         b = state["best_passed"]
-        print(f"\n[i] The fixes for the reviewer's findings didn't pass within the limits; keeping the "
-              f"version that passed on attempt {b['attempt']}.")
+        stopped = state.get("stop_reason", "")
+        why = (f"the run stopped on an error ({stopped}) before the fixes passed" if stopped
+               else "the fixes didn't pass in time")
+        lead = "A later step failed" if stopped else "The fixes for the review findings didn't pass within the limits"
+        print(f"\n[i] {lead}; keeping the version that passed on attempt {b['attempt']}.")
         state = dict(state, status="PASSED", attempt=b["attempt"], winner=b["winner"], code=b["code"],
                      execution_output=b["execution_output"], execution_stderr=b["execution_stderr"],
-                     verdict=b["verdict"] + " (A reviewer later found possible problems, but the fixes "
-                                            "didn't pass in time, so this passing version was kept.)")
+                     verdict=b["verdict"] + f" (A reviewer later found possible problems, but {why}, "
+                                            "so this passing version was kept.)")
     result_file = save_result_file(state)
     if state["status"] == "PASSED":
         dest, backup = promote(state)
@@ -2582,6 +2812,27 @@ def finalize_node(state):
            output=state["error"], execution_output=state["error"], verdict=state["verdict"],
            execution_stderr=state["execution_stderr"], result_file=result_file, **run_stats(state))
     return {}
+
+
+def keep_passed_version(latest, error):
+    """A step failed after a version had already passed (during review, proofs, mutation testing or
+    the fixes that followed): finish with that version instead of losing it. True if it was kept."""
+    if not latest or _FINALIZE_STARTED.is_set():      # the failure came from saving the result itself
+        return False
+    passed_now = latest.get("status") == "PASSED" and latest.get("code")
+    if not (passed_now or latest.get("best_passed")):
+        return False
+    print(f"\n[!] A later step failed ({short(error)}), but a version had already passed; keeping it.")
+    if passed_now:
+        state = dict(latest, verdict=latest.get("verdict", "") + f" (Kept after a later step failed: {short(error)})")
+    else:
+        state = dict(latest, status="FIX_FAILED", stop_reason=short(error))
+    try:
+        finalize_node(state)
+        return True
+    except Exception as e2:
+        print(f"[x] Couldn't save the passing version either: {short(e2)}")
+        return False
 
 
 def dispatch_ingest(state, result_file=""):
@@ -2829,6 +3080,7 @@ def main(argv=None):
           f"{'on' if args.allow_network else 'off'} | web research: {'on' if args.research else 'off'}")
     register_task(state)
     beat_stop, beat_thread = start_heartbeat(run_id)
+    latest = state
     try:
         connect_llm()
         print(f"Model: {MODEL_ID} | context window: {CONTEXT_TOKENS} tokens")
@@ -2838,8 +3090,12 @@ def main(argv=None):
         check_sandbox()
         state["attachments"], state["attachment_names"] = load_attachments(args.attach, target, goal)
         prune_runs()
-        final = build_graph().invoke(state, {"recursion_limit": 200})
+        for latest in build_graph().stream(state, {"recursion_limit": 200}, stream_mode="values"):
+            pass                            # `latest` is the full state after each step
+        final = latest
     except (LLMError, InfraError) as e:
+        if keep_passed_version(latest, e):
+            return 0
         print(f"\n[x] Run stopped: {e}")
         report(state, status="ERROR", phase="stopped", output=str(e), execution_output=str(e),
                **run_stats(state))
@@ -2848,9 +3104,11 @@ def main(argv=None):
         print("\n[x] Run cancelled.")
         report(state, status="ERROR", phase="cancelled", **run_stats(state))
         return 2
-    except Exception:
+    except Exception as e:
         tb = traceback.format_exc()
         print(f"\n[x] Pipeline crashed:\n{tb}")
+        if keep_passed_version(latest, e):
+            return 0
         report(state, status="ERROR", phase="crashed", output=tb, execution_output=tb,
                **run_stats(state))
         return 2

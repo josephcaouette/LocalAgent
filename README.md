@@ -31,7 +31,7 @@ utilities, can research the web for them, remembers what worked, and explains it
 2. On the **Model server** tab, press **Start everything**. vLLM loads (about a minute) and Node 3's
    models warm up.
 3. On the **Chat** tab, talk the task through. Press **Make task from chat** to fill in the task.
-4. On the **Task & Queue** tab, check it, pick an **accuracy level** (Low, Medium or High), and press
+4. On the **Task & Queue** tab, check it, pick an **accuracy level** (Low to MAX), and press
    **Dispatch Run**.
 5. When the run finishes, press **Talk about result**. The model explains what it built, how to
    run it and what to install first.
@@ -131,15 +131,16 @@ task from chat**: the new task edits the same file.
   name. Core files like `config.py` are protected.
 - **Allow LAN network in sandbox:** for scripts that must reach other machines on your network.
   The internet is never reachable from tests.
-- **Accuracy:** Low, Medium or High (see [Accuracy levels](#accuracy-levels)). The line next to it
-  summarizes what the chosen level does. Choosing High also ticks web research; untick it if the
-  task doesn't need it.
+- **Accuracy:** Low, Medium, High, Ultra or MAX (see [Accuracy levels](#accuracy-levels)). The line
+  next to it summarizes what the chosen level does. Choosing High, Ultra or MAX also ticks web
+  research; untick it if the task doesn't need it.
 - **Research the web first:** web research before planning. Good for unfamiliar libraries,
   protocols or standards; adds 1-3 minutes.
 - **Attachments:** files given to the agent as reference. Large ones are condensed first.
 - **Queue:** **Dispatch Run** adds the task to the queue.
-  - Up to two Low or Medium runs go at once (`MAX_PARALLEL_RUNS`). A High run waits until nothing
-    else is running, then has the GPU to itself. The queue keeps its order.
+  - Up to two Low or Medium runs go at once (`MAX_PARALLEL_RUNS`). A High, Ultra or MAX run waits
+    until nothing else is running, then has the GPU to itself. Before an Ultra or MAX run, vLLM
+    switches to the 32k server, and back when none are left. The queue keeps its order.
   - Each run has its own log: select it in the list.
   - **Stop / remove** stops a running task (its record is marked stopped and its test containers
     removed) or takes a waiting one out of the queue.
@@ -232,52 +233,65 @@ running; stop it on the Model server tab.
 
 ## Accuracy levels
 
-Chosen per task on the Task & Queue tab (or `--accuracy low|medium|high` on the command line).
-Older runs stored "normal" (now Low) and "overnight" (now Medium).
+Chosen per task on the Task & Queue tab (or `--accuracy low|medium|high|ultra|max` on the command
+line). Older runs stored "normal" (now Low) and "overnight" (now Medium). Every setting is in
+`RUN_PROFILES` in `config.py`, with a comment for each.
 
-| | Low | Medium | High |
-|---|---|---|---|
-| Attempts x candidates | 3 x 2 | 8 x 3 | 10 x 4, each told to take a **different approach** |
-| Engineer thinks | when fixing | always | always |
-| Thinking per call | up to 5,000 tokens | up to 5,000 | up to 10,000; the engineer gets what's left after room for a full file (about 5,000 in a 16k context) |
-| Static check | yes | yes | yes |
-| **Independent tester** | - | - | A separate call writes its own acceptance test from the goal, checks and interface, without seeing the code. Candidates must pass it as well as their own test |
-| Verifier | 1 vote | 1 vote | The best candidate needs a majority of **3 independent votes** |
-| **Critic** after a pass | - | - | Looks for bugs the tests missed; real problems become new checks and go back to the engineer, up to 2 rounds. If a fix doesn't pass in time, the earlier passing version is kept |
-| Tests repeated | once | 3 runs | 3 runs |
-| Web research | tick to add | tick to add | ticked by default |
-| Time cap | 30 min | 12 h | 12 h |
-| GPU | shares (2 runs at once) | shares | has it to itself |
-| Measured, simple tasks | ~2 min | ~4 min | ~7 min |
+| | Low | Medium | High | Ultra | MAX |
+|---|---|---|---|---|---|
+| Server | 16k | 16k | 16k | **32k (switches automatically)** | **32k (switches automatically)** |
+| Attempts x candidates | 3 x 2 | 8 x 3 | 10 x 4 | 12 x 4 | 16 x 5 |
+| Different approaches | - | - | yes | yes | yes |
+| Thinking per call | up to 5,000 | up to 5,000 | up to 10,000 (about 5,000 for the engineer in 16k) | up to 16,000 | up to 16,000 |
+| **Spec review** before coding | - | - | - | yes | yes |
+| **Independent tests** | - | - | acceptance test | + reference and property checks | + an **adversarial tester** |
+| **Candidates compared** on probe inputs | - | - | - | yes, with a referee | yes, with a referee |
+| Judges | 1 | 1 | 3 | 3 | 5, plus a **head-to-head** pick |
+| **Critics** per round x rounds | - | - | 1 x 2 | 1 x 3, **claims proven by tests** | 2 x 4, claims proven by tests |
+| **Mutation testing** | - | - | - | - | yes |
+| Test runs | 1 | 3 | 3 | 3, varied settings | 5, varied settings |
+| Test time limit | 20 s | 20 s | 20 s | 60 s | 60 s |
+| Web research | tick to add | tick to add | ticked by default | ticked by default | ticked by default |
+| Time cap | 30 min | 12 h | 12 h | 12 h | 24 h |
+| GPU | shared (2 runs at once) | shared | to itself | to itself | to itself |
+| Measured, small tasks | ~2 min | ~4 min | ~7 min | ~21 min | ~38 min |
 
-### Ultra and MAX
+**Automatic 32k switching.** In the Agent Cluster window, the queue restarts vLLM with the **Long
+context (32k)** preset before an Ultra or MAX run, keeps it for back-to-back Ultra and MAX runs, and
+switches back to your saved settings when none are left (about a minute each way; the status strip
+shows "vLLM starting"). Your saved settings never change. If the 32k server won't start, the run uses
+the normal one. Runs started from the command line don't switch; they print a note if they're on 16k.
 
-Two more levels for peak accuracy (settings in `RUN_PROFILES`, explained in comments in `config.py`):
+**What Ultra and MAX add.**
 
-| | Ultra | MAX |
-|---|---|---|
-| Server | 32k preset, switched to automatically | 32k preset, switched to automatically |
-| Candidates / attempts / cap | 4 / 12 / 12 h | 5 / 16 / 24 h |
-| Thinking | up to 16,000 tokens | up to 16,000 tokens |
-| Spec review before coding | yes | yes |
-| Tests | independent test with a reference and property checks; candidates compared on probe inputs (a referee settles disagreements) | the same, plus an adversarial tester |
-| Judges | 3 | 5, plus a head-to-head pick between the top two |
-| Critics | 1 per round, 3 rounds; every claim must be proven by a test, and proven tests are kept as regression checks | 2 per round (correctness and robustness), 4 rounds, same proof rule |
-| Mutation testing | - | small deliberate bugs check that the tests catch them; missed ones get new checks |
-| Repeat runs | 3, in varied time zones, locales and folders | 5, varied the same way |
-| Test time limit | 60 s | 60 s |
-
-**Automatic 32k switching.** In the Agent Cluster window, the queue restarts vLLM with the Long
-context preset before an Ultra or MAX run (they run alone), keeps it for consecutive Ultra/MAX runs,
-and switches back to your saved settings when none are left (about a minute each way). If the 32k
-server won't start, the run uses the normal one. Runs started from the command line don't switch.
-First measurement: a small Ultra task took 20.7 minutes, including the spec review (about 5.5 minutes
-of thinking).
+- **Spec review:** after the planner, a reviewer writes a precise spec (exact rules, error cases,
+  tricky inputs, and the standard conventions the goal relies on) and corrects the plan, checks and
+  interface while a misunderstanding is still cheap. Anything it's unsure of is marked ASSUMPTION.
+  Everyone downstream sees the spec, but judges against the goal if they disagree.
+- **Reference and property tests:** the independent tester also writes a slow, obviously correct
+  reference inside its test and compares the script with it on many generated inputs, plus checks
+  that must always hold. Hand-calculated expected values were the tester's weak spot.
+- **Candidates compared:** every candidate that passes answers the same 20-50 probe inputs (written by
+  a prober from the interface). Where they disagree, a referee works out the right answer from the goal,
+  and candidates that answered wrong go back with that input as a counterexample.
+- **Proven critics:** every problem a critic reports must come with a small test that shows it. The
+  test is run against the passing version: if it passes, the claim is dropped; if it fails, a referee
+  checks the test's expectation against the goal. Confirmed tests are kept as **regression checks**
+  that every later version must pass.
+- **Varied test runs:** repeat runs use other time zones (UTC+5:30, US Pacific, UTC+12:45), locales,
+  hash seeds and working folders, to catch results that depend on the environment.
+- **MAX also:** an **adversarial tester** that tries to break the script (boundaries, extreme sizes,
+  invalid input); a **head-to-head** judge that compares the top two candidates side by side, asked
+  twice with the order swapped (a pick counts only if both agree); two critics per round (correctness
+  and robustness); five judges; and **mutation testing**: it plants up to 12 small bugs in the winner
+  (`<` to `<=`, `+` to `-`, a constant off by one, a removed `not`) and checks the tests catch them.
+  For bugs that slip through, the tester writes new checks; those that hold on the real code join the
+  regression checks, and any that fail on it go to the referee as possible real bugs.
 
 Benchmark flags for the command line: `--no-memory` (no past solutions as examples) and
 `--no-ingest` (don't store the result).
 
-**Why High is more accurate.**
+**Why the higher levels are more accurate.**
 
 - **Independent tests:** in Low and Medium, one model call writes both the code and the test that
   checks it, so a misunderstanding of the task can end up in both and the test still passes. The
@@ -288,10 +302,10 @@ Benchmark flags for the command line: `--no-memory` (no past solutions as exampl
 - **Panel and critic:** the panel makes a lucky pass from a single judge unlikely, and the critic
   reads the winner for problems no test exercised.
 
-**High works best on the 32k server.** In 16k, the prompt, High's thinking and a long file don't all
-fit, so long files get cut off and thinking is squeezed. With the **Long context (32k)** preset on
-the Model server tab they fit. Measured on the same task (a cron schedule parser of 300-500 lines,
-from scratch, no memory examples), one run each:
+**Why Ultra and MAX use the 32k server.** In 16k, the prompt, the thinking and a long file don't
+all fit, so long files get cut off and thinking is squeezed. With the **Long context (32k)** preset
+they fit. Measured with High on the same task (a cron schedule parser of 300-500 lines, from scratch,
+no memory examples), one run each:
 
 | | Fast preset (16k) | Long context preset (32k) |
 |---|---|---|
@@ -301,16 +315,40 @@ from scratch, no memory examples), one run each:
 | First passing version correct | no (the critic caught a bug, fixed in round 2) | yes |
 | Tokens generated | 164,000 | 98,000 |
 
-Both final versions matched a brute-force reference on 52 test cases. To use it: on the Model
-server tab choose **Long context (32k)**, press **Apply preset** and **Restart vLLM**; switch back
-to **Fast** afterwards for quicker Low and Medium runs and chat.
+Both final versions matched a brute-force reference on 52 test cases. High stays on 16k so it remains
+the faster choice; to run it on 32k anyway, choose **Long context (32k)** on the Model server tab,
+press **Apply preset** and **Restart vLLM**, and switch back to **Fast** afterwards.
+
+**Ultra and MAX on the same task** (32k server, from scratch, no memory examples, one run each,
+2026-10-31):
+
+| | High (32k) | Ultra | MAX |
+|---|---|---|---|
+| Result | passed on attempt 1 | passed on attempt 1 | passed on attempt 2 |
+| Time | 13.8 min | 32.8 min | 54.3 min |
+| Tokens generated | 98,000 | 207,000 | 409,000 |
+| Matched the brute-force reference (52 cases) | yes | yes | yes |
+| Caught along the way | - | an independent test whose own reference was wrong | an independent test with a wrong expectation (4 of 5 candidates agreed against it); a year-9999 crash in 4 of 5 candidates; mutation testing 10 of 12 |
+
+On a task this size, High already gets it right, so Ultra and MAX buy insurance rather than a
+different answer: more independent checks that each catch a different kind of mistake. They pay
+off when the goal has rules that are easy to get subtly wrong. A first MAX run on this task exposed
+weak spots in the pipeline itself, all fixed before the run above: the spec reviewer's worked
+example was wrong (every candidate was right and "failed" against it), fix prompts lost the spec
+to the thinking budget, a spec assumption (a 1,461-day search limit) broke leap-day schedules,
+candidates whose thinking spilled into their answer were dropped, and a tester printed FAIL lines
+but exited 0.
 
 **On every level.**
 
 - **Static check (pyflakes):** rejects a candidate that uses a name it never defines, a crash
   waiting on a line the test may never reach.
-- **Repeat runs (Medium and High):** catch tests that only pass sometimes (randomness, timing, or
+- **Repeat runs (Medium and above):** catch tests that only pass sometimes (randomness, timing, or
   leftover files).
+- **Failure lines first:** when a test fails, the lines that report failures are always shown, wherever
+  they appear in its output.
+- **FAIL lines count:** an independent test that prints a line starting with `FAIL` has failed, even
+  if it exits with code 0 (testers sometimes forget the exit code).
 
 ## How a run works
 
@@ -320,46 +358,66 @@ to **Fast** afterwards for quicker Low and Medium runs and chat.
      planner as an example.
    - **Scout:** brief any other workspace file the goal mentions.
    - **Web research**, if ticked.
-3. **Planner** (thinks first): writes steps and 2-4 concrete **acceptance checks**. On High it also
-   writes the **interface**: the functions and command-line usage tests will call.
+3. **Planner** (thinks first): writes steps and 2-4 concrete **acceptance checks** (up to 6 on Ultra
+   and MAX). On High and above it also writes the **interface**: the functions and command-line
+   usage tests will call. On Ultra and MAX the **spec reviewer** then writes a precise spec and
+   corrects the plan.
 4. **Engineer:** writes **several candidate files at once** into `Z:\runs\<run>\a<attempt>c<candidate>\`,
    never straight into the workspace. Each includes its own self-test under `--test`.
-   - It thinks first when fixing a failure (always, on Medium and High).
+   - It thinks first when fixing a failure (always, on Medium and above).
    - Candidates that use undefined names are rejected straight away.
-   - On High, the tester writes `acceptance_test.py` at the same time.
+   - At the same time: the tester writes `acceptance_test.py` (High and above), the adversary writes
+     `adversarial_test.py` (MAX), and the prober writes `probe_cases.py` (Ultra and MAX).
    - Meanwhile, Node 2 starts one test container per candidate.
 5. **Testing:** each candidate runs in its own container on Node 2:
-   - its own `python3 <file> --test`, then the independent test (High), then repeat runs
-     (Medium and High);
+   - its own `python3 <file> --test`, then each independent test and the kept regression checks, then
+     repeat runs (Medium and above; in varied settings on Ultra and MAX);
+   - on Ultra and MAX, the candidates that passed answer the probe cases, and a referee settles any
+     disagreement;
    - no network unless allowed; the workspace is read-only, with a writable scratch folder;
-   - 1 GB of memory, 2 CPUs, 20 seconds per run;
+   - 1 GB of memory, 2 CPUs, 20 seconds per run (60 on Ultra and MAX);
    - it runs as the share's user, not root.
 
    Each container is used for one candidate and then removed.
 6. **Verifier** (thinks first): scores every candidate that passed from 0-10 against the checks. The
-   best one wins; on a tie, the shorter code. On High the winner needs a majority of three votes.
+   best one wins; on a tie, the shorter code (on MAX, a head-to-head judge picks between the top two).
+   On High and above the winner needs a majority of the panel (3 votes, or 5 on MAX).
 7. **If none pass:** the **diagnosis** step works out what failed (including whether the code, its
-   own test, or the independent test is wrong) and the engineer tries again. Lines that report
-   failures are always shown to it, wherever they appear in the output. If only the independent
-   test was wrong, the tester fixes it and the **same candidates are tested again** without being
+   own test, or an independent test is wrong) and the engineer tries again. Lines that report
+   failures are always shown to it, wherever they appear in the output. If only an independent
+   test was wrong, its writer fixes it and the **same candidates are tested again** without being
    rewritten (up to 3 times per run).
-8. **Critic (High):** reviews the passing version; real problems send it back with new checks.
-9. **On a pass:**
-   - the old file goes to `workspace\.history\` (20 kept per file);
-   - the winner is copied in;
-   - Node 3 summarizes it into long-term memory in the background.
+   - On High and above the diagnosis thinks first, sees the spec, and is told when several
+     candidates failed in exactly the same way. Candidates written independently rarely share a
+     bug, but they all copy an expected value from the plan or spec, so identical failures point at
+     the expected value. When independently written candidates agree and the diagnosis finds the
+     spec's example wrong, a **correction is added to the spec** for every later step.
+8. **Critics (High and above):** review the passing version; real problems send it back with new
+   checks. On Ultra and MAX each claim must be proven by a test first, and proven tests become
+   regression checks. A pass is never lost: if the fixes don't pass in time, or a later step stops on
+   an error (vLLM timing out, Node 2 unreachable), the run finishes with the version that passed and
+   its verdict says why.
+9. **Mutation testing (MAX):** small planted bugs check that the tests catch them; missed ones get new
+   checks, or go back to the engineer if a new check shows a real bug.
+10. **On a pass:**
+    - the old file goes to `workspace\.history\` (20 kept per file);
+    - the winner is copied in;
+    - Node 3 summarizes it into long-term memory in the background.
 
 ### What a run leaves behind
 
 - `Z:\runs\<run>\`:
   - `pipeline.log` (everything the run printed);
   - `final_<target>` (the winning code, or the best failed attempt);
-  - every candidate under `a<attempt>c<candidate>\`, with `acceptance_test.py` on High.
+  - every candidate under `a<attempt>c<candidate>\`, with its independent tests, regression checks and
+    probe cases;
+  - on Ultra and MAX, `proofs-r<round>\` (the critics' proof tests) and, on MAX, `mut-<n>\` (the
+    planted bugs).
 
   The newest 30 run folders are kept.
 - **Redis record** `workflow:task:<run>`: status, phase, level (`profile`), goal, plan, checks,
-  interface, verdict, output, time per step (`timings`), tokens per role (`tokens`), elapsed time,
-  and the result file's path.
+  interface, spec, verdict, output, time per step (`timings`), tokens per role (`tokens`), elapsed
+  time, regression checks kept, the mutation score, and the result file's path.
 - **While running:** a heartbeat in `workflow:active` every 30 s, and a PID file
   `%TEMP%\agent_pipeline_<run>.pid`. Several runs can go at once without interfering.
 
@@ -367,7 +425,8 @@ Exit codes from the command line: 0 passed, 1 failed, 2 stopped by an error.
 
 ```
 python run_langgraph_pipeline.py --goal="..." [--target=name.py] [--attach=path ...]
-                                 [--allow-network] [--research] [--accuracy=low|medium|high]
+                                 [--allow-network] [--research] [--accuracy=low|medium|high|ultra|max]
+                                 [--no-memory] [--no-ingest]
 ```
 
 ## Web research
@@ -426,7 +485,19 @@ Change behaviour everywhere (pipeline, agent tabs, dashboard, memory tools) by e
 | `repeat_tests` | Runs of a passing test |
 | `exclusive` | The run has the GPU to itself in the queue |
 | `research_default` | The Task tab ticks web research when this level is chosen |
+| `server` | "long": the window switches vLLM to the 32k preset (`LONG_CONTEXT_PRESET`) for the run |
+| `spec_review` | A reviewer writes a precise spec and corrects the plan before coding |
+| `reference_tests` | The tester also compares with a simple reference and checks properties |
+| `differential` | Passing candidates answer the same probe inputs; a referee settles disagreements |
+| `critics` | Critics per round (two have different focuses) |
+| `critic_proof` | Critic claims must be proven by tests; proven tests become regression checks |
+| `adversary` | A second independent tester tries to break the script |
+| `head_to_head` | A judge compares the top two candidates side by side |
+| `mutation` | Plant small bugs to check the tests catch them, and strengthen the tests |
+| `vary_env` | Repeat runs use other time zones, locales, hash seeds and folders |
+| `test_timeout`, `max_checks` | Seconds per test run; acceptance checks the planner may write |
 
+Low, Medium and High leave the last twelve unset; `LEVEL_DEFAULTS` fills them in.
 `DEFAULT_ACCURACY` (low) is used when none is given; `MAX_PARALLEL_RUNS` (2) is how many shared
 runs the queue starts at once.
 
@@ -560,8 +631,11 @@ databases, run folders, logs or secrets.
 | Chat says vLLM isn't reachable | vLLM is stopped or still loading (see the Model server tab's log). Start it, or pick Node 3 in the chat |
 | A run shows LOST | Its process ended without finishing (killed, PC restarted). Re-run this goal |
 | A run seems stuck | Its log on the Task & Queue tab shows what it's waiting for. Stop / remove it, or press Reset pipeline on the Cluster tab |
-| A High run waits in the queue | It starts once the runs ahead of it finish, because it needs the GPU to itself |
+| A High, Ultra or MAX run waits in the queue | It starts once the runs ahead of it finish, because it needs the GPU to itself (Ultra and MAX then wait about a minute for vLLM to switch to 32k) |
+| Chat is slow during an Ultra or MAX run | vLLM is on the 32k server then (about half speed for one request); it switches back when those runs finish |
 | A script needs a package to run on this PC | Talk about result names it with the pip command, and Run it installs it for you |
+| A run log says "Shortened '...' to fit the ... context window" | The prompt plus room for thinking and the answer didn't fit. Extras (attachments, web notes, past examples) are cut first; then the thinking shrinks, down to half its budget, before the spec or the failure report is cut. Common on High (16k) with big files; Ultra and MAX use the 32k server for this reason |
+| A run log says "cut off at N tokens: about X of thinking, Y of answer" | A reply reached its token limit; the line shows where the room went. When thinking runs past its budget, the model tends to keep reasoning in its answer, which then gets cut off; such a candidate is finished from its own notes without thinking again ("finishing them from their own notes"). A candidate that still came back cut off or broken keeps the model's reply as `model_reply.txt` in its folder under `Z:\runs\<run>\` |
 | Research finds nothing useful | The allowlist may not cover the topic. Add the relevant documentation site to `research_allowlist.txt` |
 | Node 3 is slow on its first answer | Its models were unloaded. Cluster tab, Warm up Node 3 models |
 | The window itself won't respond | Run `Reset_Cluster.bat` (one of the fallback `.bat` files; copies are in `launchers/`): it stops the window and every run, then reopens the window |
