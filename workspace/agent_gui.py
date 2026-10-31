@@ -1,20 +1,24 @@
-"""Agent Control GUI: chat with the models, queue pipeline runs, and look back at every run.
+"""Agent tabs: chat with the models, queue pipeline runs, and look back at every run.
+
+Normally these tabs live inside the combined "Agent Cluster" window (C:\\AI\\cluster_launcher\\
+cluster_launcher.py), which embeds them next to its Model server and Cluster tabs. Run this file
+directly to get them in a window of their own (the fallback Launch_GUI.bat does that).
 
 Three tabs:
   Chat         - talk a task through with the Node 1 model (vLLM) or Node 3's helper (Ollama).
                  "Make task from chat" turns the conversation into a goal, target file and
                  network setting on the Task tab. "Talk about result" opens a chat that already
                  knows a finished run (goal, plan, code, test output, verdict) and explains it.
-  Task & Queue - the goal form and attachments. Dispatch adds the task to a queue; up to
-                 config.MAX_PARALLEL_RUNS run at once and the rest wait. Each run has its own
-                 log; pick a run in the queue list to see it.
+  Task & Queue - the goal form, accuracy level (Low / Medium / High) and attachments. Dispatch
+                 adds the task to a queue; up to config.MAX_PARALLEL_RUNS run at once (a High run
+                 has the GPU to itself) and the rest wait. Each run has its own log.
   Runs         - every recorded run (from Redis): status, timing per step, plan, checks,
                  verdict and output, with buttons to talk about it, open or run the file,
                  re-run the goal, or open its full log and folder.
 
 Tk isn't thread-safe, so background threads (pipeline output readers, chat streaming, Redis
-polling) only put messages on a queue, and the Tk main loop drains it every 50 ms. Writes its
-PID to %TEMP%\\agent_gui.pid so the launcher's Reset can stop exactly this process.
+polling) only put messages on a queue, and the Tk main loop drains it every 50 ms. On its own it
+writes its PID to %TEMP%\\agent_gui.pid so Reset can stop exactly this process.
 """
 import ast
 import importlib.util
@@ -85,7 +89,7 @@ RESULT_PROMPT_PASSED = (
 RESULT_PROMPT_FAILED = (
     "This run failed. Explain: what was attempted; what went wrong and why, based on the test output, "
     "the diagnosis and the verdict; whether the latest code is usable at all; and what I should change "
-    "in the goal or the run settings (for example research, an overnight run, network access) so the "
+    "in the goal or the run settings (for example web research, a higher accuracy level, network access) so the "
     "next run succeeds. Be specific and practical."
 )
 
@@ -97,6 +101,51 @@ PIP_NAMES = {"yaml": "PyYAML", "cv2": "opencv-python", "PIL": "Pillow", "sklearn
 
 RUN_FIELDS = ("status", "phase", "target_file", "profile", "started_at", "updated_at", "finished_at",
               "elapsed_s", "attempt", "goal")
+
+LEVELS = [name for name in ("low", "medium", "high") if name in config.RUN_PROFILES]
+
+
+def level_summary(name):
+    """One line describing an accuracy level, built from config.RUN_PROFILES."""
+    p = config.RUN_PROFILES[name]
+    parts = [f"{p['max_attempts']} attempts x {p['candidates']}"
+             f"{' different' if p['diverse'] else ''} candidates"]
+    parts.append("always thinks" if p["think_engineer"] == "always" else "thinks when fixing")
+    if p["tester"]:
+        parts.append("independent tests")
+    if p["judges"] > 1:
+        parts.append(f"{p['judges']}-judge panel")
+    if p["critic_rounds"]:
+        parts.append("review rounds")
+    if p["repeat_tests"] > 1:
+        parts.append(f"tests run {p['repeat_tests']}x")
+    if p["exclusive"]:
+        parts.append("runs alone")
+    hours = p["time_limit_s"] / 3600
+    parts.append(f"up to {hours:g} h" if hours >= 1 else f"up to {p['time_limit_s'] // 60} min")
+    return " · ".join(parts)
+
+
+def apply_style(root):
+    """Dark ttk styling shared by these tabs and the combined window."""
+    style = ttk.Style(root)
+    style.theme_use("clam")
+    style.configure("TNotebook", background=BG, borderwidth=0)
+    style.configure("TNotebook.Tab", background=PANEL, foreground="#cccccc", padding=(16, 6),
+                    font=("Segoe UI", 10, "bold"), borderwidth=0)
+    style.map("TNotebook.Tab", background=[("selected", "#0275d8")], foreground=[("selected", "white")])
+    style.configure("TCombobox", fieldbackground=FIELD, background=PANEL, foreground=TEXT, arrowcolor=TEXT)
+    style.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", TEXT)],
+              selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", TEXT)])
+    style.configure("Treeview", background=FIELD, fieldbackground=FIELD, foreground=TEXT,
+                    borderwidth=0, rowheight=22, font=("Segoe UI", 9))
+    style.configure("Treeview.Heading", background=PANEL, foreground="#cccccc",
+                    font=("Segoe UI", 9, "bold"), relief="flat")
+    style.map("Treeview", background=[("selected", "#0b5394")], foreground=[("selected", "white")])
+    style.map("Treeview.Heading", background=[("active", "#3e3e42")])
+    root.option_add("*TCombobox*Listbox.background", FIELD)
+    root.option_add("*TCombobox*Listbox.foreground", TEXT)
+    root.option_add("*TCombobox*Listbox.selectBackground", "#0275d8")
 
 
 # --------------------------------------------------------------------------- helpers (no Tk)
@@ -203,8 +252,9 @@ def result_context(data):
     parts = [
         "You are now discussing a finished run of the coding pipeline. The facts below come from that "
         "run. Base your answers on them and on the code; say so when something isn't covered.",
-        f"Run {run_id}: {status} ({data.get('phase', '')}). Profile: {data.get('profile', 'normal')}, "
-        f"attempt {data.get('attempt', '?')}, took {fmt_secs(data.get('elapsed_s')) or 'unknown'}.",
+        f"Run {run_id}: {status} ({data.get('phase', '')}). Accuracy level: "
+        f"{config.accuracy_level(data.get('profile'))}, attempt {data.get('attempt', '?')}, "
+        f"took {fmt_secs(data.get('elapsed_s')) or 'unknown'}.",
     ]
     if status == "PASSED":
         parts.append(f"The file was saved as {path}.")
@@ -226,6 +276,8 @@ def result_context(data):
         parts.append("Plan:\n" + data["plan"][:3000])
     if checks:
         parts.append("Acceptance checks:\n" + "\n".join(f"{i}. {c}" for i, c in enumerate(checks, 1)))
+    if data.get("interface"):
+        parts.append("Interface (how the script is meant to be called):\n" + data["interface"][:2000])
     if data.get("verdict"):
         parts.append("Verifier's verdict:\n" + data["verdict"][:2000])
     out = data.get("execution_output") or data.get("output") or ""
@@ -243,11 +295,16 @@ def result_context(data):
 # --------------------------------------------------------------------------- the window
 
 class AgentControlGUI:
-    def __init__(self, root, write_pid=True):
+    """The Chat, Task & Queue and Runs tabs. On its own it makes its own window; embedded, the
+    combined window passes its notebook, three empty tab frames and a header frame to build into."""
+
+    def __init__(self, root, write_pid=True, notebook=None, frames=None, header=None):
         self.root = root
-        self.root.title("Cluster Orchestrator - Chat, Queue and Runs")
-        self.root.geometry("1120x900")
-        self.root.configure(bg=BG)
+        self.embedded = notebook is not None
+        if not self.embedded:
+            self.root.title("Agent Cluster - Chat, Queue and Runs")
+            self.root.geometry("1120x900")
+            self.root.configure(bg=BG)
         self.msgs = queue.Queue()
         # Run queue (this window's runs)
         self.jobs = []
@@ -258,7 +315,8 @@ class AgentControlGUI:
         self.attachments = []
         self.allow_network = tk.BooleanVar(value=False)
         self.task_research = tk.BooleanVar(value=False)
-        self.overnight = tk.BooleanVar(value=False)
+        self.level = tk.StringVar(value=config.DEFAULT_ACCURACY)
+        self._research_auto = False      # True when the level ticked "Research" by itself
         # Chat
         self.chat_think = tk.BooleanVar(value=False)
         self.chat_attach = tk.BooleanVar(value=False)
@@ -276,11 +334,12 @@ class AgentControlGUI:
         self.detail_data = {}
         self.runs_loading = False
         self.write_pid = write_pid
-        self._build_ui()
+        self._build_ui(notebook, frames, header)
         if write_pid:
             self._write_pid_file()
         threading.Thread(target=self._poller, daemon=True).start()
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        if not self.embedded:
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(50, self._drain)
         self.root.after(10000, self._auto_refresh)
 
@@ -299,51 +358,40 @@ class AgentControlGUI:
         return tk.Checkbutton(parent, text=text, variable=var, bg=BG, fg=TEXT, selectcolor=FIELD,
                               activebackground=BG, activeforeground=TEXT, font=("Segoe UI", 9))
 
-    def _build_ui(self):
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", background=PANEL, foreground="#cccccc", padding=(16, 6),
-                        font=("Segoe UI", 10, "bold"), borderwidth=0)
-        style.map("TNotebook.Tab", background=[("selected", "#0275d8")],
-                  foreground=[("selected", "white")])
-        style.configure("TCombobox", fieldbackground=FIELD, background=PANEL, foreground=TEXT,
-                        arrowcolor=TEXT)
-        style.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", TEXT)],
-                  selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", TEXT)])
-        style.configure("Treeview", background=FIELD, fieldbackground=FIELD, foreground=TEXT,
-                        borderwidth=0, rowheight=22, font=("Segoe UI", 9))
-        style.configure("Treeview.Heading", background=PANEL, foreground="#cccccc",
-                        font=("Segoe UI", 9, "bold"), relief="flat")
-        style.map("Treeview", background=[("selected", "#0b5394")], foreground=[("selected", "white")])
-        style.map("Treeview.Heading", background=[("active", "#3e3e42")])
-        self.root.option_add("*TCombobox*Listbox.background", FIELD)
-        self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
-        self.root.option_add("*TCombobox*Listbox.selectBackground", "#0275d8")
-
-        top = tk.Frame(self.root, bg=PANEL, pady=8, padx=10)
-        top.pack(fill=tk.X)
-        self.status_lbl = tk.Label(top, text="Idle", fg="#4CAF50", bg=PANEL, font=("Segoe UI", 11, "bold"))
+    def _build_ui(self, notebook=None, frames=None, header=None):
+        apply_style(self.root)
+        if header is None:
+            top = tk.Frame(self.root, bg=PANEL, pady=8, padx=10)
+            top.pack(fill=tk.X)
+        else:
+            top = header
+        bg = top.cget("bg")
+        self.status_lbl = tk.Label(top, text="Idle", fg="#4CAF50", bg=bg, font=("Segoe UI", 11, "bold"))
         self.status_lbl.pack(side=tk.LEFT)
-        self.redis_lbl = tk.Label(top, text="Node 2: connecting...", fg="#5bc0de", bg=PANEL,
+        self.redis_lbl = tk.Label(top, text="Node 2: connecting...", fg="#5bc0de", bg=bg,
                                   font=("Segoe UI", 9))
-        self.redis_lbl.pack(side=tk.LEFT, padx=(16, 0))
+        self.redis_lbl.pack(side=tk.LEFT, padx=(12, 0))
         self._button(top, "Dispatch Run", self.start_pipeline, "#0275d8").pack(side=tk.RIGHT, padx=4)
-        self._button(top, "Web Dashboard", lambda: webbrowser.open(config.DASHBOARD_URL),
-                     "#17a2b8").pack(side=tk.RIGHT, padx=4)
+        if header is None:
+            self._button(top, "Web Dashboard", lambda: webbrowser.open(config.DASHBOARD_URL),
+                         "#17a2b8").pack(side=tk.RIGHT, padx=4)
 
-        self.tabs = ttk.Notebook(self.root)
-        self.tabs.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 8))
-        self.chat_tab = tk.Frame(self.tabs, bg=BG)
-        self.task_tab = tk.Frame(self.tabs, bg=BG)
-        self.runs_tab = tk.Frame(self.tabs, bg=BG)
-        self.tabs.add(self.chat_tab, text="Chat")
-        self.tabs.add(self.task_tab, text="Task & Queue")
-        self.tabs.add(self.runs_tab, text="Runs")
+        if notebook is None:
+            self.tabs = ttk.Notebook(self.root)
+            self.tabs.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 8))
+            self.chat_tab = tk.Frame(self.tabs, bg=BG)
+            self.task_tab = tk.Frame(self.tabs, bg=BG)
+            self.runs_tab = tk.Frame(self.tabs, bg=BG)
+            self.tabs.add(self.chat_tab, text="Chat")
+            self.tabs.add(self.task_tab, text="Task & Queue")
+            self.tabs.add(self.runs_tab, text="Runs")
+        else:
+            self.tabs = notebook
+            self.chat_tab, self.task_tab, self.runs_tab = frames
         self._build_chat(self.chat_tab)
         self._build_task(self.task_tab)
         self._build_runs(self.runs_tab)
-        self.tabs.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self.tabs.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
 
     def _build_chat(self, parent):
         opts = tk.Frame(parent, bg=BG, padx=10, pady=6)
@@ -404,11 +452,19 @@ class AgentControlGUI:
         self._check(row, "Allow LAN network in sandbox", self.allow_network).pack(side=tk.RIGHT)
 
         row2 = tk.Frame(form, bg=BG)
-        row2.pack(fill=tk.X, pady=(4, 0))
-        self._check(row2, "Research the web first (allowlisted sites)", self.task_research).pack(
-            side=tk.LEFT, padx=(0, 14))
-        self._check(row2, "Overnight run: more attempts and candidates, up to 12 h", self.overnight).pack(
-            side=tk.LEFT)
+        row2.pack(fill=tk.X, pady=(6, 0))
+        self._label(row2, "Accuracy:").pack(side=tk.LEFT)
+        for name in LEVELS:
+            tk.Radiobutton(row2, text=name.capitalize(), value=name, variable=self.level,
+                           command=self._on_level_change, bg=BG, fg=TEXT, selectcolor=FIELD,
+                           activebackground=BG, activeforeground=TEXT,
+                           font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(6, 0))
+        self.level_lbl = self._label(row2, level_summary(self.level.get()), muted=True)
+        self.level_lbl.pack(side=tk.LEFT, padx=(12, 0))
+        row3 = tk.Frame(form, bg=BG)
+        row3.pack(fill=tk.X, pady=(2, 0))
+        self._check(row3, "Research the web first (allowlisted sites)", self.task_research).pack(side=tk.LEFT)
+        self.task_research.trace_add("write", lambda *_: setattr(self, "_research_auto", False))
 
         self._label(form, "Attachments (sent as separate context, not pasted into the goal):").pack(
             anchor=tk.W, pady=(8, 2))
@@ -427,14 +483,15 @@ class AgentControlGUI:
 
         qframe = tk.Frame(parent, bg=BG, padx=10)
         qframe.pack(fill=tk.X, pady=(4, 0))
-        self._label(qframe, f"Queue: up to {config.MAX_PARALLEL_RUNS} runs at once, the rest wait their "
-                            "turn. Select a run to see its log.").pack(anchor=tk.W)
+        self._label(qframe, f"Queue: up to {config.MAX_PARALLEL_RUNS} runs at once (a High run has the GPU "
+                            "to itself); the rest wait their turn. Select a run to see its log.").pack(anchor=tk.W)
         qrow = tk.Frame(qframe, bg=BG)
         qrow.pack(fill=tk.X, pady=(2, 0))
-        cols = ("n", "state", "target", "progress")
+        cols = ("n", "level", "state", "target", "progress")
         self.queue_tree = ttk.Treeview(qrow, columns=cols, show="headings", height=4, selectmode="browse")
-        for col, text, width, stretch in (("n", "#", 40, False), ("state", "State", 90, False),
-                                          ("target", "Target", 180, False), ("progress", "Progress", 400, True)):
+        for col, text, width, stretch in (("n", "#", 40, False), ("level", "Level", 65, False),
+                                          ("state", "State", 85, False), ("target", "Target", 170, False),
+                                          ("progress", "Progress", 400, True)):
             self.queue_tree.heading(col, text=text, anchor=tk.W)
             self.queue_tree.column(col, width=width, stretch=stretch, anchor=tk.W)
         for state, color in STATE_COLORS.items():
@@ -474,7 +531,7 @@ class AgentControlGUI:
         cols = ("started", "status", "target", "profile", "took", "attempt", "goal")
         self.runs_tree = ttk.Treeview(list_frame, columns=cols, show="headings", selectmode="browse")
         for col, text, width, stretch in (("started", "Started", 130, False), ("status", "Status", 80, False),
-                                          ("target", "Target", 170, False), ("profile", "Profile", 75, False),
+                                          ("target", "Target", 170, False), ("profile", "Level", 65, False),
                                           ("took", "Took", 70, False), ("attempt", "Attempt", 60, False),
                                           ("goal", "Goal", 400, True)):
             self.runs_tree.heading(col, text=text, anchor=tk.W)
@@ -510,6 +567,17 @@ class AgentControlGUI:
                                      ("Open run folder", self.open_selected_folder, "#3e3e42")):
             self._button(buttons, text, command, color).pack(side=tk.LEFT, padx=(0, 6))
         self._show_detail_message("Select a run to see its details. Double-click to talk about it.")
+
+    def _on_level_change(self):
+        """Show what the level does; High ticks web research (untick it if you don't want it)."""
+        name = self.level.get()
+        self.level_lbl.config(text=level_summary(name))
+        wants = config.RUN_PROFILES[name]["research_default"]
+        if wants and not self.task_research.get():
+            self.task_research.set(True)        # (setting it runs the trace, which clears the flag)
+            self._research_auto = True
+        elif not wants and self._research_auto:
+            self.task_research.set(False)       # only undo a tick the level made itself
 
     # ------------------------------------------------------------------ small helpers (main thread)
 
@@ -767,7 +835,7 @@ class AgentControlGUI:
                 card = requests.get(config.LLM_BASE_URL + "/v1/models", timeout=5).json()["data"][0]
             except Exception as e:
                 raise RuntimeError(f"vLLM isn't reachable at {config.LLM_BASE_URL} ({e}). Start it from "
-                                   "the Cluster Launcher, or pick Node 3 in the Model list.")
+                                   "the Model server tab, or pick Node 3 in the Model list.")
             self._vllm_cache = (card["id"], int(card.get("max_model_len") or config.LLM_FALLBACK_CONTEXT))
         return self._vllm_cache
 
@@ -928,30 +996,44 @@ class AgentControlGUI:
             args.append("--allow-network")
         if self.task_research.get():
             args.append("--research")
-        if self.overnight.get():
-            args.append("--overnight")
+        level = self.level.get()
+        args.append(f"--accuracy={level}")
         self.job_seq += 1
         job = {"id": self.job_seq, "goal": goal, "args": args, "target": target or "(chosen by the agent)",
-               "state": "QUEUED", "phase": "waiting for a free slot", "proc": None, "lines": [],
-               "run_id": None, "rc": None, "goal_file": None, "stopped": False}
+               "level": level, "state": "QUEUED", "phase": "waiting for a free slot", "proc": None,
+               "lines": [], "run_id": None, "rc": None, "goal_file": None, "stopped": False}
         self.jobs.append(job)
         self.queue_tree.insert("", tk.END, iid=str(job["id"]), tags=("QUEUED",),
-                               values=(job["id"], "QUEUED", job["target"], job["phase"]))
+                               values=(job["id"], level, "QUEUED", job["target"], job["phase"]))
         self._pump_queue()
         if job["state"] == "QUEUED":
             if self.view_job is None:
                 self._select_job(job["id"])
-            self.log(f"[i] Run #{job['id']} queued; it starts when one of the "
-                     f"{config.MAX_PARALLEL_RUNS} running tasks finishes.")
+            if self._exclusive(job):
+                self.log(f"[i] Run #{job['id']} queued. A High run has the GPU to itself, so it starts "
+                         "once the running tasks finish.")
+            else:
+                self.log(f"[i] Run #{job['id']} queued; it starts when a slot is free.")
+
+    @staticmethod
+    def _exclusive(job):
+        return config.RUN_PROFILES.get(job.get("level"), {}).get("exclusive", False)
 
     def _pump_queue(self):
-        running = len(self._running_jobs())
+        """Start waiting runs in order. Up to MAX_PARALLEL_RUNS share the GPU; an exclusive (High)
+        run starts only when nothing else runs, and nothing starts beside it."""
+        running = self._running_jobs()
         for job in self.jobs:
-            if running >= config.MAX_PARALLEL_RUNS:
+            if job["state"] != "QUEUED":
+                continue
+            if any(self._exclusive(j) for j in running):
                 break
-            if job["state"] == "QUEUED":
-                if self._launch(job):
-                    running += 1
+            if self._exclusive(job) and running:
+                break                       # wait for the GPU to be free; keep the queue order
+            if len(running) >= config.MAX_PARALLEL_RUNS:
+                break
+            if self._launch(job):
+                running.append(job)
         self._update_status()
 
     def _launch(self, job):
@@ -982,7 +1064,7 @@ class AgentControlGUI:
         iid = str(job["id"])
         if self.queue_tree.exists(iid):
             self.queue_tree.item(iid, tags=(job["state"],),
-                                 values=(job["id"], job["state"], job["target"], job["phase"]))
+                                 values=(job["id"], job["level"], job["state"], job["target"], job["phase"]))
 
     def _select_job(self, job_id):
         iid = str(job_id)
@@ -1025,7 +1107,7 @@ class AgentControlGUI:
             if messagebox.askyesno("Stop run", f"Stop run #{job['id']} ({job['target']})?"):
                 self._stop_job(job)
 
-    def _stop_job(self, job):
+    def _stop_job(self, job, reason="stopped from the GUI"):
         proc = job["proc"]
         job["stopped"] = True
         if proc is not None and proc.poll() is None:
@@ -1046,11 +1128,10 @@ class AgentControlGUI:
                 try:
                     r = config.get_redis(timeout=3)
                     r.hset(config.TASK_KEY_PREFIX + run_id,
-                           mapping={"status": "STOPPED", "phase": "stopped from the GUI",
-                                    "updated_at": int(time.time())})
+                           mapping={"status": "STOPPED", "phase": reason, "updated_at": int(time.time())})
                     r.zrem(config.ACTIVE_KEY, run_id)
                     if r.hget(config.LATEST_KEY, "run_id") == run_id.encode():
-                        r.hset(config.LATEST_KEY, mapping={"status": "STOPPED", "phase": "stopped from the GUI"})
+                        r.hset(config.LATEST_KEY, mapping={"status": "STOPPED", "phase": reason})
                     # Leftover test containers of this run.
                     subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", config.SSH_TARGET,
                                     f"docker ps -aq --filter name=agent-{run_id} | xargs -r docker rm -f"],
@@ -1061,6 +1142,24 @@ class AgentControlGUI:
             thread.start()
             return thread
         return None
+
+    def active_count(self):
+        return len(self._running_jobs())
+
+    def stop_all(self, reason="stopped"):
+        """Stop every running task and empty the queue (Reset uses this). Returns the threads
+        that are marking the stopped runs in Redis, so the caller can wait for them."""
+        threads = []
+        for job in self.jobs:
+            if job["state"] == "QUEUED":
+                job.update(state="STOPPED", phase=f"removed from the queue ({reason})")
+                self._refresh_job_row(job)
+            elif job["state"] == "RUNNING":
+                t = self._stop_job(job, reason)
+                if t:
+                    threads.append(t)
+        self._update_status()
+        return threads
 
     def talk_about_selected_job(self):
         job = self._selected_job()
@@ -1189,7 +1288,7 @@ class AgentControlGUI:
                 started = rid
             goal = " ".join((row.get("goal") or "").split())[:200]
             self.runs_tree.insert("", tk.END, iid=rid, tags=(state,), values=(
-                started, state, row.get("target_file") or "", row.get("profile") or "normal",
+                started, state, row.get("target_file") or "", config.accuracy_level(row.get("profile")),
                 self._row_took(row), row.get("attempt") or "", goal))
         active = sum(1 for r in rows if r["active"])
         self.runs_lbl.config(text=f"{len(rows)} runs recorded, {active} running now. Newest first; "
@@ -1243,7 +1342,7 @@ class AgentControlGUI:
         d.delete("1.0", tk.END)
         d.insert(tk.END, f"{data.get('target_file', '?')}  ", "title")
         d.insert(tk.END, f"{state}\n", state if state in STATE_COLORS else "title")
-        facts = [f"Run {run_id}", f"profile {data.get('profile', 'normal')}",
+        facts = [f"Run {run_id}", f"accuracy {config.accuracy_level(data.get('profile'))}",
                  f"attempt {data.get('attempt', '?')}",
                  "network on" if data.get("allow_network") == "1" else "network off",
                  "web research on" if data.get("research") == "1" else "web research off"]
@@ -1262,6 +1361,7 @@ class AgentControlGUI:
         checks = json_field(data, "checks", [])
         sections = [("Goal", data.get("goal")), ("Plan", data.get("plan")),
                     ("Acceptance checks", "\n".join(f"{i}. {c}" for i, c in enumerate(checks, 1))),
+                    ("Interface", data.get("interface")),
                     ("Verdict", data.get("verdict")),
                     ("Test output" if data.get("status") == "PASSED" else "Output / error",
                      data.get("execution_output") or data.get("output"))]
@@ -1331,8 +1431,9 @@ class AgentControlGUI:
         self.target_entry.delete(0, tk.END)
         self.target_entry.insert(0, data.get("target_file") or "")
         self.allow_network.set(data.get("allow_network") == "1")
-        self.task_research.set(data.get("research") == "1")
-        self.overnight.set(data.get("profile") == "overnight")
+        self.level.set(config.accuracy_level(data.get("profile")))
+        self.level_lbl.config(text=level_summary(self.level.get()))
+        self.task_research.set(data.get("research") == "1")     # as that run had it (clears the auto flag)
         self.tabs.select(self.task_tab)
         self.log(f"[+] Loaded the goal and settings of run {row['run_id']}. Edit if needed, then press "
                  "Dispatch Run.")
@@ -1470,21 +1571,29 @@ class AgentControlGUI:
         except OSError:
             pass
 
-    def _on_close(self):
+    def confirm_close(self):
+        """Ask before closing while runs are going; stops them if you agree. True = OK to close."""
         running = self._running_jobs()
         queued = [j for j in self.jobs if j["state"] == "QUEUED"]
         if running or queued:
             msg = f"{len(running)} run(s) still going"
             if queued:
                 msg += f" and {len(queued)} waiting"
-            if not messagebox.askyesno("Runs in progress", msg + ". Stop them and close the GUI?"):
-                return
-            threads = [t for t in (self._stop_job(job) for job in running) if t]
+            if not messagebox.askyesno("Runs in progress", msg + ". Stop them and close?"):
+                return False
+            threads = [t for t in (self._stop_job(job, "stopped when the window closed") for job in running) if t]
             for t in threads:
                 t.join(timeout=15)   # let each run's record be marked stopped before exiting
+        return True
+
+    def shutdown(self):
         self.chat_stop.set()
         self._remove_pid_file()
-        self.root.destroy()
+
+    def _on_close(self):
+        if self.confirm_close():
+            self.shutdown()
+            self.root.destroy()
 
 
 def main():

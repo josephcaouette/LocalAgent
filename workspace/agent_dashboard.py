@@ -113,6 +113,8 @@ def render_row(t):
         status_html += f"<div class='sub'>{esc(t['phase'])}</div>"
     if t.get("attempt"):
         status_html += f"<div class='sub'>attempt {esc(t['attempt'])}</div>"
+    if t.get("profile"):
+        status_html += f"<div class='sub'>accuracy {esc(config.accuracy_level(t['profile']))}</div>"
     if t.get("_took"):
         status_html += f"<div class='sub'>took {esc(t['_took'])}</div>"
     if t.get("memory_sync"):

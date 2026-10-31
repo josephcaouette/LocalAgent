@@ -5,8 +5,10 @@ Started by the pipeline as a detached background process:
 The old form still works:  python background_ingest.py <file.py> [goal]
 Output is appended to logs\\ingest.log.
 
-What gets embedded is a description (goal, summary, tags) with nomic's
-"search_document:" prefix, not the code itself. The code is kept in the payload.
+What gets embedded is a description (goal, summary, tags) with config.EMBED_DOCUMENT_PREFIX,
+not the code itself. The code is kept in the payload. The code comes from the run's own copy
+(Z:\\runs\\<run>\\final_<file>) when the job names one, so a later run that changes the same
+workspace file can't swap in different code.
 """
 import argparse
 import json
@@ -68,7 +70,9 @@ def main():
 
     target = os.path.basename(job["target_file"])
     goal = job.get("goal", "")
-    path = os.path.join(config.WORKSPACE, target)
+    path = job.get("code_file") or ""
+    if not path or not os.path.exists(path):
+        path = os.path.join(config.WORKSPACE, target)
     if not os.path.exists(path):
         log(f"{path} doesn't exist; nothing stored.")
         return 1

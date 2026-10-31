@@ -1,18 +1,25 @@
 """LangGraph agent pipeline: plan -> write code -> test in throwaway sandboxes -> verify -> promote.
 
     python run_langgraph_pipeline.py --goal="..." [--target=name.py] [--attach=path ...]
-                                     [--allow-network] [--research] [--overnight]
+                                     [--allow-network] [--research] [--accuracy=low|medium|high]
     python run_langgraph_pipeline.py --goal-file=goal.txt ...     (what the GUI uses)
     python run_langgraph_pipeline.py "goal text"                  (old style, still works)
 
 Flow:
     memory search + scout + optional web research, in parallel
     -> planner   (implementation steps + 2-4 acceptance checks; thinks first)
-    -> engineer  (writes N candidate files at once into Z:\\runs\\<run>\\a<A>c<K>\\)
-    -> executor  (tests every candidate in its own fresh container on Node 2, in parallel)
-    -> verifier  (judges each candidate that ran cleanly; thinks first; the best one wins)
+    -> engineer  (writes N candidate files at once into Z:\\runs\\<run>\\a<A>c<K>\\; a static
+                  check rejects files that use undefined names. On High, a separate tester
+                  writes an independent acceptance test at the same time)
+    -> executor  (tests every candidate in its own container on Node 2, in parallel: its own
+                  --test, then the independent test, then repeat runs on Medium and High)
+    -> verifier  (judges each candidate that ran cleanly; thinks first; the best one wins. On
+                  High the winner needs a majority of three independent votes)
+    -> critic    (High only: looks for bugs the tests missed; real problems become new checks
+                  and go back to the engineer, up to two rounds)
     -> finalize  (on pass: back up the old file to .history, promote the winner, store in memory)
-Crashes go through a diagnosis step back to the engineer; verifier rejections go straight back.
+Crashes go through a diagnosis step back to the engineer (for a failed independent test it
+also decides whether the script or the test is wrong); verifier rejections go straight back.
 The live workspace file only changes on a pass.
 
 Several runs can go at once (the GUI's queue runs config.MAX_PARALLEL_RUNS): each has its own
@@ -20,8 +27,10 @@ run folder, PID file (%TEMP%\\agent_pipeline_<run>.pid) and Redis record, and se
 to the workflow:active set. Everything printed is also saved to Z:\\runs\\<run>\\pipeline.log,
 and the record gets per-step timings and token counts.
 
-Run profiles (config.RUN_PROFILES): "normal" (3 attempts x 2 candidates, 30 minute cap) and
-"overnight" (8 attempts x 3 candidates, the engineer always thinks, 12 hour cap).
+Accuracy levels (config.RUN_PROFILES): "low" (3 attempts x 2 candidates, 30 minute cap),
+"medium" (8 x 3, the engineer always thinks, repeat runs, 12 hour cap) and "high" (10 x 4 diverse
+candidates, more thinking, independent tests, a 3-judge panel and review rounds, 12 hour cap,
+the GPU to itself). Older runs stored "normal" (= low) and "overnight" (= medium).
 
 Exit code: 0 passed, 1 failed (attempts or time ran out), 2 stopped by an error.
 """
@@ -66,10 +75,13 @@ LLM = OpenAI(base_url=config.LLM_BASE_URL + "/v1", api_key="none",
 MODEL_ID = config.LLM_MODEL                       # replaced by the served model in connect_llm()
 CONTEXT_TOKENS = config.LLM_FALLBACK_CONTEXT      # replaced by vLLM's max_model_len in connect_llm()
 
+THINK_TOKENS = config.THINK_TOKENS                # replaced by the accuracy level's think_tokens in main()
+
 # Where the time and tokens go, saved with the run record (Runs tab and dashboard show them).
 STEP_TIMES = {}        # step name -> seconds (summed over attempts)
 TOKENS = {}            # model role -> {"in": prompt tokens, "out": generated tokens}
 _stats_lock = threading.Lock()
+_llm_pool = ThreadPoolExecutor(max_workers=6)   # model calls that run beside each other
 
 
 class LLMError(Exception):
@@ -93,10 +105,21 @@ class AgentState(TypedDict):
     attachment_names: list
     allow_network: bool
     research: bool
-    profile: str
+    profile: str            # accuracy level: low, medium or high
     max_attempts: int
     num_candidates: int
     think_engineer: str
+    diverse: bool
+    tester: bool
+    judges: int
+    critic_rounds: int
+    critic_used: int
+    repeat_tests: int
+    interface: str          # how tests can call the script (planned on High)
+    indep_test: str         # the independent acceptance test ("" = none)
+    indep_checks: list      # the checks it was written for
+    test_feedback: str      # a diagnosis saying the independent test itself was wrong
+    best_passed: dict       # the last version that passed, kept while the reviewer's fixes run
     started: float
     time_limit_s: int
     existing_code: str
@@ -225,7 +248,7 @@ def connect_llm():
         data = requests.get(config.LLM_BASE_URL + "/v1/models", timeout=5).json()
     except Exception as e:
         raise LLMError(f"vLLM is not reachable at {config.LLM_BASE_URL} ({short(e)}). "
-                       "Start it from the Cluster Launcher.")
+                       "Start it on the Agent Cluster window's Model server tab.")
     cards = data.get("data") or []
     if not cards:
         raise LLMError("vLLM is running but reports no models.")
@@ -309,8 +332,13 @@ def fit_messages(system, blocks, want_out, min_out, extra_margin=0, template_kwa
     else:
         raise ContextTooSmall("could not fit the prompt into the context window")
     for title in shortened:
-        print(f"    [i] Shortened '{title.rstrip(':')[:60]}' to fit the {CONTEXT_TOKENS}-token context window.")
+        if title not in _SHORTENED_NOTED:           # say it once per run, not once per candidate
+            _SHORTENED_NOTED.add(title)
+            print(f"    [i] Shortened '{title.rstrip(':')[:60]}' to fit the {CONTEXT_TOKENS}-token context window.")
     return messages, max_tokens
+
+
+_SHORTENED_NOTED = set()
 
 
 def llm_complete(label, system, blocks, want_out, min_out, temperature=None, think=False, n=1,
@@ -330,7 +358,7 @@ def llm_complete(label, system, blocks, want_out, min_out, temperature=None, thi
         extra = {"top_k": config.LLM_TOP_K, "chat_template_kwargs": kwargs}
         if think:
             room = max_tokens - (answer_min if answer_min is not None else min_out)
-            extra["thinking_token_budget"] = max(256, min(config.THINK_TOKENS, room))
+            extra["thinking_token_budget"] = max(256, min(THINK_TOKENS, room))
         try:
             resp = LLM.chat.completions.create(
                 model=MODEL_ID, messages=messages, max_tokens=max_tokens, n=n,
@@ -361,12 +389,12 @@ def llm_chat(label, system, blocks, want_out, min_out, temperature=None, think=F
     """One completion. If thinking used up the whole budget before answering, retry without it."""
     answer_min = min_out
     if think:
-        want_out, min_out = want_out + config.THINK_TOKENS, min_out + 1500
+        want_out, min_out = want_out + THINK_TOKENS, min_out + 1500
     text, finish = llm_complete(label, system, blocks, want_out, min_out, temperature, think,
                                 answer_min=answer_min)[0]
     if think and finish == "length" and not text:
         print(f"    [i] {label}: thinking ran out of room; answering again without thinking.")
-        text, finish = llm_complete(label, system, blocks, want_out - config.THINK_TOKENS,
+        text, finish = llm_complete(label, system, blocks, want_out - THINK_TOKENS,
                                     min_out - 1500, temperature, False)[0]
     return text, finish
 
@@ -401,6 +429,54 @@ def extract_code(raw):
     untagged = [b for b in blocks if not b[0]]
     pool = python or untagged or blocks
     return max(pool, key=lambda b: len(b[1]))[1].strip("\n"), True
+
+
+_UNDEFINED = ("UndefinedName", "UndefinedLocal", "UndefinedExport")
+
+
+def static_problems(code, filename):
+    """Names the code uses but never defines (pyflakes, which reads the code without running it).
+    Each one is a crash waiting on a line the test may never reach. Returns a list of lines."""
+    try:
+        from pyflakes import checker
+        tree = ast.parse(code, filename)
+    except (ImportError, SyntaxError):
+        return []
+    found = []
+    for m in checker.Checker(tree, filename=filename).messages:
+        if type(m).__name__ in _UNDEFINED:
+            found.append(f"line {m.lineno}: {m.message % m.message_args}")
+    return found
+
+
+# Put in front of the independent tester's code: loads the script without running its main block.
+TEST_HEADER = '''# --- added by the pipeline: load the script under test without running its main block ---
+import importlib.util as _ilu
+import subprocess as _sp
+import sys as _sys
+
+_spec = _ilu.spec_from_file_location("target_module", "/work/{target}")
+target = _ilu.module_from_spec(_spec)
+_sys.modules["target_module"] = target
+_spec.loader.exec_module(target)
+
+
+def run_script(*args, input=None, timeout=15):
+    """Run the script as a separate process. Returns subprocess.CompletedProcess (text mode)."""
+    return _sp.run([_sys.executable, "/work/{target}", *map(str, args)], input=input,
+                   capture_output=True, text=True, timeout=timeout)
+
+# --- independent acceptance test ---
+'''
+
+
+def test_header(target):
+    return TEST_HEADER.replace("{target}", target)
+
+
+def test_body(state):
+    """The independent test without the header the pipeline added."""
+    return state["indep_test"][len(test_header(state["target_file"])):]
 
 
 def parse_json_object(text):
@@ -667,11 +743,6 @@ def _test_command(target):
     return ["timeout", "-k", "3", str(config.SANDBOX_TIMEOUT), "python3", target, "--test"]
 
 
-def docker_command(name, remote_dir, target, allow_network):
-    """Start a container and run the test in it, in one go (about 7 s of start-up on Node 2)."""
-    return _docker_run(name, remote_dir, allow_network, [], _test_command(target))
-
-
 def container_name(state, attempt, k):
     return f"agent-{state['run_id']}-a{attempt}c{k}"
 
@@ -700,20 +771,17 @@ def prewarm_containers(state, attempt, n):
     _warm[(state["run_id"], attempt)] = (_warm_pool.submit(run_ssh, remote, 120), n)
 
 
-def discard_containers(state, attempt):
-    """Remove an attempt's prepared containers (unused ones, or ones a test left) in the
-    background, after their start-up has finished."""
+def discard_containers(state, attempt, n):
+    """Remove an attempt's containers in the background, once any early start-up has finished."""
     entry = _warm.pop((state["run_id"], attempt), None)
-    if entry is None:
-        return
-    fut, n = entry
     names = " ".join(container_name(state, attempt, k) for k in range(1, n + 1))
 
     def work():
-        try:
-            fut.result(timeout=150)
-        except Exception:
-            pass
+        if entry is not None:
+            try:
+                entry[0].result(timeout=150)
+            except Exception:
+                pass
         try:
             run_ssh(f"docker rm -f {names} >/dev/null 2>&1; true", 60)
         except Exception:
@@ -722,9 +790,20 @@ def discard_containers(state, attempt):
 
 
 def discard_all_containers(state):
+    """End of run: remove every container this run may have left (waits for early starts)."""
     for run_id, attempt in list(_warm):
         if run_id == state["run_id"]:
-            discard_containers(state, attempt)
+            discard_containers(state, attempt, _warm[(run_id, attempt)][1])
+
+    def sweep():
+        _cleanup_pool.submit(lambda: None).result(timeout=200)   # after the removals queued above
+        try:
+            run_ssh(f"docker ps -aq --filter name=agent-{state['run_id']}- | xargs -r docker rm -f "
+                    ">/dev/null 2>&1; true", 60)
+        except Exception:
+            pass
+    # Daemon: never holds the run open. Anything it misses removes itself within the hour.
+    threading.Thread(target=sweep, daemon=True).start()
 
 
 def warm_ready(state, attempt):
@@ -737,64 +816,123 @@ def warm_ready(state, attempt):
         return False
 
 
-def exec_command(name, target):
-    """Run the test in a container started earlier, then remove it in the background."""
-    test = " ".join(shlex.quote(a) for a in _test_command(target))
-    return (f"docker exec {name} {test}; rc=$?; "
-            f"(docker rm -f {name} >/dev/null 2>&1 &); exit $rc")
-
-
 _NOT_WARM = ("No such container", "is not running", "container not found")
 
 
-def run_candidate(state, cand):
-    """Test one staged candidate in its own container; returns it with the results added."""
-    attempt, target, k = state["attempt"], state["target_file"], cand["k"]
+def _start_container(state, attempt, k):
+    """Start this candidate's container now (when it wasn't prepared early, or has gone)."""
     name = container_name(state, attempt, k)
-    remote_dir = remote_cand_dir(state, attempt, k)
+    res = run_ssh(_docker_run(name, remote_cand_dir(state, attempt, k), state["allow_network"],
+                              ["-d"], ["sleep", "3600"]) + " >/dev/null", 120)
+    err = (res.stderr or res.stdout or "").strip()
+    if res.returncode != 0 and not ("Conflict" in err and "already in use" in err):
+        raise InfraError(f"the sandbox container couldn't start (exit {res.returncode}): {err[-600:]}")
+
+
+def _gone(res):
+    err = (res.stderr or "").strip()
+    first = err.splitlines()[0] if err else ""
+    return (res.returncode in (1, 125, 126, 127) and first.startswith("Error")
+            and any(m in first for m in _NOT_WARM))
+
+
+def run_in_container(state, attempt, k, args):
+    """Run a command in this candidate's own container, starting the container if needed."""
+    name = container_name(state, attempt, k)
+    cmd = f"docker exec {name} " + " ".join(shlex.quote(a) for a in args)
+    if not warm_ready(state, attempt):
+        _start_container(state, attempt, k)
+    res = run_ssh(cmd, timeout=config.SANDBOX_TIMEOUT + 45)
+    if _gone(res):
+        print(f"    [i] Candidate {k}: its container was gone; starting a fresh one.")
+        _start_container(state, attempt, k)
+        res = run_ssh(cmd, timeout=config.SANDBOX_TIMEOUT + 45)
+    if res.returncode in (125, 126, 127, 255) and any(m in (res.stderr or "") for m in _INFRA_MARKERS):
+        raise InfraError(f"couldn't run the test on Node 2 (exit {res.returncode}): "
+                         f"{(res.stderr or '').strip()[-600:]}")
+    return res
+
+
+_FAIL_LINE = re.compile(r"\bFAIL|\bFAILED\b|AssertionError|\bassert\b|Traceback|Error:", re.IGNORECASE)
+
+
+def failure_lines(out, limit=2000):
+    """The lines of a test's output that report failures. They can come anywhere, so a tail of
+    the output alone may cut them off."""
+    lines = [ln for ln in out.splitlines() if _FAIL_LINE.search(ln) and not ln.strip().upper().startswith("PASS")]
+    return head("\n".join(lines), limit)
+
+
+def run_error(res, elapsed, what):
+    """'' if the run passed, otherwise what went wrong (for the engineer)."""
+    out, err, rc = res.stdout or "", res.stderr or "", res.returncode
+    if rc == 124 or (rc == 137 and elapsed >= config.SANDBOX_TIMEOUT):
+        return (f"{what} ran longer than {config.SANDBOX_TIMEOUT} seconds and was stopped. It must "
+                "finish quickly on its own (no endless loops, no waiting for input).\n"
+                f"STDOUT (tail):\n{tail(out, 1500)}\nSTDERR (tail):\n{tail(err, 1500)}")
+    if rc == 137:
+        return (f"{what} was killed (exit 137), most likely by the {config.SANDBOX_MEMORY} memory "
+                f"limit.\nSTDERR (tail):\n{tail(err, 1500)}")
+    if rc != 0:
+        fails = failure_lines(out)
+        found = f"Lines in its output that report failures:\n{fails}\n" if fails else ""
+        return (f"{what}: exit code {rc}.\n{found}STDERR:\n{tail(err, 4000)}\n"
+                f"STDOUT (tail):\n{tail(out, 1500)}")
+    if "Traceback (most recent call last)" in err:
+        return (f"{what} exited with code 0 but printed a traceback, so an exception was caught and "
+                "hidden, or a thread crashed. Let real errors fail the run.\nSTDERR:\n" + tail(err, 4000))
+    return ""
+
+
+INDEP_FILE = "acceptance_test.py"
+
+
+def run_candidate(state, cand):
+    """Test one staged candidate in its own container: its own --test, then the independent
+    acceptance test (High), then repeat runs (Medium and High). Returns it with results added."""
+    attempt, target, k = state["attempt"], state["target_file"], cand["k"]
+    result = dict(cand, rc=None, stdout="", stderr="", elapsed=0.0, indep_rc=None, indep_stdout="",
+                  indep_stderr="", indep_failed=False, exec_ok=False)
+    has_indep = bool(state["indep_test"]) and os.path.exists(os.path.join(cand_dir(state, attempt, k), INDEP_FILE))
+    indep_cmd = ["timeout", "-k", "3", str(config.SANDBOX_TIMEOUT), "python3", INDEP_FILE]
     started = time.time()
     try:
-        res = None
-        if warm_ready(state, attempt):
-            res = run_ssh(exec_command(name, target), timeout=config.SANDBOX_TIMEOUT + 45)
-            err = (res.stderr or "").strip()
-            first_line = err.splitlines()[0] if err else ""
-            if (res.returncode in (1, 125, 126, 127) and first_line.startswith("Error")
-                    and any(m in first_line for m in _NOT_WARM)):
-                print(f"    [i] Candidate {k}: its prepared container was gone; starting a fresh one.")
-                res = None
-        if res is None:
-            res = run_ssh(docker_command(name, remote_dir, target, state["allow_network"]),
-                          timeout=config.SANDBOX_TIMEOUT + 45)
+        res = run_in_container(state, attempt, k, _test_command(target))
+        result.update(rc=res.returncode, stdout=res.stdout or "", stderr=res.stderr or "",
+                      elapsed=time.time() - started)
+        error = run_error(res, result["elapsed"], f"python3 {target} --test")
+        if not error and has_indep:
+            t0 = time.time()
+            r2 = run_in_container(state, attempt, k, indep_cmd)
+            result.update(indep_rc=r2.returncode, indep_stdout=r2.stdout or "", indep_stderr=r2.stderr or "")
+            e2 = run_error(r2, time.time() - t0, "The independent acceptance test")
+            if e2:
+                result["indep_failed"] = True
+                error = ("The script's own --test passed, but the independent acceptance test (written "
+                         "separately, from the goal and checks only) failed.\n" + e2)
+        for i in range(2, state["repeat_tests"] + 1):
+            if error:
+                break
+            t0 = time.time()
+            r3 = run_in_container(state, attempt, k, _test_command(target))
+            e3 = run_error(r3, time.time() - t0, f"python3 {target} --test")
+            if not e3 and has_indep:
+                t0 = time.time()
+                e3 = run_error(run_in_container(state, attempt, k, indep_cmd), time.time() - t0,
+                               "The independent acceptance test")
+            if e3:
+                error = (f"The tests passed the first time but failed on repeat run {i}. Results must not "
+                         "depend on randomness, timing, or files left behind by an earlier run.\n" + e3)
     except subprocess.TimeoutExpired:
         try:
-            run_ssh(f"docker rm -f {name}", timeout=30)
+            run_ssh(f"docker rm -f {container_name(state, attempt, k)}", timeout=30)
         except Exception:
             pass
-        return dict(cand, exec_ok=False, rc=None, stdout="", stderr="", elapsed=time.time() - started,
-                    exec_error=f"The run didn't finish within {config.SANDBOX_TIMEOUT} seconds and was "
-                               "killed. --test mode must exit on its own: no endless loops, no waiting "
-                               "for input or network.")
-    elapsed = time.time() - started
-    out, err, rc = res.stdout or "", res.stderr or "", res.returncode
-    if rc in (125, 126, 127, 255) and any(m in err for m in _INFRA_MARKERS):
-        raise InfraError(f"the sandbox container couldn't start (exit {rc}): {err.strip()[-600:]}")
-    if rc == 124 or (rc == 137 and elapsed >= config.SANDBOX_TIMEOUT):
-        error = (f"The script ran longer than {config.SANDBOX_TIMEOUT} seconds and was stopped. "
-                 "--test mode must finish quickly on its own (no endless loops, no waiting for "
-                 f"input).\nSTDOUT (tail):\n{tail(out, 1500)}\nSTDERR (tail):\n{tail(err, 1500)}")
-    elif rc == 137:
-        error = (f"The script was killed (exit 137), most likely by the {config.SANDBOX_MEMORY} memory "
-                 f"limit.\nSTDERR (tail):\n{tail(err, 1500)}")
-    elif rc != 0:
-        error = f"Exit code {rc}.\nSTDERR:\n{tail(err, 4000)}\nSTDOUT (tail):\n{tail(out, 1500)}"
-    elif "Traceback (most recent call last)" in err:
-        error = ("The script exited with code 0 but printed a traceback, so an exception was caught "
-                 "and hidden, or a thread crashed. Let real errors fail the run.\nSTDERR:\n"
-                 + tail(err, 4000))
-    else:
-        error = ""
-    return dict(cand, exec_ok=not error, rc=rc, stdout=out, stderr=err, elapsed=elapsed, exec_error=error)
+        error = (f"A test run didn't finish within {config.SANDBOX_TIMEOUT} seconds and was killed. "
+                 "Tests must exit on their own: no endless loops, no waiting for input or network.")
+        result["elapsed"] = time.time() - started
+    result.update(exec_ok=not error, exec_error=error)
+    return result
 
 
 # --------------------------------------------------------------------------- graph nodes
@@ -911,14 +1049,21 @@ def planner_node(state):
                else "the sandbox has NO network access")
     instructions = (
         "Return ONLY a JSON object, no prose:\n"
-        '{"steps": ["...", "..."], "checks": ["...", "..."]}\n'
-        "- steps: 3-5 concrete implementation steps.\n"
+        + ('{"steps": ["...", "..."], "checks": ["...", "..."], "interface": "..."}\n' if state["tester"]
+           else '{"steps": ["...", "..."], "checks": ["...", "..."]}\n')
+        + "- steps: 3-5 concrete implementation steps.\n"
         f"- checks: 2-4 acceptance checks a reviewer can confirm from the script's stdout and exit "
         f"code when it runs as `python3 {target} --test` in an isolated sandbox ({network}; "
         f"Python {config.SANDBOX_PYTHON} standard library plus {', '.join(config.SANDBOX_PACKAGES)}). "
         "Each check must be specific and observable, e.g. 'prints one line per host with UP or DOWN'. "
         "Don't require services the sandbox can't reach."
     )
+    if state["tester"]:
+        instructions += (
+            "\n- interface: exactly how other code can use the script, because an independent test "
+            "will be written against it without seeing the code: the public functions and classes "
+            "(names, parameters, return values, exceptions raised) and the command-line usage "
+            "(arguments, what is printed, exit codes). Keep it small and precise.")
     blocks = [
         block("Goal:", state["goal"]),
         block("Target file:", target),
@@ -931,17 +1076,26 @@ def planner_node(state):
         block("Instructions:", instructions),
     ]
     raw, _ = llm_chat("Planner", "You are a pragmatic software architect who plans small, "
-                      "testable Python utilities.", blocks, want_out=1000, min_out=300, think=think)
+                      "testable Python utilities.", blocks, want_out=1500 if state["tester"] else 1000,
+                      min_out=300, think=think)
     data = parse_json_object(raw) or {}
     steps = [str(s).strip() for s in data.get("steps") or [] if str(s).strip()]
     checks = [str(c).strip() for c in data.get("checks") or [] if str(c).strip()][:4]
+    interface = data.get("interface") or ""
+    if isinstance(interface, dict):
+        interface = "\n".join(f"{k}: {v}" for k, v in interface.items())
+    elif isinstance(interface, list):
+        interface = "\n".join(str(i) for i in interface)
+    interface = str(interface).strip()
     plan = numbered(steps) if steps else raw
     print("\n" + "=" * 20 + " ARCHITECT EXECUTION PLAN " + "=" * 20)
     print(plan)
     print("Acceptance checks:\n" + (numbered(checks) if checks else "(none parsed; the verifier will judge against the goal)"))
+    if interface:
+        print("Interface:\n" + interface)
     print("=" * 66)
-    report(state, phase="planned", plan=plan, checks=checks)
-    return {"plan": plan, "checks": checks}
+    report(state, phase="planned", plan=plan, checks=checks, interface=interface)
+    return {"plan": plan, "checks": checks, "interface": interface}
 
 
 def engineer_system(state):
@@ -959,6 +1113,8 @@ def engineer_system(state):
         "- Exit with a non-zero status when something fails. Never hide failures behind broad "
         "try/except blocks, and never fake results (for example hardcoding success instead of "
         "actually checking).\n"
+        "- Put the entry point under `if __name__ == \"__main__\":` so the file can be imported "
+        "(for example by a test) without running anything.\n"
         f"- Use the Python {config.SANDBOX_PYTHON} standard library plus only these installed "
         f"packages: {', '.join(config.SANDBOX_PACKAGES)}.\n"
         "- The script runs in /work, a writable scratch folder. Existing workspace files are "
@@ -967,18 +1123,109 @@ def engineer_system(state):
     )
 
 
+# On High's first attempt each candidate gets a different one, so best-of-N compares real
+# alternatives instead of near-copies.
+APPROACHES = [
+    "Write the most straightforward, readable implementation that fully meets the goal.",
+    "Write a careful, defensive implementation: validate inputs and handle every edge case the "
+    "goal implies, explicitly.",
+    "Before coding, work out the tricky cases the goal implies; make sure both the code and the "
+    "--test run cover each one.",
+    "If there is a sound alternative to the obvious approach (a different algorithm or structure), "
+    "use it; otherwise write the clearest correct version.",
+]
+
+TESTER_SYSTEM = ("You are an expert test engineer. You write independent acceptance tests from a "
+                 "specification, without seeing the implementation.")
+
+
+def write_independent_test(state):
+    """High: a separate call writes acceptance_test.py from the goal, checks and interface only
+    (it never sees the code). Returns the full test file, or "" if none could be written."""
+    target = state["target_file"]
+    network = ("The sandbox can reach the LAN." if state["allow_network"] else
+               "The sandbox has NO network access.")
+    instructions = (
+        f"Write an independent acceptance test for {target}, based only on the goal, the acceptance "
+        "checks and the interface. You have not seen the implementation.\n"
+        "The pipeline puts setup code in front of your file. It provides `target` (the script, "
+        "imported as a module without running its main block) and `run_script(*args, input=None, "
+        "timeout=15)`, which runs the script as a separate process and returns a "
+        "subprocess.CompletedProcess with text stdout and stderr. Don't repeat that setup.\n"
+        f"- Use the Python {config.SANDBOX_PYTHON} standard library plus {', '.join(config.SANDBOX_PACKAGES)} "
+        f"only. {network} No display. The whole test must finish within {config.SANDBOX_TIMEOUT - 5} seconds. "
+        "Write scratch files only to the current folder or /tmp.\n"
+        "- Prefer checks that need no hand calculation: round trips, invariants, comparison with a "
+        "simple obviously-correct reference written in the test, and known values you are certain "
+        "of. Double-check every hand-computed expected value against the goal.\n"
+        "- Don't test exact wording or formatting unless the goal or interface specifies it.\n"
+        "- Print one line per check (\"PASS: ...\" or \"FAIL: ... expected X, got Y\"), then exit with "
+        "status 1 if any check failed and 0 otherwise. Let unexpected exceptions propagate.\n"
+        "- Keep it compact (well under 200 lines): cover every acceptance check and the riskiest "
+        "edge cases rather than many similar examples.\n"
+        f"Reply with only the test code in one {TICK3}python block."
+    )
+    blocks = [
+        block("Goal:", state["goal"]),
+        block("Script under test:", target),
+        block("Acceptance checks:", numbered(state["checks"]) or "(none; test the goal directly)"),
+        block("Interface:", state["interface"] or "(not specified; infer the obvious interface from the goal)"),
+    ]
+    if state["indep_test"]:
+        update = "Update this test so it covers every acceptance check above. Keep the parts that are right."
+        if state["test_feedback"]:
+            update = ("A diagnosis found that this test itself was wrong (see below). Fix the test, "
+                      "and make sure it covers every acceptance check above. Keep the parts that are right.")
+        blocks += [block("Your previous test:", test_body(state), trim=2, code=True, min_chars=2000),
+                   block("Diagnosis of the last failure:", state["test_feedback"], trim=1, keep="tail"),
+                   block("Task:", update)]
+    blocks.append(block("Instructions:", instructions))
+    try:
+        # answer room first (min_out), so the thinking can't squeeze the test until it's cut off
+        raw, finish = llm_chat("Tester", TESTER_SYSTEM, blocks, want_out=5000, min_out=4000, think=True)
+        if finish == "length":
+            print("    [i] Tester: the test was cut off; writing it again without thinking.")
+            raw, finish = llm_chat("Tester", TESTER_SYSTEM, blocks, want_out=6000, min_out=3000, think=False)
+    except ContextTooSmall as e:
+        print(f"    [!] Tester: {short(e)}; continuing without an independent test this attempt.")
+        return ""
+    code, _ = extract_code(raw)
+    if finish == "length" or not code.strip():
+        print("    [!] Tester: no complete test came back; continuing without one this attempt.")
+        return ""
+    full = test_header(target) + code.strip() + "\n"
+    try:
+        compile(full, INDEP_FILE, "exec")
+    except SyntaxError as e:
+        print(f"    [!] Tester: the test doesn't compile (line {e.lineno}: {e.msg}); skipping it this attempt.")
+        return ""
+    problems = static_problems(full, INDEP_FILE)
+    if problems:
+        print(f"    [!] Tester: the test uses undefined names ({problems[0]}); skipping it this attempt.")
+        return ""
+    return full
+
+
 def engineer_node(state):
     attempt, target, n = state["attempt"], state["target_file"], state["num_candidates"]
     fixing = bool(state["error"])
     think = (state["think_engineer"] == "always"
              or (state["think_engineer"] == "retries" and fixing))
+    diverse = state["diverse"] and not fixing and n > 1
+    need_test = state["tester"] and (not state["indep_test"] or state["indep_checks"] != state["checks"]
+                                     or bool(state["test_feedback"]))
     print(f"\n[Node: Engineer Coder] {'Fixing' if fixing else 'Writing'} {target}: {n} candidate(s)"
-          f"{', thinking first' if think else ''} ({attempt_label(state)})...")
+          f"{', each with a different approach' if diverse else ''}{', thinking first' if think else ''}"
+          f" ({attempt_label(state)})...")
+    if need_test:
+        print("    The tester is writing the independent acceptance test at the same time"
+              f"{' (revising it)' if state['indep_test'] else ''}.")
     report(state, phase=f"coding ({attempt_label(state)}, {n} candidates)", attempt=attempt)
     try:
         prewarm_containers(state, attempt, n)
     except OSError as e:
         print(f"    [i] Couldn't prepare test containers early ({short(e)}); tests will start their own.")
+    test_future = _llm_pool.submit(write_independent_test, state) if need_test else None
 
     checks = numbered(state["checks"]) or "(none given; demonstrate the goal clearly)"
     blocks = [
@@ -986,12 +1233,22 @@ def engineer_node(state):
         block("Target file:", target),
         block("Acceptance checks (the --test run must demonstrate each one):", checks),
         block("Plan:", state["plan"]),
+        block("Interface (an independent acceptance test calls the script this way; implement it "
+              "exactly):", state["interface"]),
     ]
     existing = state["existing_code"]
     if fixing:
+        if state["failure_kind"] == "critic":
+            title = "A reviewer found problems in the version that passed:"
+        else:
+            title = f"The previous attempt failed (attempt {attempt - 1}):"
+        note = ""
+        if state["test_feedback"]:
+            note = ("The diagnosis says the independent acceptance test was (at least partly) wrong; "
+                    "it is being corrected. If your previous code was right, keep it as it is.")
         blocks += [
-            block(f"The previous attempt failed (attempt {attempt - 1}):", state["error"],
-                  trim=2, keep="tail", min_chars=1500),
+            block(title, state["error"], trim=2, keep="tail", min_chars=1500),
+            block("Note:", note),
             block("Previous version:", state["code"], code=True),
             block(f"Original {target} before your changes:", existing, trim=3, code=True),
             block("Attached files:", state["attachments"], trim=5),
@@ -1019,14 +1276,25 @@ def engineer_node(state):
     want_out = max(min_out, base_tokens + 800, min(config.ENGINEER_MAX_OUTPUT, CONTEXT_TOKENS // 2))
     answer_min = min_out
     if think:
-        want_out, min_out = want_out + config.THINK_TOKENS, min_out + 2000
-    replies = llm_complete("Engineer", engineer_system(state), blocks, want_out, min_out,
-                           think=think, n=n, answer_min=answer_min)
+        # Thinking stops early enough to leave room for a realistic file (6,500 tokens is about
+        # 500-600 lines); otherwise a long budget squeezes the code until it's cut off.
+        answer_min = max(min_out, min(6500, want_out))
+        want_out, min_out = want_out + THINK_TOKENS, min_out + 2000
+    system = engineer_system(state)
+    if diverse:
+        def one(k):
+            hint = block("Approach for this version:", APPROACHES[(k - 1) % len(APPROACHES)])
+            return llm_complete("Engineer", system, blocks + [hint], want_out, min_out,
+                                think=think, n=1, answer_min=answer_min)[0]
+        replies = list(_llm_pool.map(one, range(1, n + 1)))
+    else:
+        replies = llm_complete("Engineer", system, blocks, want_out, min_out,
+                               think=think, n=n, answer_min=answer_min)
     if think and all(finish == "length" for _, finish in replies):
         print("    [i] Every candidate ran out of room after thinking; rewriting them without "
               "thinking in this same attempt.")
-        replies = llm_complete("Engineer", engineer_system(state), blocks,
-                               want_out - config.THINK_TOKENS, answer_min, think=False, n=n)
+        replies = llm_complete("Engineer", system, blocks, want_out - THINK_TOKENS, answer_min,
+                               think=False, n=n)
 
     candidates = []
     for k, (raw, finish) in enumerate(replies, 1):
@@ -1045,6 +1313,12 @@ def engineer_node(state):
             except SyntaxError as e:
                 cand.update(status="syntax", error=f"The file doesn't compile:\nSyntaxError on line "
                                                    f"{e.lineno}: {e.msg}\n    {(e.text or '').rstrip()}")
+            else:
+                problems = static_problems(code, target)
+                if problems:
+                    cand.update(status="static", error=(
+                        "A static check found names that are used but never defined. Each one crashes "
+                        "when its line runs, even if the test never reaches it:\n" + "\n".join(problems)))
         if cand["status"] == "coded":
             folder = cand_dir(state, attempt, k)
             os.makedirs(folder, exist_ok=True)
@@ -1055,50 +1329,94 @@ def engineer_node(state):
             print(f"    Candidate {k}: {cand['status']} ({cand['error'].splitlines()[0][:100]})")
         candidates.append(cand)
 
+    # The independent test (High): keep the old one if a new one couldn't be written.
+    tests = {}
+    if test_future is not None:
+        new_test = test_future.result()
+        if new_test:
+            tests = {"indep_test": new_test, "indep_checks": list(state["checks"]), "test_feedback": ""}
+            body_lines = len(new_test.splitlines()) - len(test_header(target).splitlines())
+            print(f"    Independent test ready ({body_lines} lines).")
+    indep_test = tests.get("indep_test", state["indep_test"])
+    if indep_test:
+        for c in candidates:
+            if c["status"] == "coded":
+                with open(os.path.join(cand_dir(state, attempt, c["k"]), INDEP_FILE), "w",
+                          encoding="utf-8", newline="\n") as f:
+                    f.write(indep_test)
+
     if not any(c["status"] == "coded" for c in candidates):
-        discard_containers(state, attempt)
+        discard_containers(state, attempt, n)
         first = candidates[0]
         msg = first["error"]
         if first["status"] == "truncated" and state["error"]:
             msg += "\n\nThe problem you were fixing:\n" + tail(state["error"], 3000)
         return fail(state, first["status"], msg, candidates=candidates,
-                    code=first["code"] if first["status"] == "syntax" else state["code"])
-    return {"candidates": candidates, "status": "CODED", "error": "", "failure_kind": ""}
+                    code=first["code"] if first["status"] in ("syntax", "static") else state["code"], **tests)
+    return {"candidates": candidates, "status": "CODED", "error": "", "failure_kind": "", **tests}
 
 
 def sandbox_executor_node(state):
     staged = [c for c in state["candidates"] if c["status"] == "coded"]
     network = "LAN network" if state["allow_network"] else "no network"
-    print(f"\n[Node: Sandbox Executor] Testing {len(staged)} candidate(s) with --test in fresh "
-          f"containers on Node 2 ({network}, {config.SANDBOX_TIMEOUT}s limit each)...")
+    extras = []
+    if state["indep_test"]:
+        extras.append("then the independent test")
+    if state["repeat_tests"] > 1:
+        extras.append(f"{state['repeat_tests']} runs in all")
+    print(f"\n[Node: Sandbox Executor] Testing {len(staged)} candidate(s) with --test"
+          f"{' (' + ', '.join(extras) + ')' if extras else ''} in their own containers on Node 2 "
+          f"({network}, {config.SANDBOX_TIMEOUT}s limit per run)...")
     report(state, phase=f"testing ({attempt_label(state)}, {len(staged)} candidates)")
     try:
         with ThreadPoolExecutor(max_workers=len(staged)) as pool:
             results = list(pool.map(lambda c: run_candidate(state, c), staged))
     finally:
-        discard_containers(state, state["attempt"])
+        discard_containers(state, state["attempt"], len(state["candidates"]))
     by_k = {c["k"]: c for c in results}
     candidates = [by_k.get(c["k"], c) for c in state["candidates"]]
     for c in results:
         status = "ran cleanly" if c["exec_ok"] else "failed"
-        print(f"    --- Candidate {c['k']}: exit code {c['rc']} after {c['elapsed']:.1f}s, {status} ---")
+        rc = c["rc"] if c["rc"] is not None else "-"
+        print(f"    --- Candidate {c['k']}: exit code {rc} after {c['elapsed']:.1f}s, {status} ---")
         if c["stdout"].strip():
             print(tail(c["stdout"].rstrip(), 1500))
         if c["stderr"].strip():
             print("    stderr:\n" + tail(c["stderr"].rstrip(), 1500))
+        if c["indep_rc"] is not None:
+            print(f"    Independent test: {'passed' if c['indep_rc'] == 0 else 'FAILED'}")
+            if c["indep_rc"] != 0:
+                fails = failure_lines(c["indep_stdout"], 1500)
+                print(fails or tail((c["indep_stdout"] + "\n" + c["indep_stderr"]).strip(), 1500))
+        if not c["exec_ok"] and c["exec_error"] and c["rc"] == 0 and c["indep_rc"] in (None, 0):
+            print("    " + c["exec_error"].splitlines()[0])
     if any(c["exec_ok"] for c in results):
         return {"status": "EXECUTED", "candidates": candidates}
-    # Nothing ran cleanly: fix the candidate that got furthest (most output before failing).
-    best = max(results, key=lambda c: len(c["stdout"]))
-    return fail(state, "runtime", best["exec_error"], code=best["code"], candidates=candidates,
-                execution_output=best["stdout"], execution_stderr=best["stderr"])
+    # Nothing passed: fix the candidate that got furthest (its own test passed, then most output).
+    best = max(results, key=lambda c: (c["rc"] == 0, len(c["stdout"])))
+    kind = "indep" if best["indep_failed"] else "runtime"
+    output = best["stdout"]
+    if best["indep_failed"]:
+        output += "\n--- independent acceptance test ---\n" + best["indep_stdout"]
+    return fail(state, kind, best["exec_error"], code=best["code"], candidates=candidates,
+                execution_output=output, execution_stderr=best["stderr"] + best["indep_stderr"])
 
 
 VERIFIER_SYSTEM = ("You are a strict QA reviewer. You decide whether a script's test run really "
                    "demonstrates its goal. Reply with JSON only.")
 
 
-def judge(state, cand):
+# Extra judges on High each look from a slightly different angle, so their votes are less alike.
+JUDGE_FOCUS = [
+    "",
+    "Pay special attention to edge cases, and to whether each acceptance check is really "
+    "demonstrated by the output rather than just claimed.",
+    "Pay special attention to hidden problems: hardcoded or faked results, swallowed errors, and "
+    "behaviour the test never exercises.",
+]
+
+
+def judge(state, cand, focus="", label=None):
     network = ("Network access was DISABLED in the sandbox, so failed connections to other hosts are "
                "expected and fine when the script reports them clearly."
                if not state["allow_network"] else "Network access was enabled in the sandbox.")
@@ -1109,6 +1427,7 @@ def judge(state, cand):
         "Fail the run if the output lacks evidence for any acceptance check, if results are faked "
         "(for example hardcoded success instead of actually checking), or if errors are being "
         "swallowed. Judge only what the goal and checks require; don't fail for style or wording."
+        + (f"\n{focus}" if focus else "")
     )
     blocks = [
         block("Goal:", state["goal"]),
@@ -1116,11 +1435,13 @@ def judge(state, cand):
         block(f"Test run: python3 {state['target_file']} --test finished with exit code 0.", network),
         block("STDOUT:", cand["stdout"] or "(empty)", trim=2, keep="tail", min_chars=1500),
         block("STDERR:", cand["stderr"], trim=3, keep="tail"),
+        block("An independent acceptance test (written separately from the goal, without seeing the "
+              "code) also passed. Its output:", cand.get("indep_stdout", ""), trim=3, keep="tail"),
         block("Script source:", cand["code"], trim=4, code=True, min_chars=2000),
         block("Instructions:", instructions),
     ]
     think = config.THINK_VERIFIER
-    raw, _ = llm_chat(f"Verifier, candidate {cand['k']}", VERIFIER_SYSTEM, blocks, want_out=400,
+    raw, _ = llm_chat(label or f"Verifier, candidate {cand['k']}", VERIFIER_SYSTEM, blocks, want_out=400,
                       min_out=150, temperature=None if think else 0.0, think=think)
     data = parse_json_object(raw)
     if data is None or "pass" not in data:
@@ -1153,14 +1474,36 @@ def verifier_node(state):
         if v["failed_checks"] and not v["pass"]:
             text += "\n        Failed checks: " + "; ".join(v["failed_checks"])
         print(f"    Candidate {c['k']}: {text}")
+    passed = [c for c in judged if c["pass"]]
+    win, panel_note = None, ""
+    if passed and state["judges"] > 1:
+        # High: the best passing candidates (at most two) go to a panel; a majority must agree.
+        for c in sorted(passed, key=lambda c: (c["score"], -len(c["code"])), reverse=True)[:2]:
+            extra = list(_llm_pool.map(
+                lambda i: judge(state, c, JUDGE_FOCUS[i % len(JUDGE_FOCUS)],
+                                label=f"Verifier, candidate {c['k']} (panel vote {i + 1})"),
+                range(1, state["judges"])))
+            votes = [c] + extra
+            yes = sum(1 for v in votes if v["pass"])
+            print(f"    Panel for candidate {c['k']}: {yes} of {len(votes)} votes pass"
+                  + "".join(f"\n        Vote {i + 2}: {'PASS' if v['pass'] else 'FAIL'} (score {v['score']}/10)"
+                            f"{': ' + v['reason'] if v['reason'] else ''}" for i, v in enumerate(extra)))
+            if yes * 2 > len(votes):
+                c["score"] = round(sum(v["score"] for v in votes) / len(votes), 1)
+                c["reason"] = " | ".join(v["reason"] for v in votes if v["pass"] and v["reason"])[:600]
+                win, panel_note = c, f", {yes} of {len(votes)} panel votes"
+                break
+            c["pass"] = False
+            c["failed_checks"] = [fc for v in extra if not v["pass"] for fc in v["failed_checks"]] or c["failed_checks"]
+            c["reason"] = " | ".join(v["reason"] for v in extra if not v["pass"] and v["reason"])[:600] or c["reason"]
+    elif passed:
+        win = max(passed, key=lambda c: (c["score"], -len(c["code"])))
     by_k = {c["k"]: c for c in judged}
     candidates = [by_k.get(c["k"], c) for c in state["candidates"]]
-    passed = [c for c in judged if c["pass"]]
-    if passed:
-        win = max(passed, key=lambda c: (c["score"], -len(c["code"])))
+    if win:
         if len(judged) > 1:
             print(f"    Winner: candidate {win['k']}")
-        verdict = f"PASS (candidate {win['k']}, score {win['score']}/10): {win['reason']}"
+        verdict = f"PASS (candidate {win['k']}, score {win['score']}/10{panel_note}): {win['reason']}"
         return {"status": "PASSED", "verdict": verdict, "winner": win["k"], "code": win["code"],
                 "execution_output": win["stdout"], "execution_stderr": win["stderr"],
                 "candidates": candidates}
@@ -1177,6 +1520,9 @@ def verifier_node(state):
 
 def error_condenser_node(state):
     raw_error = state["error"]
+    indep = state["failure_kind"] == "indep" and bool(state["indep_test"])
+    if indep:
+        return diagnose_independent_failure(state)
     where = "Node 1" if config.HELPER_BACKEND == "node1" else "Node 3"
     print(f"\n[Node: Error Condenser] Diagnosing the failure on {where} "
           f"(attempt {state['attempt'] - 1})...")
@@ -1212,6 +1558,106 @@ def error_condenser_node(state):
     return {"error": f"DIAGNOSIS:\n{diagnosis}\n\nRAW ERROR (tail):\n{tail(raw_error, 2500)}"}
 
 
+def diagnose_independent_failure(state):
+    """The script's own test passed but the independent test failed: decide, against the goal,
+    whether the script, the test or both are wrong. A wrong test goes back to the tester."""
+    print(f"\n[Node: Error Condenser] The independent test failed; deciding whether the script or "
+          f"the test is wrong (thinking first, attempt {state['attempt'] - 1})...")
+    report(state, phase=f"diagnosing (attempt {state['attempt'] - 1}/{state['max_attempts']})")
+    ask = ("Give a concise diagnosis:\n"
+           "1. Which check failed: what the script returned versus what the test expected.\n"
+           "2. Who is wrong, judged strictly against the goal: the script, the independent test, or "
+           "both? Hand-computed expected values in tests are often wrong, and so are scripts.\n"
+           "3. The exact fix (to the script, to the test, or to both).\n"
+           "Keep it under 6 sentences and write no code. End with one line that is exactly one of: "
+           "BLAME: script / BLAME: test / BLAME: both")
+    try:
+        diagnosis, _ = llm_chat(
+            "Condenser", "You are an expert Python debugger and test reviewer. You are impartial "
+                         "between the script and its test; only the goal decides who is right.",
+            [block("What the script should do:", state["goal"]),
+             block("Acceptance checks:", numbered(state["checks"])),
+             block("Interface:", state["interface"]),
+             block("Script:", state["code"], trim=2, code=True, min_chars=3000),
+             block("Independent acceptance test:", test_body(state), trim=3, code=True, min_chars=2000),
+             block("What happened:", state["error"], trim=1, keep="tail", min_chars=1500),
+             block("Instructions:", ask)],
+            want_out=500, min_out=150, think=True)
+    except LLMError as e:
+        if not isinstance(e, ContextTooSmall):
+            raise
+        print(f"-> Condenser skipped ({short(e)}); the engineer gets the raw error.")
+        return {}
+    m = re.search(r"BLAME:\s*(script|test|both)", diagnosis, re.IGNORECASE)
+    blame = m.group(1).lower() if m else "script"
+    print(f"-> Diagnosis (Node 1, blame: {blame}):\n{diagnosis}")
+    update = {"error": f"DIAGNOSIS:\n{diagnosis}\n\nRAW ERROR (tail):\n{tail(state['error'], 2500)}",
+              "test_feedback": diagnosis if blame in ("test", "both") else ""}
+    return update
+
+
+CRITIC_SYSTEM = ("You are a meticulous senior code reviewer. You look for real bugs that tests "
+                 "missed, not style. Reply with JSON only.")
+
+
+def critic_node(state):
+    """High: after a pass, look for bugs the tests didn't catch. Real problems become new
+    acceptance checks and go back to the engineer; the passing version is kept as a fallback."""
+    rnd = state["critic_used"] + 1
+    print(f"\n[Node: Critic] Reviewing the passing version for bugs the tests missed (round {rnd} of "
+          f"{state['critic_rounds']}, thinking first)...")
+    report(state, phase=f"reviewing (round {rnd}/{state['critic_rounds']})")
+    win = next((c for c in state["candidates"] if c["k"] == state["winner"]), {})
+    instructions = (
+        "Reply with ONLY this JSON object:\n"
+        '{"issues": [{"severity": "major" or "minor", "problem": "...", "check": "..."}]}\n'
+        "Report only real problems: wrong results for input the goal covers, crashes on valid input, "
+        "edge cases the goal implies but the code mishandles, results that are faked or not actually "
+        "computed, and self-tests that pass without really verifying what they claim. 'major' means "
+        "the script fails the goal for some valid use; everything else is 'minor'. For each problem, "
+        "'check' is one concrete acceptance check, observable in the --test output, that would catch "
+        "it. Return an empty list if nothing major is wrong. Don't report style, naming, comments, "
+        "performance that doesn't matter, or features the goal doesn't ask for."
+    )
+    blocks = [
+        block("Goal:", state["goal"]),
+        block("Acceptance checks it passed:", numbered(state["checks"])),
+        block("Interface:", state["interface"]),
+        block("Its --test output:", state["execution_output"], trim=2, keep="tail", min_chars=1000),
+        block("Independent acceptance test output:", win.get("indep_stdout", ""), trim=3, keep="tail"),
+        block("Script:", state["code"], trim=1, code=True, min_chars=4000),
+        block("Instructions:", instructions),
+    ]
+    try:
+        raw, _ = llm_chat("Critic", CRITIC_SYSTEM, blocks, want_out=900, min_out=200, think=True)
+    except LLMError as e:
+        print(f"-> Review skipped ({short(e)}); keeping the version that passed.")
+        return {"critic_used": state["critic_rounds"]}
+    data = parse_json_object(raw) or {}
+    issues = [i for i in data.get("issues") or [] if isinstance(i, dict) and str(i.get("problem") or "").strip()]
+    major = [i for i in issues if str(i.get("severity", "")).lower() == "major"]
+    for i in issues:
+        print(f"    {str(i.get('severity', '?')).upper()}: {i.get('problem')}")
+    if not major:
+        print("-> No major problems found; keeping this version.")
+        return {"critic_used": rnd}
+    new_checks = [str(i.get("check")).strip() for i in major if str(i.get("check") or "").strip()]
+    checks = list(dict.fromkeys(state["checks"] + new_checks))[:8]
+    print(f"-> {len(major)} major problem(s); sending them back to the engineer with "
+          f"{len(checks) - len(state['checks'])} new acceptance check(s). The passing version is kept "
+          "in case the fixes don't pass.")
+    best = {"attempt": state["attempt"], "winner": state["winner"], "code": state["code"],
+            "verdict": state["verdict"], "execution_output": state["execution_output"],
+            "execution_stderr": state["execution_stderr"]}
+    error = ("A reviewer found these problems in the version that passed:\n"
+             + numbered(str(i.get("problem")).strip() for i in major)
+             + "\nFix them while keeping everything that already works. New acceptance checks were "
+               "added for them, and the --test run must demonstrate those too.")
+    report(state, phase=f"fixing review findings (round {rnd})", checks=checks)
+    return {"status": "CRITIQUED", "failure_kind": "critic", "error": error, "checks": checks,
+            "best_passed": best, "critic_used": rnd, "attempt": state["attempt"] + 1}
+
+
 def save_result_file(state):
     """Keep the final code next to the run (the winner, or the best failing version), so the
     GUI's result chat sees exactly what this run produced even if the file changes later."""
@@ -1235,6 +1681,15 @@ def run_stats(state):
 
 def finalize_node(state):
     target = state["target_file"]
+    if state["status"] != "PASSED" and state["best_passed"]:
+        # High: the reviewer's fixes didn't pass in time, so keep the version that did pass.
+        b = state["best_passed"]
+        print(f"\n[i] The fixes for the reviewer's findings didn't pass within the limits; keeping the "
+              f"version that passed on attempt {b['attempt']}.")
+        state = dict(state, status="PASSED", attempt=b["attempt"], winner=b["winner"], code=b["code"],
+                     execution_output=b["execution_output"], execution_stderr=b["execution_stderr"],
+                     verdict=b["verdict"] + " (A reviewer later found possible problems, but the fixes "
+                                            "didn't pass in time, so this passing version was kept.)")
     result_file = save_result_file(state)
     if state["status"] == "PASSED":
         dest, backup = promote(state)
@@ -1246,7 +1701,7 @@ def finalize_node(state):
         report(state, status="PASSED", phase="done", attempt=state["attempt"],
                output=state["execution_output"], execution_output=state["execution_output"],
                verdict=state["verdict"], result_file=result_file, **run_stats(state))
-        dispatch_ingest(state)
+        dispatch_ingest(state, result_file)
         return {}
     elapsed = time.time() - state["started"]
     if elapsed > state["time_limit_s"]:
@@ -1263,14 +1718,14 @@ def finalize_node(state):
     return {}
 
 
-def dispatch_ingest(state):
+def dispatch_ingest(state, result_file=""):
     """Store the verified script in Qdrant memory in a detached background process."""
     worker = os.path.join(config.WORKSPACE, "background_ingest.py")
     if not os.path.exists(worker):
         return
     job_path = os.path.join(config.RUNS_DIR, state["run_id"], "ingest_job.json")
     job = {"target_file": state["target_file"], "goal": state["goal"], "checks": state["checks"],
-           "verdict": state["verdict"], "task_key": state["task_key"]}
+           "verdict": state["verdict"], "task_key": state["task_key"], "code_file": result_file}
     try:
         with open(job_path, "w", encoding="utf-8") as f:
             json.dump(job, f)
@@ -1310,8 +1765,15 @@ def route_after_executor(state):
 
 def route_after_verifier(state):
     if state["status"] == "PASSED":
-        return "finalize"
+        in_time = time.time() - state["started"] < state["time_limit_s"]
+        return "critic" if state["critic_used"] < state["critic_rounds"] and in_time else "finalize"
     return "finalize" if out_of_budget(state) else "engineer"
+
+
+def route_after_critic(state):
+    if state["status"] == "CRITIQUED" and not out_of_budget(state):
+        return "engineer"
+    return "finalize"     # satisfied, or no attempts/time left (finalize keeps the passing version)
 
 
 def timed(step, fn):
@@ -1340,6 +1802,7 @@ def build_graph():
     g.add_node("executor", timed("testing", sandbox_executor_node))
     g.add_node("verifier", timed("checking", verifier_node))
     g.add_node("condenser", timed("diagnosis", error_condenser_node))
+    g.add_node("critic", timed("review", critic_node))
     g.add_node("finalize", finalize_node)
     for first in ("retriever", "scout", "web"):     # these three run in parallel
         g.add_edge(START, first)
@@ -1347,7 +1810,8 @@ def build_graph():
     g.add_edge("planner", "engineer")
     g.add_conditional_edges("engineer", route_after_engineer, ["executor", "engineer", "finalize"])
     g.add_conditional_edges("executor", route_after_executor, ["verifier", "condenser", "finalize"])
-    g.add_conditional_edges("verifier", route_after_verifier, ["finalize", "engineer"])
+    g.add_conditional_edges("verifier", route_after_verifier, ["finalize", "engineer", "critic"])
+    g.add_conditional_edges("critic", route_after_critic, ["engineer", "finalize"])
     g.add_edge("condenser", "engineer")
     g.add_edge("finalize", END)
     return g.compile()
@@ -1364,15 +1828,34 @@ def parse_args(argv):
     p.add_argument("--attach", action="append", default=[], help="file to include as context (repeatable)")
     p.add_argument("--allow-network", action="store_true", help="give the sandbox LAN access")
     p.add_argument("--research", action="store_true", help="research allowlisted websites before planning")
-    p.add_argument("--overnight", action="store_true",
-                   help="use the overnight profile: more attempts and candidates, up to 12 hours")
+    p.add_argument("--accuracy", choices=list(config.RUN_PROFILES), default=None,
+                   help=f"accuracy level (default {config.DEFAULT_ACCURACY}); see RUN_PROFILES in config.py")
+    p.add_argument("--overnight", action="store_true", help="old name for --accuracy=medium")
     return p.parse_args(argv)
+
+
+def describe_level(name, p):
+    parts = [f"{p['max_attempts']} attempts x {p['candidates']} candidates"]
+    if p["diverse"]:
+        parts.append("different approaches")
+    if p["think_tokens"] != config.THINK_TOKENS:
+        parts.append(f"thinking up to {p['think_tokens']} tokens")
+    if p["tester"]:
+        parts.append("independent tests")
+    if p["judges"] > 1:
+        parts.append(f"{p['judges']}-judge panel")
+    if p["critic_rounds"]:
+        parts.append(f"up to {p['critic_rounds']} review rounds")
+    if p["repeat_tests"] > 1:
+        parts.append(f"tests run {p['repeat_tests']}x")
+    parts.append(f"up to {p['time_limit_s'] // 60} min")
+    return f"{name} ({', '.join(parts)})"
 
 
 def main(argv=None):
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.goal_file:
-        with open(args.goal_file, encoding="utf-8") as f:
+        with open(args.goal_file, encoding="utf-8-sig") as f:   # -sig: drop a Windows byte-order mark
             goal = f.read().strip()
     else:
         goal = (args.goal or args.goal_text or DEFAULT_GOAL).strip()
@@ -1394,8 +1877,10 @@ def main(argv=None):
         sys.stdout = Tee(sys.stdout, os.path.join(config.RUNS_DIR, run_id, "pipeline.log"))
     except OSError as e:
         print(f"[i] Not saving a log file for this run ({e}).")
-    profile_name = "overnight" if args.overnight else "normal"
+    global THINK_TOKENS
+    profile_name = args.accuracy or ("medium" if args.overnight else config.DEFAULT_ACCURACY)
     profile = config.RUN_PROFILES[profile_name]
+    THINK_TOKENS = profile["think_tokens"]
     write_pid_file(run_id)
     state: AgentState = {
         "run_id": run_id, "task_key": config.TASK_KEY_PREFIX + run_id, "goal": goal,
@@ -1403,6 +1888,10 @@ def main(argv=None):
         "allow_network": bool(args.allow_network), "research": bool(args.research),
         "profile": profile_name, "max_attempts": profile["max_attempts"],
         "num_candidates": profile["candidates"], "think_engineer": profile["think_engineer"],
+        "diverse": profile["diverse"], "tester": profile["tester"], "judges": profile["judges"],
+        "critic_rounds": profile["critic_rounds"], "critic_used": 0,
+        "repeat_tests": profile["repeat_tests"], "interface": "", "indep_test": "", "indep_checks": [],
+        "test_feedback": "", "best_passed": {},
         "started": time.time(), "time_limit_s": profile["time_limit_s"],
         "existing_code": "", "memory_context": "", "memory_summary": "", "research_brief": "",
         "web_brief": "", "plan": "", "checks": [], "candidates": [], "winner": 0, "code": "",
@@ -1411,8 +1900,7 @@ def main(argv=None):
     }
     print("=== Starting LangGraph Autonomous Pipeline ===")
     print(f"Run {run_id} | target: {target} ({why})")
-    print(f"Profile: {profile_name} ({profile['max_attempts']} attempts x {profile['candidates']} "
-          f"candidates, up to {profile['time_limit_s'] // 60} min) | sandbox network: "
+    print(f"Accuracy: {describe_level(profile_name, profile)} | sandbox network: "
           f"{'on' if args.allow_network else 'off'} | web research: {'on' if args.research else 'off'}")
     register_task(state)
     beat_stop, beat_thread = start_heartbeat(run_id)

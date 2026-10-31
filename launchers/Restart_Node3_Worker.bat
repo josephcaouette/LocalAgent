@@ -17,16 +17,26 @@ if %errorlevel% neq 0 (
 )
 echo [+] Node 3 host is reachable.
 
-:: 2. Restart Ollama systemd service
-echo [*] Restarting Ollama systemd service...
-ssh %NODE3_USER%@%NODE3_IP% "sudo systemctl restart ollama"
+:: 2. Restart Ollama systemd service. -t gives sudo a terminal so it can ask for your password.
+echo [*] Restarting Ollama systemd service (enter your sudo password for %NODE3_USER% if asked)...
+ssh -t %NODE3_USER%@%NODE3_IP% "sudo systemctl restart ollama"
+if %errorlevel% neq 0 (
+    echo [!] The restart command failed; Ollama may still be running the old process.
+)
 
-:: 3. Wait for Ollama HTTP API to respond
+:: 3. Wait for Ollama HTTP API to respond (up to 2 minutes)
 echo [*] Waiting for Ollama API to come online on port 11434...
+set /a TRIES=0
 :wait_ollama
 timeout /t 2 /nobreak >nul
+set /a TRIES+=1
 curl -s --connect-timeout 2 http://%NODE3_IP%:11434/api/tags >nul
 if %errorlevel% neq 0 (
+    if %TRIES% geq 60 (
+        echo [!] Ollama didn't come back within 2 minutes. Check it on Node 3: systemctl status ollama
+        pause
+        exit /b 1
+    )
     echo [...] Waiting for Ollama daemon...
     goto wait_ollama
 )

@@ -86,8 +86,9 @@ LLM_TEMPERATURE = 0.7          # sampling values from the Qwen3.8 model card (no
 LLM_TOP_P = 0.8
 LLM_TOP_K = 20
 # Where the pipeline lets the model think before answering (slower, better). Thinking calls use
-# the model card's thinking-mode sampling (temperature 0.6, top_p 0.95) and get THINK_TOKENS of
-# extra room. The engineer's thinking is set per run profile below.
+# the model card's thinking-mode sampling (temperature 0.6, top_p 0.95) and get up to the
+# accuracy level's think_tokens of extra room (THINK_TOKENS is the default). The engineer's
+# thinking is set per accuracy level below.
 THINK_PLANNER = True
 THINK_VERIFIER = True
 THINK_TOKENS = 5000
@@ -135,16 +136,40 @@ SANDBOX_CPUS = 2
 SANDBOX_PIDS = 128
 KEEP_RUNS = 30             # per-run scratch folders kept in Z:\runs
 
-# --- Run profiles (GUI "Overnight run" checkbox, or --overnight) ----------------
-# candidates: how many versions the engineer writes at once; all are tested and the verifier
-# picks the best. think_engineer: "retries" = think only when fixing a failure, "always", "never".
-# A run stops as soon as a candidate passes, or when attempts or time run out.
+# --- Accuracy levels (the GUI's Low / Medium / High selector, or --accuracy) -----
+# candidates:     versions the engineer writes per attempt; all are tested, the best one wins.
+# think_engineer: "retries" = think only when fixing a failure, "always", or "never".
+# think_tokens:   most hidden thinking per call (always capped so the answer still fits).
+# diverse:        on the first attempt each candidate is told to take a different approach.
+# tester:         a separate call writes an independent acceptance test from the goal (it never
+#                 sees the code); candidates must pass it as well as their own --test.
+# judges:         independent verifier votes the winner needs a majority of.
+# critic_rounds:  after a pass, a reviewer looks for bugs the tests missed; up to this many fix
+#                 rounds. If a fix doesn't pass in time, the earlier passing version is kept.
+# repeat_tests:   runs of a passing test; a later failure means randomness or timing problems.
+# exclusive:      the run has the GPU to itself (the GUI queue starts nothing beside it).
+# research_default: the GUI ticks "Research the web first" when this level is chosen.
+# A run ends as soon as a candidate passes (and, on High, the reviewer is satisfied), or when
+# attempts or time run out.
 RUN_PROFILES = {
-    "normal":    {"max_attempts": 3, "candidates": 2, "time_limit_s": 30 * 60,
-                  "think_engineer": "retries"},
-    "overnight": {"max_attempts": 8, "candidates": 3, "time_limit_s": 12 * 3600,
-                  "think_engineer": "always"},
+    "low": {"max_attempts": 3, "candidates": 2, "time_limit_s": 30 * 60, "think_engineer": "retries",
+            "think_tokens": THINK_TOKENS, "diverse": False, "tester": False, "judges": 1,
+            "critic_rounds": 0, "repeat_tests": 1, "exclusive": False, "research_default": False},
+    "medium": {"max_attempts": 8, "candidates": 3, "time_limit_s": 12 * 3600, "think_engineer": "always",
+               "think_tokens": THINK_TOKENS, "diverse": False, "tester": False, "judges": 1,
+               "critic_rounds": 0, "repeat_tests": 3, "exclusive": False, "research_default": False},
+    "high": {"max_attempts": 10, "candidates": 4, "time_limit_s": 12 * 3600, "think_engineer": "always",
+             "think_tokens": 10000, "diverse": True, "tester": True, "judges": 3,
+             "critic_rounds": 2, "repeat_tests": 3, "exclusive": True, "research_default": True},
 }
+DEFAULT_ACCURACY = "low"
+LEGACY_PROFILES = {"normal": "low", "overnight": "medium"}   # names stored by older runs
+
+
+def accuracy_level(name):
+    """Map a stored profile name (including the old 'normal'/'overnight') to low/medium/high."""
+    name = LEGACY_PROFILES.get(name or "", name or "")
+    return name if name in RUN_PROFILES else DEFAULT_ACCURACY
 KEEP_HISTORY_PER_FILE = 20 # backups kept per file in .history
 
 # How many runs the GUI's queue runs at the same time. vLLM serves them together, filling the GPU

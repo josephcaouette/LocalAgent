@@ -34,9 +34,11 @@ echo [*] Clearing active workflow state in Redis...
 call "C:\AI\venvs\agent_brain\Scripts\activate.bat"
 python -c "import sys; sys.path.insert(0, r'Z:\workspace'); import config; r = config.get_redis(); r.delete(config.LATEST_KEY, config.ACTIVE_KEY); print('[+] Redis keys reset.')" 2>nul
 
-:: 4. Relaunch GUI using whichever launcher exists
-echo [*] Relaunching GUI...
-if exist "%~dp0Launch_GUI.bat" (
+:: 4. Reopen the Agent Cluster window (or, if it's missing, the fallback Launch_GUI.bat)
+echo [*] Reopening the Agent Cluster window...
+if exist "C:\AI\cluster_launcher\cluster_launcher.py" (
+    start "" "C:\AI\venvs\agent_brain\Scripts\pythonw.exe" "C:\AI\cluster_launcher\cluster_launcher.py"
+) else if exist "%~dp0Launch_GUI.bat" (
     start "" "%~dp0Launch_GUI.bat"
 )
 

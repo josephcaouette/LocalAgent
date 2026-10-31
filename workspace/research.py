@@ -91,12 +91,18 @@ def ask(backend, system, prompt, max_tokens=600, temperature=0.3):
     if backend == "node3":
         return ollama_generate(f"{system}\n\n{prompt}", temperature=temperature,
                                timeout=180, num_predict=max_tokens)
-    res = requests.post(config.LLM_BASE_URL + "/v1/chat/completions", timeout=300, json={
-        "model": _vllm_model(), "max_tokens": max_tokens, "temperature": temperature,
-        "top_p": config.LLM_TOP_P, "top_k": config.LLM_TOP_K,
-        "chat_template_kwargs": {"enable_thinking": False},
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-    })
+    global _model_id
+    for _ in range(2):
+        res = requests.post(config.LLM_BASE_URL + "/v1/chat/completions", timeout=300, json={
+            "model": _vllm_model(), "max_tokens": max_tokens, "temperature": temperature,
+            "top_p": config.LLM_TOP_P, "top_k": config.LLM_TOP_K,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+        })
+        if res.status_code == 404:      # vLLM was restarted with another model: look it up again
+            _model_id = None
+            continue
+        break
     res.raise_for_status()
     return (res.json()["choices"][0]["message"]["content"] or "").strip()
 
@@ -264,7 +270,10 @@ def fetch(url, allowlist):
     except Exception as e:
         log("FETCH!", f"{url} {type(e).__name__}: {e}")
         return ""
-    raw = body.decode(encoding, errors="replace")
+    try:
+        raw = body.decode(encoding, errors="replace")
+    except LookupError:              # the page declared a character set Python doesn't know
+        raw = body.decode("utf-8", errors="replace")
     if "html" in ctype:
         import trafilatura
         text = trafilatura.extract(raw, url=final, output_format="markdown",

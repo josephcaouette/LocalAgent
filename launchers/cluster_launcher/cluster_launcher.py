@@ -1,17 +1,22 @@
-"""Cluster Launcher: one window to start, stop, tune and check the whole cluster.
+"""Agent Cluster: one window for the whole cluster.
 
-Replaces Launch_GUI.bat, Reset_Cluster.bat, Restart_Node2_Blackboard.bat,
-Restart_Node3_Worker.bat and Backup_To_GitHub.bat (they still work as fallbacks).
+  Status strip  live health of every node and service (every 5 s), the run queue and Dispatch Run
+  Chat          talk with the models; "Talk about result" explains finished runs   } from
+  Task & Queue  the task form, accuracy level, attachments, queue and per-run logs   } Z:\\workspace\\
+  Runs          every recorded run with details and actions                          } agent_gui.py
+  Model server  vLLM settings, presets, free-VRAM check, start / stop / restart, live log
+  Cluster       Z: drive, pipeline reset, Node 2 / Node 3 restarts, backup, links, status details
+  Activity      what the window did (bottom)
 
-  Status (top)  live health of every node and service, refreshed every 5 seconds
-  Model server  vLLM settings with presets, a free-VRAM check, start / stop / restart
-  Cluster       agent GUI, Z: drive, pipeline reset, Node 2 / Node 3 restarts, backup
-  Links         dashboard, search page, GitHub, folders, logs and settings files
-
-It lives on Node 1 (C:\\AI\\cluster_launcher), so it works even when Z: isn't connected.
-Settings are saved next to it in launcher_settings.json.
+It lives on Node 1 (C:\\AI\\cluster_launcher), so it opens even when Z: isn't connected: the three
+agent tabs then show a Connect Z: button and load as soon as Z: is there. vLLM runs without a
+window of its own (its log is on the Model server tab) and keeps running when this window
+closes. Settings are saved next to this file in launcher_settings.json. The old .bat files and
+agent_gui.py on its own still work as fallbacks.
 """
 import copy
+import glob
+import importlib
 import json
 import os
 import queue
@@ -23,6 +28,7 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import traceback
 import webbrowser
 from tkinter import messagebox, scrolledtext, ttk
 
@@ -32,7 +38,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(HERE, "launcher_settings.json")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 NEW_CONSOLE = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-GUI_PID_FILE = os.path.join(tempfile.gettempdir(), "agent_gui.pid")
+NEW_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+GUI_PID_FILE = os.path.join(tempfile.gettempdir(), "agent_gui.pid")      # this window (Reset_Cluster.bat)
 PIPELINE_PID_GLOB = os.path.join(tempfile.gettempdir(), "agent_pipeline*.pid")   # one per run
 LLM_URL = "http://127.0.0.1:8001"     # not "localhost": Windows tries IPv6 first (2 s delay)
 
@@ -67,6 +74,9 @@ KNOWN_MODELS = ["RedHatAI/Qwen3.8-27B-INT4", "Qwen/Qwen2.5-Coder-32B-Instruct-AW
 
 BG, PANEL, FIELD, TEXT, MUTED = "#1e1e1e", "#2d2d2d", "#252526", "#d4d4d4", "#8a8a8a"
 GREEN, RED, ORANGE, GREY = "#4CAF50", "#e05252", "#f0ad4e", "#777777"
+
+# vLLM log lines not worth showing (the status checks hit /v1/models every few seconds).
+LOG_NOISE = re.compile(r'"(GET /v1/models|POST /tokenize|GET /health|GET /metrics)')
 
 
 # --------------------------------------------------------------------------- settings and commands
@@ -161,27 +171,38 @@ def vllm_card():
 
 # --------------------------------------------------------------------------- the window
 
-class Launcher:
-    def __init__(self, root):
+class ClusterWindow:
+    def __init__(self, root, load_agent=True):
         self.root = root
         self.s = load_settings()
         self.q = queue.Queue()
-        self.vllm_window = None
+        self.vllm_proc = None            # the hidden wsl process running vLLM (if started here)
         self.vllm_started_at = None      # set while vLLM is starting
-        self.open_gui_when_ready = False
-        root.title("Cluster Launcher")
-        root.geometry("1040x900")
+        self.agent = None                # the Chat / Task & Queue / Runs tabs, once loaded
+        self.agent_failed = False        # loading raised an error: wait for "Try again"
+        self.redis_active = 0            # runs with a heartbeat (from any window or the CLI)
+        self._vlog_path = None
+        self._vlog_busy = False
+        self._vlog_text = ""
+        root.title("Agent Cluster")
+        root.geometry("1280x960")
+        root.minsize(1060, 760)
         root.configure(bg=BG)
         self._style()
         self._build()
         self._load_form(self.s["vllm"])
+        self._write_pid_file()
+        if load_agent:
+            self.load_agent()
         threading.Thread(target=self._status_loop, daemon=True).start()
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.after(100, self._drain)
+        root.after(1500, self._vlog_tick)
 
     # ------------------------------------------------------------------ layout
 
     def _style(self):
-        st = ttk.Style()
+        st = ttk.Style(self.root)
         st.theme_use("clam")
         st.configure("TNotebook", background=BG, borderwidth=0)
         st.configure("TNotebook.Tab", background=PANEL, foreground="#cccccc", padding=(16, 6),
@@ -193,8 +214,8 @@ class Launcher:
         self.root.option_add("*TCombobox*Listbox.foreground", TEXT)
         self.root.option_add("*TCombobox*Listbox.selectBackground", "#0275d8")
 
-    def _label(self, parent, text, muted=False, bold=False, size=10):
-        return tk.Label(parent, text=text, bg=BG, fg=MUTED if muted else "#cccccc", justify=tk.LEFT,
+    def _label(self, parent, text, muted=False, bold=False, size=10, bg=BG):
+        return tk.Label(parent, text=text, bg=bg, fg=MUTED if muted else "#cccccc", justify=tk.LEFT,
                         font=("Segoe UI", size - 1 if muted else size, "bold" if bold else "normal"))
 
     def _button(self, parent, text, cmd, color="#3e3e42", width=None):
@@ -209,44 +230,58 @@ class Launcher:
                               activebackground=BG, activeforeground=TEXT, font=("Segoe UI", 9))
 
     def _build(self):
-        # ---- status grid
-        status = tk.Frame(self.root, bg=PANEL, padx=12, pady=8)
-        status.pack(fill=tk.X)
-        self.dots = {}
-        columns = [("Node 1 (this PC)", ["vLLM", "GPU", "Z: drive", "Agent GUI"]),
-                   ("Node 2 (Blackboard)", ["Redis", "Qdrant", "SearXNG", "Dashboard", "File share"]),
-                   ("Node 3 (Worker)", ["Ollama", "Models", "Last run"])]
-        for col, (title, names) in enumerate(columns):
-            frame = tk.Frame(status, bg=PANEL)
-            frame.grid(row=0, column=col, sticky="nw", padx=(0, 30))
-            tk.Label(frame, text=title, bg=PANEL, fg="#5bc0de", font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
+        # ---- status strip: one compact row of service dots, then the run queue's own header
+        strip = tk.Frame(self.root, bg=PANEL, padx=10, pady=5)
+        strip.pack(fill=tk.X)
+        row = tk.Frame(strip, bg=PANEL)
+        row.pack(fill=tk.X)
+        self.dots = {}        # name -> (dot, short label, detail label)
+        groups = [("Node 1", ["vLLM", "GPU", "Z: drive"]),
+                  ("Node 2", ["Redis", "Qdrant", "SearXNG", "Dashboard", "File share"]),
+                  ("Node 3", ["Ollama"])]
+        for title, names in groups:
+            tk.Label(row, text=title, bg=PANEL, fg="#5bc0de", font=("Segoe UI", 9, "bold")).pack(
+                side=tk.LEFT, padx=(0, 4))
             for name in names:
-                row = tk.Frame(frame, bg=PANEL)
-                row.pack(anchor=tk.W, fill=tk.X)
                 dot = tk.Label(row, text="\u25cf", bg=PANEL, fg=GREY, font=("Segoe UI", 10))
                 dot.pack(side=tk.LEFT)
-                txt = tk.Label(row, text=f"{name}: checking...", bg=PANEL, fg=TEXT, font=("Segoe UI", 9))
-                txt.pack(side=tk.LEFT)
-                self.dots[name] = (dot, txt)
+                short = tk.Label(row, text=name, bg=PANEL, fg=TEXT, font=("Segoe UI", 9))
+                short.pack(side=tk.LEFT, padx=(0, 8))
+                self.dots[name] = [dot, short, None]
+            tk.Frame(row, bg="#444444", width=1, height=16).pack(side=tk.LEFT, padx=(2, 10))
+        self.agent_header = tk.Frame(strip, bg=PANEL)
+        self.agent_header.pack(fill=tk.X, pady=(4, 0))
 
-        self.tabs = ttk.Notebook(self.root)
-        self.tabs.pack(fill=tk.BOTH, expand=False, padx=8, pady=(8, 4))
-        model_tab, cluster_tab, links_tab = (tk.Frame(self.tabs, bg=BG) for _ in range(3))
-        self.tabs.add(model_tab, text="Model server")
-        self.tabs.add(cluster_tab, text="Cluster")
-        self.tabs.add(links_tab, text="Links & files")
-        self._build_model(model_tab)
-        self._build_cluster(cluster_tab)
-        self._build_links(links_tab)
-
+        # ---- activity log (packed before the tabs so it always keeps its space at the bottom)
         logf = tk.Frame(self.root, bg=BG, padx=10)
-        logf.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
-        self._label(logf, "Activity").pack(anchor=tk.W)
-        self.log_box = scrolledtext.ScrolledText(logf, bg="#0c0c0c", fg="#00ff66", height=10,
+        logf.pack(side=tk.BOTTOM, fill=tk.X, pady=(0, 8))
+        head = tk.Frame(logf, bg=BG)
+        head.pack(fill=tk.X)
+        self._label(head, "Activity").pack(side=tk.LEFT)
+        self.log_toggle = self._button(head, "Show more", self._toggle_log)
+        self.log_toggle.pack(side=tk.RIGHT)
+        self.log_box = scrolledtext.ScrolledText(logf, bg="#0c0c0c", fg="#00ff66", height=4,
                                                  font=("Consolas", 9), relief=tk.FLAT)
-        self.log_box.pack(fill=tk.BOTH, expand=True)
+        self.log_box.pack(fill=tk.X)
         self.log_box.tag_config("err", foreground="#ff6b6b")
         self.log_box.tag_config("ok", foreground="#9dff7a")
+
+        # ---- tabs
+        self.tabs = ttk.Notebook(self.root)
+        self.tabs.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 4))
+        self.agent_frames = tuple(tk.Frame(self.tabs, bg=BG) for _ in range(3))
+        self.model_tab, self.cluster_tab = tk.Frame(self.tabs, bg=BG), tk.Frame(self.tabs, bg=BG)
+        for frame, text in zip(self.agent_frames + (self.model_tab, self.cluster_tab),
+                               ("Chat", "Task & Queue", "Runs", "Model server", "Cluster")):
+            self.tabs.add(frame, text=text)
+        self._build_model(self.model_tab)
+        self._build_cluster(self.cluster_tab)
+
+    def _toggle_log(self):
+        big = int(self.log_box.cget("height")) <= 4
+        self.log_box.config(height=16 if big else 4)
+        self.log_toggle.config(text="Show less" if big else "Show more")
+        self.log_box.see(tk.END)
 
     def _build_model(self, p):
         self.v_preset = tk.StringVar(value=self.s.get("preset", "Fast (default)"))
@@ -256,21 +291,21 @@ class Launcher:
         self.v_seqs, self.v_mtp_n = tk.IntVar(), tk.IntVar()
         self.v_mtp, self.v_graphs, self.v_prefix, self.v_textonly = (tk.BooleanVar() for _ in range(4))
 
-        form = tk.Frame(p, bg=BG, padx=12, pady=10)
+        form = tk.Frame(p, bg=BG, padx=12, pady=8)
         form.pack(fill=tk.X)
         r = 0
 
         def row(label, widget, note=""):
             nonlocal r
-            self._label(form, label).grid(row=r, column=0, sticky="w", pady=3)
-            widget.grid(row=r, column=1, sticky="w", pady=3)
+            self._label(form, label).grid(row=r, column=0, sticky="w", pady=2)
+            widget.grid(row=r, column=1, sticky="w", pady=2)
             if note:
                 self._label(form, note, muted=True).grid(row=r, column=2, sticky="w", padx=10)
             r += 1
 
         preset_box = tk.Frame(form, bg=BG)
-        cb = ttk.Combobox(preset_box, textvariable=self.v_preset, values=list(PRESETS), state="readonly", width=38)
-        cb.pack(side=tk.LEFT)
+        ttk.Combobox(preset_box, textvariable=self.v_preset, values=list(PRESETS), state="readonly",
+                     width=38).pack(side=tk.LEFT)
         self._button(preset_box, "Apply preset", self.apply_preset).pack(side=tk.LEFT, padx=6)
         row("Preset", preset_box, "Fills in the settings below; nothing changes until you start vLLM.")
         row("Model", ttk.Combobox(form, textvariable=self.v_model, values=KNOWN_MODELS, width=44),
@@ -288,7 +323,7 @@ class Launcher:
 
         row("Parallel requests", tk.Spinbox(form, from_=1, to=32, textvariable=self.v_seqs, width=6,
                                             bg=FIELD, fg=TEXT, buttonbackground=PANEL, relief=tk.FLAT),
-            "Most requests vLLM runs at once (best-of-3 candidates + chat need about 4).")
+            "Most requests vLLM runs at once (candidates, judges and chat share them).")
         kv_box = tk.Frame(form, bg=BG)
         ttk.Combobox(kv_box, textvariable=self.v_kv, values=["fp8", "auto"], state="readonly", width=8).pack(side=tk.LEFT)
         self._label(kv_box, "   Attention backend ").pack(side=tk.LEFT)
@@ -311,7 +346,7 @@ class Launcher:
                                         insertbackground="white", relief=tk.FLAT),
             "Added to the vllm serve command as-is.")
 
-        bar = tk.Frame(p, bg=BG, padx=12, pady=6)
+        bar = tk.Frame(p, bg=BG, padx=12, pady=4)
         bar.pack(fill=tk.X)
         self._button(bar, "Start everything", self.start_everything, "#0275d8").pack(side=tk.LEFT, padx=(0, 6))
         self._button(bar, "Start vLLM", self.start_vllm, "#3d8b3d").pack(side=tk.LEFT, padx=3)
@@ -319,30 +354,39 @@ class Launcher:
         self._button(bar, "Restart vLLM", self.restart_vllm, "#d9534f").pack(side=tk.LEFT, padx=3)
         self._button(bar, "Save settings", self.save_form).pack(side=tk.LEFT, padx=(18, 3))
         self._button(bar, "Show command", self.show_command).pack(side=tk.LEFT, padx=3)
-        self._button(bar, "Open vLLM log", self.open_vllm_log).pack(side=tk.LEFT, padx=3)
+        self._button(bar, "Open log file", self.open_vllm_log).pack(side=tk.LEFT, padx=3)
+
+        logf = tk.Frame(p, bg=BG, padx=12)
+        logf.pack(fill=tk.BOTH, expand=True, pady=(4, 6))
+        self._label(logf, "vLLM log (its status-check lines are hidden):", muted=True).pack(anchor=tk.W)
+        self.vlog = scrolledtext.ScrolledText(logf, bg="#0c0c0c", fg="#bbbbbb", font=("Consolas", 8),
+                                              relief=tk.FLAT, wrap=tk.WORD, height=10, state=tk.DISABLED)
+        self.vlog.pack(fill=tk.BOTH, expand=True)
 
     def _build_cluster(self, p):
-        grid = tk.Frame(p, bg=BG, padx=12, pady=10)
-        grid.pack(fill=tk.X)
-        actions = [
-            ("Open agent GUI", self.open_agent_gui, "#0275d8", "Opens the chat and task window (connects Z: first if needed)."),
-            ("Connect Z: drive", self.connect_drive, None, "Opens a window that asks for the share password once."),
-            ("Reset pipeline", self.reset_pipeline, "#d9534f", "Stops the GUI and any run, clears the last-run record, reopens the GUI."),
-            ("Restart Node 2 services", self.restart_node2, None, "Restarts Redis, Qdrant, SearXNG and the dashboard (about 15 s)."),
-            ("Restart Ollama on Node 3", self.restart_node3, None, "Opens a window for your sudo password, then warms up the models."),
-            ("Warm up Node 3 models", self.warm_node3, None, "Loads the helper and embedding models and keeps them loaded."),
-            ("Back up to GitHub", self.backup, "#3d8b3d", "Copies launchers and settings to Node 2, commits and pushes."),
+        top = tk.Frame(p, bg=BG, padx=12, pady=10)
+        top.pack(fill=tk.X)
+        actions = tk.Frame(top, bg=BG)
+        actions.pack(side=tk.LEFT, anchor="n")
+        self._label(actions, "Actions", bold=True).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        items = [
+            ("Connect Z: drive", self.connect_drive, None, "Opens a window that asks for the share password."),
+            ("Reset pipeline", self.reset_pipeline, "#d9534f", "Stops every run, clears their records and test containers."),
+            ("Restart Node 2 services", self.restart_node2, None, "Redis, Qdrant, SearXNG and the dashboard (~15 s)."),
+            ("Restart Ollama on Node 3", self.restart_node3, None, "Opens a window for your sudo password."),
+            ("Warm up Node 3 models", self.warm_node3, None, "Loads the helper and embedding models."),
+            ("Back up to GitHub", self.backup, "#3d8b3d", "Copies launchers and settings to Node 2, commits, pushes."),
         ]
-        for i, (text, cmd, color, note) in enumerate(actions):
-            self._button(grid, text, cmd, color or "#3e3e42", width=24).grid(row=i, column=0, sticky="w", pady=3)
-            self._label(grid, note, muted=True).grid(row=i, column=1, sticky="w", padx=12)
+        for i, (text, cmd, color, note) in enumerate(items, 1):
+            self._button(actions, text, cmd, color or "#3e3e42", width=22).grid(row=i, column=0, sticky="w", pady=2)
+            self._label(actions, note, muted=True).grid(row=i, column=1, sticky="w", padx=10)
 
-    def _build_links(self, p):
-        grid = tk.Frame(p, bg=BG, padx=12, pady=10)
-        grid.pack(fill=tk.X)
+        links = tk.Frame(top, bg=BG)
+        links.pack(side=tk.LEFT, anchor="n", padx=(30, 0))
+        self._label(links, "Links & files", bold=True).grid(row=0, column=0, sticky="w", pady=(0, 4))
         ws = os.path.join(self.s["drive"] + "\\", "workspace")
-        links = [
-            ("Dashboard", lambda: webbrowser.open(f"http://{self.s['node2_ip']}:8080")),
+        entries = [
+            ("Web dashboard", lambda: webbrowser.open(f"http://{self.s['node2_ip']}:8080")),
             ("Search page (SearXNG)", lambda: webbrowser.open(f"http://{self.s['node2_ip']}:8888")),
             ("GitHub repository", lambda: webbrowser.open(self.s["github"])),
             ("Workspace folder", lambda: self.open_path(ws)),
@@ -351,10 +395,92 @@ class Launcher:
             ("config.py", lambda: self.edit(os.path.join(ws, "config.py"))),
             ("research.log", lambda: self.edit(os.path.join(ws, "logs", "research.log"))),
             ("ingest.log", lambda: self.edit(os.path.join(ws, "logs", "ingest.log"))),
-            ("Launcher settings", lambda: self.edit(SETTINGS_FILE)),
+            ("Window settings", lambda: self.edit(SETTINGS_FILE)),
         ]
-        for i, (text, cmd) in enumerate(links):
-            self._button(grid, text, cmd, width=22).grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 10), pady=3)
+        for i, (text, cmd) in enumerate(entries):
+            self._button(links, text, cmd, width=20).grid(row=1 + i // 2, column=i % 2, sticky="w", padx=(0, 8), pady=2)
+
+        details = tk.Frame(p, bg=BG, padx=12, pady=6)
+        details.pack(fill=tk.X)
+        self._label(details, "Status details", bold=True).pack(anchor=tk.W, pady=(0, 4))
+        grid = tk.Frame(details, bg=PANEL, padx=12, pady=8)
+        grid.pack(fill=tk.X)
+        columns = [("Node 1 (this PC)", ["vLLM", "GPU", "Z: drive"]),
+                   ("Node 2 (Blackboard)", ["Redis", "Qdrant", "SearXNG", "Dashboard", "File share"]),
+                   ("Node 3 (Worker)", ["Ollama", "Models"])]
+        for col, (title, names) in enumerate(columns):
+            frame = tk.Frame(grid, bg=PANEL)
+            frame.grid(row=0, column=col, sticky="nw", padx=(0, 40))
+            tk.Label(frame, text=title, bg=PANEL, fg="#5bc0de", font=("Segoe UI", 10, "bold")).pack(anchor=tk.W)
+            for name in names:
+                lbl = tk.Label(frame, text=f"{name}: checking...", bg=PANEL, fg=TEXT, font=("Segoe UI", 9))
+                lbl.pack(anchor=tk.W)
+                if name in self.dots:
+                    self.dots[name][2] = lbl
+                else:
+                    self.dots[name] = [None, None, lbl]
+
+    # ------------------------------------------------------------------ the agent tabs
+
+    def _clear(self, frame):
+        for w in frame.winfo_children():
+            w.destroy()
+
+    def _show_agent_placeholder(self, message):
+        for frame in self.agent_frames:
+            self._clear(frame)
+            box = tk.Frame(frame, bg=BG)
+            box.place(relx=0.5, rely=0.4, anchor="center")
+            self._label(box, message, size=11).pack(pady=(0, 10))
+            buttons = tk.Frame(box, bg=BG)
+            buttons.pack()
+            self._button(buttons, "Connect Z:", self.connect_drive, "#0275d8").pack(side=tk.LEFT, padx=4)
+            self._button(buttons, "Try again", lambda: self.load_agent(retry=True)).pack(side=tk.LEFT, padx=4)
+        self._clear(self.agent_header)
+        self._label(self.agent_header, "Chat, tasks and runs load once Z: is connected.", muted=True,
+                    bg=PANEL).pack(side=tk.LEFT)
+
+    def load_agent(self, retry=False):
+        """Build the Chat, Task & Queue and Runs tabs from Z:\\workspace\\agent_gui.py."""
+        if self.agent is not None:
+            return True
+        if retry:
+            self.agent_failed = False
+        ws = os.path.join(self.s["drive"] + "\\", "workspace")
+        if not os.path.exists(os.path.join(ws, "agent_gui.py")):
+            self._show_agent_placeholder("Z: isn't connected, so chat, tasks and runs aren't available yet.\n"
+                                         "They load by themselves as soon as Z: is connected.")
+            return False
+        try:
+            if ws not in sys.path:
+                sys.path.insert(0, ws)
+            if "agent_gui" in sys.modules:
+                importlib.reload(sys.modules["agent_gui"])
+            import agent_gui
+            for frame in self.agent_frames:
+                self._clear(frame)
+            self._clear(self.agent_header)
+            self.agent = agent_gui.AgentControlGUI(self.root, write_pid=False, notebook=self.tabs,
+                                                   frames=self.agent_frames, header=self.agent_header)
+        except Exception as e:
+            self.agent = None
+            self.agent_failed = True     # don't retry every 5 s; the Try again button retries
+            self.log("Couldn't load the agent tabs:\n" + traceback.format_exc(limit=3), "err")
+            self._show_agent_placeholder(f"Couldn't load chat, tasks and runs: {e}")
+            return False
+        self.log("Loaded Chat, Task & Queue and Runs from Z:\\workspace.", "ok")
+        return True
+
+    def _runs_going(self):
+        mine = self.agent.active_count() if self.agent else 0
+        return max(mine, self.redis_active)
+
+    def _confirm_runs(self, what):
+        n = self._runs_going()
+        if not n:
+            return True
+        return messagebox.askyesno("Runs in progress", f"{n} run(s) are going. {what} will make them fail.\n\n"
+                                                       "Continue anyway?")
 
     # ------------------------------------------------------------------ form helpers
 
@@ -382,11 +508,11 @@ class Launcher:
                  "prefix_caching": bool(self.v_prefix.get()), "text_only": bool(self.v_textonly.get()),
                  "reasoning_parser": self.v_reason.get().strip(), "extra": self.v_extra.get().strip()}
         except (ValueError, tk.TclError):
-            messagebox.showerror("Cluster Launcher", "Context length and the number fields must be whole numbers.")
+            messagebox.showerror("Agent Cluster", "Context length and the number fields must be whole numbers.")
             return None
         problem = validate_vllm(v)
         if problem:
-            messagebox.showerror("Cluster Launcher", problem)
+            messagebox.showerror("Agent Cluster", problem)
             return None
         return v
 
@@ -442,6 +568,8 @@ class Launcher:
                     self.log(*payload)
                 elif kind == "status":
                     self._show_status(payload[0])
+                elif kind == "vlog":
+                    self._show_vlog(payload[0])
                 elif kind == "call":
                     payload[0]()
         except queue.Empty:
@@ -473,6 +601,15 @@ class Launcher:
     def ssh(self, host, remote_cmd):
         return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", f"{self.s['ssh_user']}@{host}", remote_cmd]
 
+    def _redis(self):
+        """A Redis client: config.get_redis() (with any password) once the agent tabs loaded it."""
+        cfg = sys.modules.get("config")
+        if cfg is not None and hasattr(cfg, "get_redis"):
+            return cfg.get_redis(decode_responses=True, timeout=2)
+        import redis
+        return redis.Redis(host=self.s["node2_ip"], socket_timeout=2, socket_connect_timeout=2,
+                           decode_responses=True)
+
     # ------------------------------------------------------------------ status
 
     def _status_loop(self):
@@ -498,14 +635,10 @@ class Launcher:
                 st["models"] = [m["name"] for m in requests.get(f"http://{n3}:11434/api/ps", timeout=2).json()["models"]]
             except Exception:
                 pass
-        st["gui"] = self._pid_alive(GUI_PID_FILE)
-        st["last_run"] = None
+        st["active_runs"] = 0
         if st["Redis"]:
             try:
-                import redis
-                r = redis.Redis(host=n2, socket_timeout=1, socket_connect_timeout=1, decode_responses=True)
-                st["last_run"] = r.hmget("workflow:langgraph:001", "status", "phase", "target_file")
-                st["active_runs"] = r.zcount("workflow:active", time.time() - 120, "+inf")
+                st["active_runs"] = self._redis().zcount("workflow:active", time.time() - 120, "+inf")
             except Exception:
                 pass
         st["vllm_error"] = None
@@ -515,104 +648,96 @@ class Launcher:
             st["vllm_error"] = m[-1][:300] if m else None
         return st
 
-    @staticmethod
-    def _pid_alive(pid_file):
-        try:
-            with open(pid_file) as f:
-                pid = int(f.read().strip())
-        except (OSError, ValueError):
-            return False
-        code, out = run_quiet(["tasklist", "/FI", f"PID eq {pid}", "/NH"], timeout=5)
-        return "python" in out.lower()
-
-    def _set(self, name, color, text):
-        dot, label = self.dots[name]
-        dot.config(fg=color)
-        label.config(text=f"{name}: {text}")
+    def _set(self, name, color, short, detail=None):
+        dot, short_lbl, detail_lbl = self.dots[name]
+        if dot is not None:
+            dot.config(fg=color)
+            short_lbl.config(text=short)
+        if detail_lbl is not None:
+            detail_lbl.config(text=f"{name}: {detail or short}", fg=TEXT if color != RED else "#ff8a8a")
 
     def _show_status(self, st):
+        self.redis_active = st.get("active_runs", 0)
         card = st["card"]
         if card:
             if self.vllm_started_at:
                 self.log(f"vLLM is ready after {time.time() - self.vllm_started_at:.0f} s.", "ok")
                 self.vllm_started_at = None
-            self._set("vLLM", GREEN, f"ready, {card['id'].split('/')[-1]}, {card.get('max_model_len')} context")
-            if self.open_gui_when_ready:
-                self.open_gui_when_ready = False
-                self.open_agent_gui()
+            ctx = card.get("max_model_len")
+            self._set("vLLM", GREEN, f"vLLM ready ({ctx // 1024 if ctx else '?'}k)",
+                      f"ready, {card['id'].split('/')[-1]}, {ctx} context")
         elif st["vllm_error"]:
-            self._set("vLLM", RED, "failed to start (see Activity)")
+            self._set("vLLM", RED, "vLLM failed", "failed to start (see Activity and the Model server log)")
             self.log("vLLM failed to start: " + st["vllm_error"], "err")
             self.log("Tip: lower Context length or GPU memory, or try 'Check free VRAM'.", "err")
             self.vllm_started_at = None
-            self.open_gui_when_ready = False
         elif self.vllm_started_at:
-            self._set("vLLM", ORANGE, f"starting ({time.time() - self.vllm_started_at:.0f} s, usually 1-3 min)")
+            secs = time.time() - self.vllm_started_at
+            self._set("vLLM", ORANGE, f"vLLM starting {secs:.0f}s", f"starting ({secs:.0f} s, usually about a minute)")
         else:
-            self._set("vLLM", RED, "stopped")
+            self._set("vLLM", RED, "vLLM stopped", "stopped (Model server tab, Start vLLM)")
         if st["gpu"]:
             used, total, util, temp = st["gpu"]
-            self._set("GPU", GREEN, f"{float(used) / 1024:.1f} of {float(total) / 1024:.1f} GB used, "
-                                    f"{util}% busy, {float(temp):.0f} C")
+            self._set("GPU", GREEN, f"GPU {float(used) / 1024:.1f}/{float(total) / 1024:.0f} GB {float(temp):.0f}°C",
+                      f"{float(used) / 1024:.1f} of {float(total) / 1024:.1f} GB used, {util}% busy, "
+                      f"{float(temp):.0f} C")
         else:
-            self._set("GPU", GREY, "nvidia-smi unavailable")
-        self._set("Z: drive", GREEN if st["drive"] else RED, "connected" if st["drive"] else "not connected")
-        self._set("Agent GUI", GREEN if st["gui"] else GREY, "running" if st["gui"] else "not running")
-        for name in ("Redis", "Qdrant", "SearXNG", "Dashboard", "File share", "Ollama"):
-            self._set(name, GREEN if st[name] else RED, "up" if st[name] else "down")
+            self._set("GPU", GREY, "GPU ?", "nvidia-smi unavailable")
+        self._set("Z: drive", GREEN if st["drive"] else RED, "Z:", "connected" if st["drive"] else "not connected")
+        for name, short in (("Redis", "Redis"), ("Qdrant", "Qdrant"), ("SearXNG", "SearXNG"),
+                            ("Dashboard", "Dashboard"), ("File share", "Share")):
+            self._set(name, GREEN if st[name] else RED, short, "up" if st[name] else "down")
         models = st["models"]
-        self._set("Models", GREEN if models else ORANGE,
-                  ", ".join(models) if models else ("none loaded (Warm up)" if models == [] else "unknown"))
-        lr, active = st["last_run"], st.get("active_runs", 0)
-        if active:
-            text = f"{active} running" + (f" - newest: {lr[1]} ({lr[2]})" if lr and lr[1] else "")
-            self._set("Last run", ORANGE, text)
-        elif lr and lr[0]:
-            status = "LOST" if lr[0] == "RUNNING" else lr[0]   # no heartbeat: its process is gone
-            color = {"PASSED": GREEN, "STOPPED": ORANGE, "LOST": GREY}.get(status, RED)
-            self._set("Last run", color, status + (f" ({lr[2]})" if lr[2] else ""))
+        if not st["Ollama"]:
+            self._set("Ollama", RED, "Ollama down", "down")
         else:
-            self._set("Last run", GREY, "none")
+            color = GREEN if models else ORANGE
+            self._set("Ollama", color, f"Ollama · {len(models)} models" if models else "Ollama · none loaded", "up")
+        self._set("Models", GREEN if models else ORANGE, "",
+                  ", ".join(models) if models else ("none loaded (Warm up Node 3 models)" if models == [] else "unknown"))
+        if self.agent is None and st["drive"] and not self.agent_failed:
+            self.load_agent()            # Z: has just been connected
 
     # ------------------------------------------------------------------ vLLM
 
-    def start_vllm(self, then_gui=False):
+    def start_vllm(self):
         v = self.save_form(quiet=True)
         if v is None:
             return
         if vllm_card():
             self.log("vLLM is already running. Use Restart vLLM to apply new settings.")
-            if then_gui:
-                self.open_agent_gui()
             return
         self.log("Starting vLLM: " + " ".join(vllm_args(v)[2:]))
         run_quiet(["wsl", "-u", "root", "bash", "-c",
                    "fuser -k -9 8001/tcp >/dev/null 2>&1; pkill -9 -f '[v]llm serve' >/dev/null 2>&1"])
         run_quiet(["wsl", "bash", "-c", "rm -f ~/vllm_last.log"])
-        title = "vLLM Engine - " + v["model"].split("/")[-1]
-        ps = f"$host.UI.RawUI.WindowTitle = '{title}'; wsl bash -c '{vllm_script(v)}'"
-        self.vllm_window = subprocess.Popen(["powershell", "-NoExit", "-Command", ps], creationflags=NEW_CONSOLE)
+        # No window of its own: the log shows on the Model server tab, and vLLM keeps running if
+        # this window closes. Stop vLLM stops it.
+        self.vllm_proc = subprocess.Popen(["wsl", "bash", "-c", vllm_script(v)], stdin=subprocess.DEVNULL,
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                          creationflags=NO_WINDOW | NEW_GROUP)
         self.vllm_started_at = time.time()
-        self.open_gui_when_ready = then_gui
-        self._set("vLLM", ORANGE, "starting...")
+        self._vlog_text = ""
+        self._set("vLLM", ORANGE, "vLLM starting", "starting...")
 
     def start_everything(self):
+        """Connect Z: if needed, start vLLM if it isn't running, and load Node 3's models."""
         if not os.path.exists(self.s["drive"] + "\\workspace"):
-            self.log("Z: isn't connected. Connect it in the window that opens, then press Start everything again.", "err")
+            self.log("Z: isn't connected; connect it in the window that opens (the tabs load by themselves).")
             self.connect_drive()
-            return
-        self.start_vllm(then_gui=True)
+        self.start_vllm()
+        self.warm_node3()
 
     def _stop_vllm_blocking(self):
         run_quiet(["wsl", "-u", "root", "bash", "-c",
                    "fuser -k -9 8001/tcp >/dev/null 2>&1; pkill -9 -f '[v]llm serve' >/dev/null 2>&1"])
-        if self.vllm_window and self.vllm_window.poll() is None:
-            run_quiet(["taskkill", "/F", "/T", "/PID", str(self.vllm_window.pid)])
+        if self.vllm_proc and self.vllm_proc.poll() is None:
+            run_quiet(["taskkill", "/F", "/T", "/PID", str(self.vllm_proc.pid)])
         # Also close a vLLM window started by Launch_GUI.bat (match its command line, not ours).
         run_quiet(["powershell", "-NoProfile", "-Command",
                    "$p = '*vllm' + ' serve*'; Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | "
                    "Where-Object { $_.CommandLine -like $p } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"])
-        self.vllm_window = None
+        self.vllm_proc = None
         for _ in range(20):
             if not port_open("127.0.0.1", 8001, 0.5):
                 return True
@@ -620,8 +745,9 @@ class Launcher:
         return False
 
     def stop_vllm(self):
+        if not self._confirm_runs("Stopping vLLM"):
+            return
         self.vllm_started_at = None
-        self.open_gui_when_ready = False
 
         def work():
             self.post("log", "Stopping vLLM...")
@@ -630,6 +756,8 @@ class Launcher:
         self.in_thread(work)
 
     def restart_vllm(self):
+        if not self._confirm_runs("Restarting vLLM"):
+            return
         v = self.save_form(quiet=True)
         if v is None:
             return
@@ -637,7 +765,7 @@ class Launcher:
         def work():
             self.post("log", "Restarting vLLM with the settings above...")
             self._stop_vllm_blocking()
-            self.post("call", lambda: self.start_vllm())
+            self.post("call", self.start_vllm)
         self.in_thread(work)
 
     def check_vram(self):
@@ -660,13 +788,59 @@ class Launcher:
             self.post("call", lambda: self.v_util.set(min(best, 0.95)))
         self.in_thread(work)
 
+    def _vlog_file(self):
+        if self._vlog_path is None:
+            code, out = run_quiet(["wsl", "bash", "-c", "wslpath -w ~/vllm_last.log"])
+            self._vlog_path = out.strip().splitlines()[-1] if code == 0 and out.strip() else ""
+        return self._vlog_path
+
     def open_vllm_log(self):
-        code, home = run_quiet(["wsl", "bash", "-c", "wslpath -w ~/vllm_last.log"])
-        path = home.strip().splitlines()[-1] if code == 0 and home.strip() else ""
-        if path:
+        path = self._vlog_file()
+        if path and os.path.exists(path):
             subprocess.Popen(["notepad", path])
         else:
-            self.log("Couldn't find the vLLM log in WSL.", "err")
+            self.log("No vLLM log yet (it's written while vLLM runs).", "err")
+
+    def _vlog_tick(self):
+        """Refresh the vLLM log pane every 2 s while the Model server tab is open (or vLLM starts)."""
+        visible = self.tabs.select() == str(self.model_tab)
+        if (visible or self.vllm_started_at) and not self._vlog_busy:
+            self._vlog_busy = True
+            self.in_thread(self._read_vlog)
+        self.root.after(2000, self._vlog_tick)
+
+    def _read_vlog(self):
+        text = ""
+        try:
+            path = self._vlog_file()
+            if path:
+                with open(path, "rb") as f:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - 60000))
+                    text = f.read().decode("utf-8", errors="replace")
+        except OSError:
+            text = ""
+        # Drop the status-check lines, blank lines and progress-bar redraws (\r).
+        lines = [ln.split("\r")[-1] for ln in text.splitlines()[1:]]
+        lines = [ln for ln in lines if ln.strip() and not LOG_NOISE.search(ln)]
+        self.post("vlog", "\n".join(lines[-300:]))
+
+    def _show_vlog(self, text):
+        self._vlog_busy = False
+        if text == self._vlog_text:
+            return
+        self._vlog_text = text
+        at_end = self.vlog.yview()[1] >= 0.999
+        top = self.vlog.yview()[0]
+        self.vlog.config(state=tk.NORMAL)
+        self.vlog.delete("1.0", tk.END)
+        self.vlog.insert(tk.END, text or "(no log yet: vLLM writes it while it runs)")
+        self.vlog.config(state=tk.DISABLED)
+        if at_end:
+            self.vlog.see(tk.END)
+        else:
+            self.vlog.yview_moveto(top)
 
     # ------------------------------------------------------------------ cluster actions
 
@@ -677,62 +851,57 @@ class Launcher:
         subprocess.Popen(["cmd", "/k", cmd], creationflags=NEW_CONSOLE)
         self.log("Opened a window to connect the Z: drive.")
 
-    def open_agent_gui(self):
-        ws = os.path.join(self.s["drive"] + "\\", "workspace")
-        if not os.path.exists(os.path.join(ws, "agent_gui.py")):
-            self.log("Z: isn't connected, so the agent GUI can't start. Connect it first.", "err")
-            self.connect_drive()
-            return
-        if self._pid_alive(GUI_PID_FILE):
-            self.log("The agent GUI is already running.")
-            return
-        python = os.path.join(self.s["venv"], "Scripts", "python.exe")
-        # A hidden console, so the GUI's own child processes (ssh, the pipeline) don't flash windows.
-        subprocess.Popen([python, os.path.join(ws, "agent_gui.py")], cwd=ws, creationflags=NO_WINDOW)
-        self.log("Opened the agent GUI.", "ok")
-
     def reset_pipeline(self):
-        if not messagebox.askyesno("Reset pipeline", "Stop the agent GUI and every running task, clear "
-                                                     "their records and test containers, and reopen the GUI?"):
+        if not messagebox.askyesno("Reset pipeline", "Stop every running task, empty the queue, and clear "
+                                                     "their records and test containers?"):
             return
+        threads = self.agent.stop_all("stopped by Reset pipeline") if self.agent else []
 
         def work():
-            import glob
-            for pid_file in [GUI_PID_FILE] + glob.glob(PIPELINE_PID_GLOB):
+            for t in threads:
+                t.join(timeout=20)
+            # Runs started outside this window (for example from the command line).
+            for pid_file in glob.glob(PIPELINE_PID_GLOB):
                 try:
                     with open(pid_file) as f:
                         pid = int(f.read().strip())
                 except (OSError, ValueError):
-                    continue
-                if self._pid_alive(pid_file):
+                    pid = None
+                if pid and pid != os.getpid() and self._pid_alive(pid):
                     run_quiet(["taskkill", "/F", "/T", "/PID", str(pid)])
-                    self.post("log", f"Stopped process {pid}.")
+                    self.post("log", f"Stopped pipeline process {pid}.")
                 try:
                     os.remove(pid_file)
                 except OSError:
                     pass
             try:
-                import redis
-                r = redis.Redis(host=self.s["node2_ip"], socket_timeout=3, decode_responses=True)
-                # Mark every run still listed as running as stopped, so nothing shows as running.
+                r = self._redis()
                 stopped = 0
                 for key in r.zrevrange("workflow:tasks", 0, 50):
                     if r.hget(key, "status") == "RUNNING":
                         r.hset(key, mapping={"status": "STOPPED", "phase": "stopped by Reset pipeline"})
                         stopped += 1
                 r.delete("workflow:langgraph:001", "workflow:active")
-                self.post("log", f"Cleared the run records in Redis ({stopped} marked stopped).")
+                self.post("log", f"Cleared the run records in Redis ({stopped} more marked stopped).")
             except Exception as e:
                 self.post("log", f"Couldn't clear Redis ({e}).", "err")
             code, out = run_quiet(self.ssh(self.s["node2_ip"], "docker ps -aq --filter name=agent- | "
                                            "xargs -r docker rm -f | wc -l"), timeout=60)
             if code == 0:
                 self.post("log", f"Removed {out.strip() or 0} leftover test container(s) on Node 2.")
-            time.sleep(1)
-            self.post("call", self.open_agent_gui)
+            self.post("log", "Reset done.", "ok")
+            if self.agent:
+                self.post("call", self.agent.refresh_runs)
         self.in_thread(work)
 
+    @staticmethod
+    def _pid_alive(pid):
+        code, out = run_quiet(["tasklist", "/FI", f"PID eq {pid}", "/NH"], timeout=5)
+        return "python" in out.lower()
+
     def restart_node2(self):
+        if not self._confirm_runs("Restarting Node 2's services (Redis and the test sandbox)"):
+            return
         self.stream(self.ssh(self.s["node2_ip"],
                              "pkill -f '^python3 /mnt/blackboard/workspace/agent_dashboard.py'; "
                              "cd /mnt/blackboard/docker && docker compose down --remove-orphans && "
@@ -742,7 +911,7 @@ class Launcher:
     def restart_node3(self):
         cmd = (f"echo Restarting Ollama on Node 3. Enter the sudo password for '{self.s['ssh_user']}' when asked. && "
                f"ssh -t {self.s['ssh_user']}@{self.s['node3_ip']} \"sudo systemctl restart ollama\" && "
-               "echo Done. Back in the launcher, press Warm up Node 3 models. You can close this window.")
+               "echo Done. Back in Agent Cluster, press Warm up Node 3 models. You can close this window.")
         subprocess.Popen(["cmd", "/k", cmd], creationflags=NEW_CONSOLE)
         self.log("Opened a window to restart Ollama on Node 3. Afterwards, press Warm up Node 3 models.")
 
@@ -751,11 +920,11 @@ class Launcher:
             url = f"http://{self.s['node3_ip']}:11434"
             worker, embedder, ctx = self.s["worker_model"], self.s["embed_model"], self.s["ollama_num_ctx"]
             try:
-                self.post("log", f"Loading {worker}...")
+                self.post("log", f"Loading {worker} on Node 3...")
                 requests.post(f"{url}/api/generate", timeout=300, json={
                     "model": worker, "prompt": "warmup", "stream": False, "think": False,
                     "keep_alive": -1, "options": {"num_ctx": ctx}}).raise_for_status()
-                self.post("log", f"Loading {embedder}...")
+                self.post("log", f"Loading {embedder} on Node 3...")
                 requests.post(f"{url}/api/embed", timeout=120, json={
                     "model": embedder, "input": "warmup", "keep_alive": -1}).raise_for_status()
                 models = [m["name"] for m in requests.get(f"{url}/api/ps", timeout=5).json()["models"]]
@@ -788,7 +957,7 @@ class Launcher:
                                                   "Backing up to GitHub"))
         self.in_thread(work)
 
-    # ------------------------------------------------------------------ files
+    # ------------------------------------------------------------------ files and lifecycle
 
     def open_path(self, path):
         if os.path.exists(path):
@@ -802,18 +971,50 @@ class Launcher:
         else:
             self.log(f"Not found: {path} (is Z: connected?)", "err")
 
+    def _write_pid_file(self):
+        try:
+            with open(GUI_PID_FILE, "w") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
+
+    def _remove_pid_file(self):
+        try:
+            with open(GUI_PID_FILE) as f:
+                mine = f.read().strip() == str(os.getpid())
+            if mine:
+                os.remove(GUI_PID_FILE)
+        except OSError:
+            pass
+
+    def on_close(self):
+        if self.agent is not None:
+            if not self.agent.confirm_close():
+                return
+            self.agent.shutdown()
+        self._remove_pid_file()
+        self.root.destroy()          # vLLM keeps running; Stop vLLM (or Reset_Cluster) stops it
+
+
+Launcher = ClusterWindow    # the old name, still used by the test scripts
+
 
 def selftest():
     root = tk.Tk()
     root.withdraw()
-    app = Launcher(root)
+    app = ClusterWindow(root)
     st = app._collect_status()
     app._show_status(st)
+    root.update()
+    tabs = [app.tabs.tab(i, "text") for i in app.tabs.tabs()]
     print("command:", vllm_script(app.read_form()))
-    print("status:", {k: (v if k not in ("card",) else (v or {}).get("id")) for k, v in st.items()})
-    print("labels:", " | ".join(lbl.cget("text") for _, lbl in app.dots.values()))
-    print("LAUNCHER_SELF_TEST_PASSED")
+    print("tabs:", tabs, "| agent loaded:", app.agent is not None)
+    print("status:", {k: (v if k != "card" else (v or {}).get("id")) for k, v in st.items()})
+    print("strip:", " | ".join(short.cget("text") for dot, short, _ in app.dots.values() if short is not None))
+    ok = tabs == ["Chat", "Task & Queue", "Runs", "Model server", "Cluster"]
+    app._remove_pid_file()
     root.destroy()
+    print("LAUNCHER_SELF_TEST_PASSED" if ok else "LAUNCHER SELF-TEST FAILED")
 
 
 if __name__ == "__main__":
@@ -821,5 +1022,5 @@ if __name__ == "__main__":
         selftest()
     else:
         root = tk.Tk()
-        Launcher(root)
+        ClusterWindow(root)
         root.mainloop()

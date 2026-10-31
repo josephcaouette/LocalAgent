@@ -11,6 +11,9 @@ set NODE2=server@192.168.254.25
 echo [*] Copying launchers to Node 2...
 scp -q -o BatchMode=yes "%~dp0Launch_GUI.bat" "%~dp0Reset_Cluster.bat" "%~dp0Restart_Node2_Blackboard.bat" "%~dp0Restart_Node3_Worker.bat" "%~dp0Backup_To_GitHub.bat" %NODE2%:/mnt/blackboard/launchers/
 scp -q -o BatchMode=yes "%USERPROFILE%\.wslconfig" %NODE2%:/mnt/blackboard/launchers/wslconfig.txt
+:: The Agent Cluster window's code and settings live on C: so it works without Z:; back them up too.
+ssh -o BatchMode=yes %NODE2% "mkdir -p /mnt/blackboard/launchers/cluster_launcher"
+scp -q -o BatchMode=yes "C:\AI\cluster_launcher\cluster_launcher.py" "C:\AI\cluster_launcher\launcher_settings.json" %NODE2%:/mnt/blackboard/launchers/cluster_launcher/
 
 :: 2. First run only: ask which GitHub repository to back up to.
 set "REPO_URL="

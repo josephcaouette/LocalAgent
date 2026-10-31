@@ -1,5 +1,7 @@
 @echo off
 title Cluster Orchestrator Launcher
+:: Fallback. The normal way in is the "Agent Cluster" shortcut (one window for everything).
+:: This starts vLLM in its own console window and the chat / task / runs tabs on their own.
 echo ======================================================
 echo       STARTING CLUSTER AGENT PIPELINE AND GUI
 echo ======================================================
@@ -27,15 +29,16 @@ set "VLLM_EXTRA=--kv-cache-dtype fp8 --attention-backend TRITON_ATTN --max-num-s
 
 :: 1. Check if vLLM API is already running on port 8001
 echo [*] Testing vLLM API on port 8001...
-curl -s --connect-timeout 2 http://localhost:8001/v1/models | findstr "max_model_len" >nul
+curl -s --connect-timeout 2 http://127.0.0.1:8001/v1/models | findstr "max_model_len" >nul
 if %errorlevel% equ 0 (
     echo [+] vLLM is already active and healthy on port 8001.
     goto launch_gui
 )
 
 :: 2. Clean up any orphaned sockets on port 8001 as root before launching
+::    ('[v]llm serve' matches only vLLM itself, not other programs with "vllm" in their name.)
 echo [*] Cleaning up any orphaned vLLM processes on port 8001...
-wsl -u root bash -c "fuser -k -9 8001/tcp >/dev/null 2>&1; pkill -9 -f vllm >/dev/null 2>&1"
+wsl -u root bash -c "fuser -k -9 8001/tcp >/dev/null 2>&1; pkill -9 -f '[v]llm serve' >/dev/null 2>&1"
 
 :: 3. Launch vLLM in a dedicated PowerShell window. Output is also saved to ~/vllm_last.log in WSL.
 echo [*] Launching vLLM in a dedicated PowerShell window...
@@ -47,7 +50,7 @@ set /a WAITED=0
 :wait_vllm
 timeout /t 5 /nobreak >nul
 set /a WAITED+=5
-curl -s --connect-timeout 2 http://localhost:8001/v1/models | findstr "max_model_len" >nul
+curl -s --connect-timeout 2 http://127.0.0.1:8001/v1/models | findstr "max_model_len" >nul
 if %errorlevel% equ 0 goto vllm_ready
 if %WAITED% geq 900 (
     echo [!] vLLM did not come up within 15 minutes. Check the vLLM window, or ~/vllm_last.log in WSL.
