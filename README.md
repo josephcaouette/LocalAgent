@@ -146,6 +146,13 @@ task from chat**: the new task edits the same file.
   - Up to two Low or Medium runs go at once (`MAX_PARALLEL_RUNS`). A High, Ultra or MAX run waits
     until nothing else is running, then has the GPU to itself. Before an Ultra or MAX run, vLLM
     switches to the 32k server, and back when none are left. The queue keeps its order.
+  - Runs started outside this window (a second window, a test battery, the command line) count as
+    well: nothing from the queue starts beside them and vLLM isn't switched under them. A window that
+    put vLLM on 32k for its own runs switches back as soon as its queue is empty; one that found it
+    on 32k waits until Node 1 has had no run at all for two minutes, because a battery may start its
+    next run seconds after the last one ends. Run summaries wait for other processes' runs too, since
+    they use the GPU. (Before, a window opened during a test battery could switch vLLM back to 16k
+    under the battery's Ultra run.)
   - Each run has its own log: select it in the list.
   - **Stop / remove** stops a running task (its record is marked stopped and its test containers
     removed) or takes a waiting one out of the queue.
@@ -433,6 +440,42 @@ two that rejected correct code, and each showed a weak spot in the pipeline, now
   didn't help, so it isn't in the pipeline: in a side-by-side of 9 acceptance tests on the same plan,
   none used `csv`, and only 1 of 3 tests with the old instructions and 1 of 6 with two new wordings
   passed a correct parser. The rest tripped over empty lines (`['']` where the goal says `[]`).
+  With the goal's `\n` case spelled out, a repeat run on Ultra passed on attempt 3 in 36 minutes
+  and 210,000 tokens (against 6 attempts, 62 minutes and 390,000 before), and matched the reference
+  on all 815 cases.
+
+**A third battery: Ultra against MAX** (2026-11-01, same setup). Sets 1 and 2 never told the two
+apart, so this one used three tasks with rules that are hard to get exactly right: a strict JSON parser
+(NaN and Infinity rejected, surrogate pairs, repeated keys), IPv6 address normalization to a canonical
+form, and a matcher for a subset of regular expressions that must consider every way to match and
+never loop on patterns like `(a*)*`. Each ran on Ultra and then MAX, and was checked against
+standard-library references on 947-1,919 generated cases with a one-second limit per call
+(`scripts/tests/battery3_checks.py`).
+
+| | JSON | IPv6 | Regex |
+|---|---|---|---|
+| Ultra | 1,242/1,242 in 2 attempts, 45 min, 299,000 tokens | 947/947 in 3, 46 min, 279,000 | 1,918/1,919 in 4, 59 min, 354,000 |
+| MAX | 1,242/1,242 in 7 attempts, 109 min, 891,000 tokens | 947/947 in 1, 52 min, 372,000 | 1,919/1,919 in 4, 82 min, 606,000 |
+
+- **No real difference in quality.** All six passed. The one case between them came from the regex
+  goal's wording: a backslash before "a letter or digit" is an error, and the reference counts `é` as
+  a letter (as Python's `str.isalnum()` does) where Ultra's matcher read "letter" as ASCII. The goal
+  now says which.
+- **MAX cost 1.1-2.4x the time and 1.3-3x the tokens.** Its extra steps all ran: adversarial tests,
+  one head-to-head pick, and mutation testing that caught 11 of 12 planted bugs on every MAX run. The
+  critics found nothing real on either level.
+- **MAX's JSON run lost five attempts to its own adversarial test.** The test ended with
+  `sys.exit(1 if fails else 0)`, where `fails` held one `False` per passing check, so it failed every
+  candidate while printing only PASS lines. Two diagnoses in a row invented a failure and blamed the
+  script, and the engineer broke working emoji output to satisfy them. Such a test now goes back to
+  its writer without asking the model (see [How a run works](#how-a-run-works)); on all 32 saved run
+  logs, that rule would have fired exactly at this run's three broken-test attempts and nowhere else.
+- **Ultra's slower runs lost their time to wrong tests**, as before: IPv6 and regex each needed two
+  re-tests, and the regex test's own reference matcher was wrong twice (it matched `b+` against an
+  empty string).
+- **None of the six runs got a summary**, because of a change to the window's queue made during the
+  battery: the battery's window waited two minutes before switching vLLM back, and closed first. The
+  window that put vLLM on 32k now switches back at once.
 
 **On every level.**
 
@@ -444,6 +487,8 @@ two that rejected correct code, and each showed a weak spot in the pipeline, now
   they appear in its output.
 - **FAIL lines count:** an independent test that prints a line starting with `FAIL` has failed, even
   if it exits with code 0 (testers sometimes forget the exit code).
+- **No failure, said plainly:** when a test exits with an error but every check it printed passed,
+  the failure report says so, rather than leaving the diagnosis to guess from a page of PASS lines.
 
 ## How a run works
 
@@ -515,6 +560,13 @@ two that rejected correct code, and each showed a weak spot in the pipeline, now
      and must decide for good: blame the test when the goal allows the candidates' reading, or add
      a **correction to the interface**, which the engineer implements exactly and the test writers
      read too. (In the second battery a CSV run went round this loop nine times.)
+   - **A test that fails with nothing failing goes back to its writer.** When an independent test
+     exits with an error for every candidate alike while printing only PASS lines (no FAIL line, no
+     traceback, no timeout), its own bookkeeping is wrong: it goes back to its writer and the same
+     candidates are tested again, without asking the model. Asked who was wrong with no failure in
+     view, the diagnosis invented one: in the third battery a MAX run's adversarial test ended with
+     `sys.exit(1 if fails else 0)`, where `fails` held one `False` per passing check, and two
+     diagnoses in a row blamed the script for a failure that didn't exist.
    - A candidate whose answer was cut off after thinking is finished from its own notes, asking for
      at least the room its file needs. If even that doesn't fit, it stays cut off and the other
      candidates carry on; before, this could stop the run.

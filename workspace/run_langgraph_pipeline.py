@@ -1042,6 +1042,24 @@ def failure_lines(out, limit=2000):
     return head("\n".join(lines), limit)
 
 
+_PASS_LINE = re.compile(r"\s*PASS", re.IGNORECASE)
+# A summary saying nothing failed ("2 passed, 0 failed", "failures: 0") is not a failure line.
+_ZERO_FAILS = re.compile(r"\b(?:0|no)\s+(?:checks?\s+|tests?\s+)?(?:failed|failures?)\b"
+                         r"|\bfail(?:ed|ures?)?\s*[:=]\s*0\b", re.IGNORECASE)
+
+
+def passed_silently(rc, out, err):
+    """How many PASS lines a test printed when it exited with an error although nothing in its output
+    reports a failure (no FAIL line, no traceback, no timeout); 0 otherwise. Such a test decides its
+    exit code wrongly, or fails a check without printing it: set 3's json run on MAX lost four attempts
+    to sys.exit(1 if fails else 0), where fails held one False per passing check."""
+    if rc in (0, 124, 137) or rc < 0:
+        return 0
+    if any(not _ZERO_FAILS.search(ln) for ln in failure_lines(out + "\n" + err, 10 ** 6).splitlines()):
+        return 0
+    return sum(1 for ln in out.splitlines() if _PASS_LINE.match(ln))
+
+
 def run_error(res, elapsed, what, limit=None):
     """'' if the run passed, otherwise what went wrong (for the engineer)."""
     out, err, rc = res.stdout or "", res.stderr or "", res.returncode
@@ -1056,6 +1074,11 @@ def run_error(res, elapsed, what, limit=None):
     if rc != 0:
         fails = failure_lines(out)
         found = f"Lines in its output that report failures:\n{fails}\n" if fails else ""
+        passes = passed_silently(rc, out, err)
+        if passes:     # said plainly: asked who is wrong with no failure in view, a model invents one
+            found = (f"No line in its output reports a failed check and there is no traceback: all {passes} "
+                     f"checks it printed passed, yet it exited with code {rc}. So it decides its exit code "
+                     "wrongly, or it fails a check without printing it.\n")
         return (f"{what}: exit code {rc}.\n{found}STDERR:\n{tail(err, 4000)}\n"
                 f"STDOUT (tail):\n{tail(out, 1500)}")
     if "Traceback (most recent call last)" in err:
@@ -2547,7 +2570,23 @@ def indep_fail_lines(state, role):
     for c in state["candidates"]:
         if c.get("failed_test") == role:
             lines += failure_lines(c.get("tests_out", {}).get(role, (0, "", "", 0))[1] or "", 1500).splitlines()
-    return list(dict.fromkeys(s for s in (ln.strip() for ln in lines) if s and not _GENERIC_FAIL.match(s)))
+    return list(dict.fromkeys(s for s in (ln.strip() for ln in lines)
+                              if s and not _GENERIC_FAIL.match(s) and not _ZERO_FAILS.search(s)))
+
+
+def silent_test_failure(state, role):
+    """(exit code, PASS lines, candidates) when every candidate that failed an independent test got the
+    same error exit from it with nothing failing in its output; None when fewer than two did, or when
+    anything in a run (a FAIL line, a traceback, a timeout, another exit code) could be the script's
+    doing."""
+    runs = [c.get("tests_out", {}).get(role) for c in state["candidates"] if c.get("failed_test") == role]
+    if len(runs) < 2 or not all(runs):
+        return None
+    passes = [passed_silently(rc, out or "", err or "") for rc, out, err, _secs in runs]
+    codes = {run[0] for run in runs}
+    if not all(passes) or len(codes) != 1:
+        return None
+    return codes.pop(), max(passes), len(runs)
 
 
 def consensus_note(state, role="self"):
@@ -2700,29 +2739,37 @@ def diagnose_independent_failure(state):
     note, _count, _independent = consensus_note(state, role)
     if note:
         print(f"    {note.splitlines()[0]}")
-    try:
-        diagnosis, _ = llm_chat(
-            "Condenser", "You are an expert Python debugger and test reviewer. You are impartial "
-                         "between the script and its test; only the goal decides who is right.",
-            [block("What the script should do:", state["goal"]),
-             block("Spec (reviewed, but its worked examples were computed by hand; the goal wins):",
-                   state["spec"], trim=3),
-             block("Acceptance checks:", numbered(state["checks"])),
-             block("What the candidates have in common:", note),
-             block("Interface:", state["interface"]),
-             block("Script:", state["code"], trim=2, code=True, min_chars=3000),
-             block(f"{TEST_LABELS[role].capitalize()}:", test_body(state, role), trim=3, code=True, min_chars=2000),
-             block("What happened:", state["error"], trim=1, keep="tail", min_chars=1500),
-             block("Instructions:", ask)],
-            want_out=500, min_out=150, think=True)
-    except LLMError as e:
-        if not isinstance(e, ContextTooSmall):
-            raise
-        print(f"-> Condenser skipped ({short(e)}); the engineer gets the raw error.")
-        return {}
+    silent, who = silent_test_failure(state, role), "Node 1"
+    if silent:
+        # Nothing failed, yet the test failed every candidate the same way. Asked who is wrong with no
+        # failure in view, the diagnosis invents one (twice in set 3's json run on MAX).
+        rc, passes, n = silent
+        diagnosis, who = SILENT_TEST.format(n=n, test=TEST_LABELS[role], passes=passes, rc=rc), "no model call"
+    else:
+        try:
+            diagnosis, _ = llm_chat(
+                "Condenser", "You are an expert Python debugger and test reviewer. You are impartial "
+                             "between the script and its test; only the goal decides who is right.",
+                [block("What the script should do:", state["goal"]),
+                 block("Spec (reviewed, but its worked examples were computed by hand; the goal wins):",
+                       state["spec"], trim=3),
+                 block("Acceptance checks:", numbered(state["checks"])),
+                 block("What the candidates have in common:", note),
+                 block("Interface:", state["interface"]),
+                 block("Script:", state["code"], trim=2, code=True, min_chars=3000),
+                 block(f"{TEST_LABELS[role].capitalize()}:", test_body(state, role), trim=3, code=True,
+                       min_chars=2000),
+                 block("What happened:", state["error"], trim=1, keep="tail", min_chars=1500),
+                 block("Instructions:", ask)],
+                want_out=500, min_out=150, think=True)
+        except LLMError as e:
+            if not isinstance(e, ContextTooSmall):
+                raise
+            print(f"-> Condenser skipped ({short(e)}); the engineer gets the raw error.")
+            return {}
     m = re.search(r"BLAME:\s*(script|test|both)", diagnosis, re.IGNORECASE)
     blame = m.group(1).lower() if m else "script"
-    print(f"-> Diagnosis (Node 1, blame: {blame}):\n{diagnosis}")
+    print(f"-> Diagnosis ({who}, blame: {blame}):\n{diagnosis}")
     feedback = dict(state["test_feedback"])
     if blame in ("test", "both"):
         feedback[role] = diagnosis
@@ -2756,6 +2803,15 @@ STUCK_NOTE = (
     "script only if the goal clearly rules the candidates' reading out, and then add one last line: "
     "CORRECTION: <the rule the script must follow in these cases, in one sentence>. It goes into the "
     "interface, which the engineer implements exactly.")
+
+
+SILENT_TEST = (
+    "No check failed: for all {n} candidates, {test} printed only PASS lines (up to {passes}), no FAIL "
+    "line and no traceback, yet exited with code {rc}. So the test decides its exit code wrongly (for "
+    "example from a list of results that is non-empty even when every entry in it is False), or it fails "
+    "a check without printing it. Fix the test: exit 0 exactly when every check passed, and print a FAIL "
+    "line with the expected and actual values for every check that fails. Nothing shows the script is "
+    "wrong.\nBLAME: test")
 
 
 CRITIC_SYSTEM = ("You are a meticulous senior code reviewer. You look for real bugs that tests "

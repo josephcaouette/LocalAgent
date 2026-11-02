@@ -116,6 +116,12 @@ def needs_long(level):
     return config.level_settings(level)["server"] == "long"
 
 
+# The queue switches vLLM back to the normal server only after Node 1 has had no pipeline run (from this
+# window or any other) for this long, and looks again this often while it waits.
+SWITCH_BACK_QUIET_S = 120
+RECHECK_MS = 30000
+
+
 def level_summary(name):
     """One line describing an accuracy level, built from config.RUN_PROFILES."""
     p = config.level_settings(name)
@@ -343,6 +349,9 @@ class AgentControlGUI:
         self.server_hook = None
         self._server_mode = "normal"
         self._switching = False
+        self._quiet_since = None        # when Node 1 last went without any pipeline run (see _pump_queue)
+        self._long_is_mine = False      # this window put vLLM on the 32k server for its own runs
+        self._recheck_pending = False
         # Chat
         self.chat_think = tk.BooleanVar(value=False)
         self.chat_attach = tk.BooleanVar(value=False)
@@ -632,6 +641,25 @@ class AgentControlGUI:
 
     def _running_jobs(self):
         return [j for j in self.jobs if j["state"] == "RUNNING"]
+
+    def _others_running(self, running):
+        """True while a pipeline run this window didn't start (another window, a test battery, the
+        command line) is using Node 1: starting a run beside it or switching vLLM would hurt or kill it."""
+        try:
+            active = set(config.active_runs(config.get_redis(decode_responses=True, timeout=3)))
+        except Exception:
+            return False
+        return bool(active - {j.get("run_id") for j in running})
+
+    def _recheck_later(self):
+        """The queue only moves on events, so look again in a while (one pending timer at most)."""
+        if not self._recheck_pending:
+            self._recheck_pending = True
+            self.root.after(RECHECK_MS, self._recheck)
+
+    def _recheck(self):
+        self._recheck_pending = False
+        self._pump_queue()
 
     def _on_tab_changed(self, _event=None):
         if self.tabs.select() == str(self.runs_tab):
@@ -1065,14 +1093,20 @@ class AgentControlGUI:
         """Start waiting runs in order. Up to MAX_PARALLEL_RUNS share the GPU; an exclusive (High and
         above) run starts only when nothing else runs, and nothing starts beside it. Inside the Agent
         Cluster window, vLLM is switched to the 32k server before an Ultra or MAX run and back to the
-        normal one when no such run is left."""
+        normal one when no such run is left. A run another window or a test battery started holds Node 1
+        too: nothing starts beside it and the server isn't switched under it."""
         if self._switching:
             self._update_status()
             return
         running = self._running_jobs()
+        queued = any(j["state"] == "QUEUED" for j in self.jobs)
+        others = self._others_running(running) if queued or self._server_mode == "long" else False
         for job in self.jobs:
             if job["state"] != "QUEUED":
                 continue
+            if others:
+                self._recheck_later()       # wait for the other run to finish
+                break
             if any(self._exclusive(j) for j in running):
                 break
             if self._exclusive(job) and running:
@@ -1086,11 +1120,35 @@ class AgentControlGUI:
                 break
             if self._launch(job):
                 running.append(job)
-        if (self.server_hook is not None and not self._switching and self._server_mode == "long"
-                and not running and not any(j["state"] == "QUEUED" for j in self.jobs)):
-            self._switch_server("normal", None)     # nothing needs the 32k server any more
-        if (not running and not self._switching and not any(j["state"] == "QUEUED" for j in self.jobs)
-                and (self.server_hook is None or self._server_mode == "normal")):
+                self._long_is_mine = self._long_is_mine or want == "long"
+        idle_long = (self.server_hook is not None and not self._switching and self._server_mode == "long"
+                     and not running and not any(j["state"] == "QUEUED" for j in self.jobs))
+        if idle_long and others:
+            self._quiet_since = None                # someone else's run is on the 32k server
+            self._recheck_later()
+        elif idle_long:
+            # Back to the normal server: at once when this window put it on 32k for its own runs (its
+            # queue is empty and nothing else runs); otherwise once Node 1 has had no run at all for a
+            # while, because a battery or another window may start its next run seconds after the last
+            # one ends. So a window that found the 32k server running never switches in the middle of
+            # its owner's switch back: by then the normal server is already up.
+            self._quiet_since = self._quiet_since or time.time()
+            if self._long_is_mine or time.time() - self._quiet_since >= SWITCH_BACK_QUIET_S:
+                self._quiet_since = None
+                self._switch_server("normal", None)     # nothing needs the 32k server any more
+            else:
+                self._recheck_later()
+        else:
+            self._quiet_since = None
+        idle = (not running and not self._switching and not any(j["state"] == "QUEUED" for j in self.jobs)
+                and (self.server_hook is None or self._server_mode == "normal"))
+        digesting = self._digest_proc is not None and self._digest_proc.poll() is None
+        if (digesting or (idle and self._digest_due)) and (others or self._others_running(running)):
+            # Another process's run has Node 1 (a battery, another window): the summaries would compete
+            # with it for the GPU, so they wait; one in progress is simply written next time.
+            self._stop_digest()
+            self._recheck_later()
+        elif idle:
             self._maybe_digest()
         self._update_status()
 
@@ -1134,6 +1192,7 @@ class AgentControlGUI:
     def _switch_server(self, want, job):
         self._stop_digest()
         self._switching = True
+        self._long_is_mine = want == "long"
         if job is not None:
             job["phase"] = ("waiting for vLLM to switch to the 32k server (about a minute)" if want == "long"
                             else "waiting for vLLM to switch back to the normal server (about a minute)")

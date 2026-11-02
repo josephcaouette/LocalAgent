@@ -1,0 +1,68 @@
+[
+ {
+  "task": "json",
+  "level": "ultra",
+  "state": "PASSED",
+  "run_id": "20261101-193354",
+  "attempt": "2",
+  "elapsed_s": "2710",
+  "tokens_out": 298925,
+  "digest": false,
+  "check": "SCORE 1242/1242"
+ },
+ {
+  "task": "json",
+  "level": "max",
+  "state": "PASSED",
+  "run_id": "20261101-201906",
+  "attempt": "7",
+  "elapsed_s": "6532",
+  "tokens_out": 890788,
+  "digest": false,
+  "check": "SCORE 1242/1242"
+ },
+ {
+  "task": "ipv6",
+  "level": "ultra",
+  "state": "PASSED",
+  "run_id": "20261101-220800",
+  "attempt": "3",
+  "elapsed_s": "2782",
+  "tokens_out": 279098,
+  "digest": false,
+  "check": "SCORE 947/947"
+ },
+ {
+  "task": "ipv6",
+  "level": "max",
+  "state": "PASSED",
+  "run_id": "20261101-225425",
+  "attempt": "1",
+  "elapsed_s": "3137",
+  "tokens_out": 372414,
+  "digest": false,
+  "check": "SCORE 947/947"
+ },
+ {
+  "task": "regex",
+  "level": "ultra",
+  "state": "PASSED",
+  "run_id": "20261101-234645",
+  "attempt": "4",
+  "elapsed_s": "3518",
+  "tokens_out": 354438,
+  "digest": false,
+  "check": "SCORE 1918/1919\n  MISMATCH full_match('\\\\\u00e9', '\u00e9') -> ok True, expected ValueError"
+ },
+ {
+  "task": "regex",
+  "level": "max",
+  "state": "PASSED",
+  "run_id": "20261102-004526",
+  "attempt": "4",
+  "elapsed_s": "4924",
+  "tokens_out": 605731,
+  "digest": false,
+  "check": "SCORE 1919/1919"
+ }
+]

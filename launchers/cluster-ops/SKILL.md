@@ -33,7 +33,11 @@ Key paths:
 - vLLM log: `\\wsl.localhost\Ubuntu-24.04\home\moltjr\vllm_last.log`. Presets: **Fast** 16k
   context (MTP, ~104 tok/s single) and **Long context** 32k (GPU memory 0.92, no MTP; ~53 tok/s
   single, ~270 tok/s with 6 requests). The window's queue switches to 32k for Ultra/MAX runs and
-  back afterwards (~40 s each). To compare server settings: `scripts/tests/vllm_ab.py [config ...]`
+  back afterwards (~40 s each). Runs from other processes (heartbeats in `workflow:active`: another
+  window, a battery, the CLI) hold Node 1 too: the queue starts nothing beside them, doesn't switch
+  vLLM under them, and switches back from 32k only after Node 1 has had no run for
+  `SWITCH_BACK_QUIET_S` (120 s), rechecking every 30 s (`queueguard_unit.py`). So the user's window
+  can stay open during a battery. To compare server settings: `scripts/tests/vllm_ab.py [config ...]`
   (restarts vLLM per config, restores the saved settings, merges into `vllm_ab_results.json`; nothing
   else may use Node 1 meanwhile). On 32k, MTP or `--max-num-batched-tokens 4096` shrink the KV cache
   by 40-47% and run 2-4x slower with eight requests at once (2026-10-31).
@@ -56,6 +60,11 @@ Key paths:
   GPU, power or system settings yourself; the user does that.
 - To watch a long run, wait in the background (`until grep -q ... pipeline.log; do sleep 10; done`)
   rather than polling, and filter logs to state changes (see `scripts/tests/milestones.py`).
+- Line endings: the repo stores LF, and edits to files on `Z:` can come back CRLF (a whole-file
+  `git diff --stat` on Node 2). Fix on Node 2 with `sed -i 's/\r$//' FILE`. Check with Python
+  (`open(f, 'rb').read().count(b'\r')`) or `grep -c $'\r'` on Node 2: in Git Bash on Node 1,
+  `grep -c $'\r'` counts every line, so it can't tell. Run pyflakes on `Z:` files by full path
+  (`Z:/workspace/x.py`); a relative path once gave "Invalid argument".
 
 ## The pipeline in one paragraph
 
@@ -111,7 +120,33 @@ name and `BATTERY_EXTRA="--helper-think 8000"` adds pipeline flags. Results go t
 `battery_results_<set>.json` for a full battery (set 1's first run wrote `battery_results.json`);
 quick, one-off and tagged runs add a suffix (`battery_results_set2_x_one.json`); the produced
 `<task>_<level>.py` files in `Z:\workspace` must be deleted afterwards. Use it after pipeline changes
-so fixes aren't tuned to one task.
+so fixes aren't tuned to one task. `set3` (`battery3_checks.py`: a strict JSON parser, IPv6
+normalization, a regex-subset matcher; references are `json`, `ipaddress` and `re` behind thin layers
+for the goals' own rules, each call under a 1 s alarm; `python3 battery3_checks.py selfcheck`, and
+stubs in `tests/stubs3/`, where every `<task>_ok` must score in full and every `<task>_bad_*` must not)
+goes with `umax` mode: Ultra then MAX on each task, 6 runs, about 8 hours. `BATTERY_HOURS` (default 10)
+caps the wait for the queue. `scripts/tests/umax_report.py battery_results_set3_umax.json` (or run ids)
+tabulates score, attempts, minutes, tokens and which Ultra/MAX steps fired (independent and
+adversarial failures, blames, head-to-head, critic rounds, proven findings, mutation score, stuck
+notes). The battery drives a hidden window with its own queue (the user's window shows nothing),
+and puts the user's `agent_gui.pid` back at the end only if no window wrote its own meanwhile.
+
+`set4` (`battery4_checks.py`) goes with `full` mode, all five levels on each task (15 runs, roughly
+15-20 hours; use `BATTERY_HOURS=30`). Three big tasks with exact references, built to push Ultra and
+MAX apart: pyexpr (a Python-subset integer evaluator; traps: 100,000-deep nesting, million-character
+inputs, 100,000-digit literals past Python 3.11's 4,300-digit `int()` limit, and a size rule that must
+not compute 9**9**9), toml (TOML 1.0 against `tomllib`, ~460 invalid documents) and struct
+(pack/unpack/calcsize against `struct`, half and single precision rounded by hand). Every candidate
+call runs in a forked child with a time and memory limit, because an alarm can't interrupt a
+computation inside C (a huge power, a backtracking regex); the battery gives set 4's check 900 s and
+1 GB. The deep and long pyexpr cases use closed forms (`ast.parse` stops at 200 nested parentheses),
+which the selfcheck verifies at small scale. Validate changes with `python3 battery4_checks.py
+selfcheck` and `tests/stubs4/`: `python mkvariants4.py` writes the 23 `*_bad_*` variants from the
+`*_ok` stubs through their `BUG` switch, and each must lose cases (2026-11-02: all do; the ok stubs
+score 1234/1234, 1037/1037 and 1315/1315 in 12-28 s). `tests/probe4.py` records the reference
+behaviours the goals rely on: tomllib has no 64-bit limit, rejects `0x_1`, and recurses past ~900
+nested arrays (so no deep TOML cases); struct raises struct.error, not OverflowError, for a huge int
+packed as `f`, so no case depends on that.
 
 Reading results: a FAILED run whose final file still scores full marks means the pipeline rejected
 correct code, almost always a wrong hand-computed expected value in a test. Look in
@@ -130,6 +165,15 @@ or one empty record), with the diagnosis blaming the script nine times while eve
 reading the reference shares (`stuck_unit.py`: a repeat after a script blame now gets a decision
 that sticks). csv/ultra took 6 attempts because its test checked random inputs against the test
 writer's own parser, which had a new bug at each fix (the diagnosis rightly blamed the test).
+Set 3 umax (2026-11-01): all 6 passed; json and ipv6 full marks on both levels; regex Ultra 1918/1919,
+lost on goal wording alone (`\é`: "letter" read as ASCII; the goal now says Unicode counts). MAX cost
+1.1-2.4x the time and 1.3-3x the tokens; json/max lost 5 attempts to an adversarial test that exited 1
+with only PASS lines (`silent_unit.py`: such a test is now blamed without a model call; replayable
+outputs in `tests/data/silent_test_case/`). No run got a summary: the battery's window waited the
+quiet period before switching back and closed first (fixed: the window that switched to 32k switches
+back at once, `queueguard_unit.py`; battery.py also waits for the switch back). A window keeps the
+code it loaded: compare a window's start time with your edits (`Get-Process -Id N | Select StartTime`)
+before relying on a fix in it.
 
 Live checks on two saved failures (`tests/data/`): `scripts/tests/inplace_live.py [1|2]`, about a
 minute with Node 1 free. Part 1 replays the in-place fix of a wrong adversarial value (must be one

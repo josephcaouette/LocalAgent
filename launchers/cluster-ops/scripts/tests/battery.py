@@ -1,8 +1,11 @@
 """Test battery: five non-cron tasks queued through a hidden Agent Cluster window at several
 accuracy levels, then each result is checked against a reference in the sandbox.
 
-Usage: python battery.py [full|quick] [set1|set2]   (quick = Low only; set2 = the second task set)
+Usage: python battery.py [full|quick|umax] [set1|set2|set3|set4]   (quick = Low only; umax = Ultra and MAX on
+                                                    every task; set3 = three hard tasks for telling them apart;
+                                                    set4 = three big ones, full = all five levels on each)
        python battery.py one set2 TASK LEVEL        (one run; BATTERY_TAG=_x suffixes the target name)
+BATTERY_HOURS (default 10) is how long it waits for the queue before giving up.
 Results: battery_results_<set>.json next to this file for a full battery (other modes and tags add a
 suffix, e.g. battery_results_set2_x_one.json), and a table at the end of the output.
 The produced files land in Z:\\workspace as <task>_<level>.py: delete them afterwards.
@@ -74,12 +77,24 @@ GOALS = {
 }
 SET = sys.argv[2] if len(sys.argv) > 2 else "set1"
 CHECKS_FILE = "battery_checks.py"
+CHECK_TIMEOUT, CHECK_MEMORY = 300, "512m"
 TOP = [("bowling", "ultra"), ("glob", "ultra"), ("calc", "max")]
 if SET == "set2":                      # the second task set: goals live with their checkers
     sys.path.insert(0, HERE)
     import battery2_checks  # noqa: E402
     GOALS, CHECKS_FILE = battery2_checks.GOALS, "battery2_checks.py"
     TOP = [("semver", "ultra"), ("csv", "ultra"), ("justify", "max")]
+elif SET == "set3":                    # hard tasks (json, ipv6, regex), to tell Ultra and MAX apart
+    sys.path.insert(0, HERE)
+    import battery3_checks  # noqa: E402
+    GOALS, CHECKS_FILE = battery3_checks.GOALS, "battery3_checks.py"
+    TOP = [(t, lvl) for t in battery3_checks.GOALS for lvl in ("ultra", "max")]
+elif SET == "set4":                    # big tasks dense with rules (pyexpr, toml, struct), on every level
+    sys.path.insert(0, HERE)
+    import battery4_checks  # noqa: E402
+    GOALS, CHECKS_FILE = battery4_checks.GOALS, "battery4_checks.py"
+    TOP = [(t, lvl) for t in battery4_checks.GOALS for lvl in ("ultra", "max")]
+    CHECK_TIMEOUT, CHECK_MEMORY = 900, "1g"   # ~1,200 cases per task, each in its own forked child
 TASKS = list(GOALS)
 TAG = os.environ.get("BATTERY_TAG", "")                 # suffix for target names (one-off runs)
 EXTRA = os.environ.get("BATTERY_EXTRA", "").split()    # extra pipeline flags, e.g. --helper-think 8000
@@ -87,6 +102,8 @@ if MODE == "quick":
     MATRIX = [(t, "low") for t in TASKS]
 elif MODE == "one":                    # battery.py one set1 TASK LEVEL
     MATRIX = [(sys.argv[3], sys.argv[4])]
+elif MODE == "umax":                   # Ultra then MAX on each task, back to back
+    MATRIX = [(t, lvl) for t in TASKS for lvl in ("ultra", "max")]
 else:
     MATRIX = [(t, lvl) for lvl in ("low", "medium", "high") for t in TASKS] + TOP
 
@@ -147,11 +164,11 @@ def check(job):
         remote = f"/bb/runs/{job['run_id']}/final_{target}"
     else:
         return "no file"
-    cmd = (f"docker run --rm -i --network none --memory 512m -v /mnt/blackboard:/bb:ro {config.SANDBOX_IMAGE} "
-           f"timeout 300 python3 - {job['task']} {remote}")
+    cmd = (f"docker run --rm -i --network none --memory {CHECK_MEMORY} -v /mnt/blackboard:/bb:ro "
+           f"{config.SANDBOX_IMAGE} timeout {CHECK_TIMEOUT} python3 - {job['task']} {remote}")
     with open(os.path.join(HERE, CHECKS_FILE), "rb") as f:
         res = subprocess.run(["ssh", "-o", "BatchMode=yes", config.SSH_TARGET, cmd], stdin=f,
-                             capture_output=True, timeout=400)
+                             capture_output=True, timeout=CHECK_TIMEOUT + 100)
     out = res.stdout.decode("utf-8", "replace").strip()
     return out or f"checker failed: {res.stderr.decode('utf-8', 'replace')[-300:]}"
 
@@ -160,7 +177,7 @@ pump(4)
 jobs = [dispatch(t, lvl) for t, lvl in MATRIX]
 say("queued:", [(j["id"], j["task"], j["level"]) for j in jobs])
 last = None
-end = time.time() + 10 * 3600
+end = time.time() + float(os.environ.get("BATTERY_HOURS", "10")) * 3600
 while time.time() < end and (any(j["state"] in ("QUEUED", "RUNNING") for j in jobs) or ag._switching):
     pump(5)
     snap = [(j["id"], j["task"], j["level"], j["state"]) for j in jobs] + [("mode", ag._server_mode, ag._switching)]
@@ -168,7 +185,10 @@ while time.time() < end and (any(j["state"] in ("QUEUED", "RUNNING") for j in jo
         say(" ".join(f"#{i} {t}/{lvl} {st}" for i, t, lvl, st in snap[:-1]), "| mode", ag._server_mode,
             "switching" if ag._switching else "")
         last = snap
-say("all runs finished; waiting for the idle-time digests...")
+say("all runs finished; waiting for the switch back to the normal server and the idle-time digests...")
+t0 = time.time()
+while time.time() - t0 < 600 and (ag._switching or ag._server_mode == "long"):
+    pump(5)                            # the summaries start only on the normal server
 t0 = time.time()
 pump(30)
 while time.time() - t0 < 900 and ag._digest_proc is not None and ag._digest_proc.poll() is None:
@@ -193,7 +213,7 @@ with open(os.path.join(HERE, f"battery_results_{SET}{suffix}.json"), "w", encodi
     json.dump(results, f, indent=1)
 say("BATTERY DONE")
 app._remove_pid_file()
-if OLD_PID:
+if OLD_PID and not os.path.exists(cl.GUI_PID_FILE):   # a window opened meanwhile keeps its own entry
     with open(cl.GUI_PID_FILE, "w") as f:
         f.write(OLD_PID)
 root.destroy()

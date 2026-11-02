@@ -1,0 +1,13 @@
+[
+ {
+  "task": "csv",
+  "level": "ultra",
+  "state": "PASSED",
+  "run_id": "20261101-185322",
+  "attempt": "3",
+  "elapsed_s": "2146",
+  "tokens_out": 210249,
+  "digest": true,
+  "check": "SCORE 815/815"
+ }
+]
