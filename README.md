@@ -477,10 +477,67 @@ standard-library references on 947-1,919 generated cases with a one-second limit
   battery: the battery's window waited two minutes before switching vLLM back, and closed first. The
   window that put vLLM on 32k now switches back at once.
 
+**A fourth battery: bigger files, every level** (2026-11-02, same setup, 15 runs in 20 hours). To
+push Ultra and MAX apart, three tasks whose scripts run 800-900 lines, each checked against an exact
+reference on 1,037-1,315 cases, every call in its own process with time and memory limits
+(`scripts/tests/battery4_checks.py`): an evaluator for Python's integer expressions with Python's
+exact rules (precedence, chained comparisons, short-circuiting, 100,000-digit numbers, a size limit
+that must not compute `9**9**9`), a TOML 1.0 reader (against `tomllib`) and a `struct` clone (pack,
+unpack and calcsize, with half precision rounded by hand). Cases matched by the file each run kept,
+with the best of all its candidates in brackets where better (`score_candidates.py`):
+
+| | Low | Medium | High | Ultra | MAX |
+|---|---|---|---|---|---|
+| Expressions (1,234) | failed: 887 | failed: 180 (944) | failed: 0 | failed: 757 (972) | failed: **1,213** |
+| TOML (1,037) | failed: 271 (718) | failed: 697 | failed: 732 | passed: 920 | passed: **975** (1,005) |
+| struct (1,315) | failed: 658 | failed: 712 (1,140) | failed: 1,164 (1,197) | passed: **1,314** | passed: 1,298 (1,309) |
+| Time per run | 8-12 min | 19-45 min | 62-73 min | 96-194 min | 126-264 min |
+| Output tokens | 52,000-85,000 | 186,000-272,000 | 409,000-443,000 | 643,000-1.3 million | 885,000-2.0 million |
+
+- **Only the 32k levels passed anything.** On the 16k server a file this size, its failure report and
+  room to think don't fit together. The expression evaluator on High wrote 750 lines on its first
+  attempt and left `evaluate` and `_main` as placeholders that raise `NotImplementedError`. Every
+  later attempt had to send edits, and with 1,500 tokens kept for the answer, 28 of 36 edit replies
+  were cut off before one complete edit: the evaluator never got written (0 cases). struct on High
+  came closest: its code matched 1,197 cases, but its self-test held wrong hand-worked bytes (the
+  byte order of half-precision floats), and each diagnosis corrected one more until the 10 attempts
+  ran out.
+- **Ultra and MAX differ for the first time.** Neither passed the expression evaluator, but MAX's
+  file matches 1,213 of 1,234 cases, against Ultra's 757 (972 for its best candidate of 44). MAX's
+  best came on its last attempt, while Ultra's came on attempt 4 and later fixes made things worse.
+  The misses the checker shows point to one rule: MAX accepts `not` right after a comparison
+  (`1 == not 2`), which Python rejects. On TOML, MAX's file matches 975 cases against Ultra's 920:
+  its adversarial test failed the candidates on three attempts (the diagnosis blamed code and test
+  once, then the test twice), and mutation testing caught 11 of 12 planted bugs. On struct
+  it's a draw (1,314 against 1,298). MAX cost 1.1-1.8 times the output tokens and 1.1-1.5 times the
+  time.
+- **A failed run kept worse code than it had.** It saved its last attempt's code: TOML on Low kept a
+  version the static check had rejected (271) over its first attempt's (718), and the expression
+  evaluator on Medium kept 180 over 944. A failed run now keeps the candidate that got furthest (see
+  step 11 of [How a run works](#how-a-run-works)). Replayed on the 11 failed runs' logs, that keeps
+  8,913 of the 9,158 points their best candidates reach, against 7,271 before; no run loses more
+  than 11.
+- **A wrong test that no rule catches.** MAX's acceptance test for the evaluator generated random
+  expressions that Python itself rejects (`4 - not 4`) and failed every candidate the same way on
+  its last two attempts; the diagnosis blamed both the code and the test. Running a failing test
+  against a stand-in that implements nothing would show which failures don't depend on the script,
+  but a test that prints `FAIL precedence` without values would match too and get correct code
+  blamed, so the pipeline doesn't do it.
+- **Every run got its summary.** The battery's window switched vLLM back 75 seconds after the last
+  run, and Node 1 wrote all 15 summaries while the battery waited.
+- **Fixed since, each with a unit test (`bigfile_unit.py`):** a failed run keeps the candidate that
+  got furthest; a forgotten standard-library import is added rather than the candidate rejected
+  (TOML on Low lost both candidates of an attempt to `re.` calls without `import re`); placeholder
+  functions are rejected by name; and edits keep 4,000 tokens for their answer when the model thinks
+  first.
+
 **On every level.**
 
 - **Static check (pyflakes):** rejects a candidate that uses a name it never defines, a crash
-  waiting on a line the test may never reach.
+  waiting on a line the test may never reach. A forgotten standard-library import is added instead
+  (when the code uses `re.split` and every other `re.` name it uses exists in `re`), since it is
+  never a design choice. Functions that only raise `NotImplementedError` are rejected as
+  placeholders, named in the message (methods are left alone: an abstract method is normal).
 - **Repeat runs (Medium and above):** catch tests that only pass sometimes (randomness, timing, or
   leftover files).
 - **Failure lines first:** when a test fails, the lines that report failures are always shown, wherever
@@ -546,7 +603,10 @@ standard-library references on 947-1,919 generated cases with a one-second limit
      rewrite the file, in case the diagnosis is wrong.
    - When a fix's whole file can't fit in the context window (a long file on the 16k server: the
      prompt carries the previous version and the answer would need it all again), every candidate
-     sends edits instead. Before, the run stopped there with an error.
+     sends edits instead. Before, the run stopped there with an error. When it thinks first, the
+     thinking gets only what is left after 4,000 tokens for the edits themselves: with 1,500 kept,
+     a High run in the fourth battery thought through most of an 8,300-token room, and 28 of 36 edit
+     replies were cut off before one complete edit.
    - On Low and Medium, when checks fail without a crash, the diagnosis thinks briefly (up to
      3,000 tokens) before deciding whether the code or the self-test's expected value is wrong.
    - On High and above the diagnosis thinks first, sees the spec, and is told when several
@@ -583,12 +643,18 @@ standard-library references on 947-1,919 generated cases with a one-second limit
     - Node 3 summarizes it into long-term memory in the background, with the pitfalls the run
       proved by machine (corrected expected values, and checks added by critics and mutation
       testing).
+11. **On a failure:** the workspace file isn't touched. The run keeps the candidate that got
+    furthest as `final_<target>` (its own test passed, then the most independent tests passed, then
+    the largest share of its own checks), which is what **Talk about result** explains. Before, it
+    kept the last attempt's code, which can be far worse: in the fourth battery, the TOML run on Low
+    kept a version the static check had rejected (271 of 1,037 reference cases) over its first
+    attempt's (718).
 
 ### What a run leaves behind
 
 - `Z:\runs\<run>\`:
   - `pipeline.log` (everything the run printed);
-  - `final_<target>` (the winning code, or the best failed attempt);
+  - `final_<target>` (the winning code, or in a failed run the candidate that got furthest);
   - every candidate under `a<attempt>c<candidate>\`, with its independent tests, regression checks and
     probe cases;
   - on Ultra and MAX, `proofs-r<round>\` (the critics' proof tests) and, on MAX, `mut-<n>\` (the

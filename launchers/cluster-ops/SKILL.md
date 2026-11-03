@@ -105,7 +105,11 @@ new pipeline behaviour (copy the pattern in `scripts/tests/*_unit.py`). Give fak
 keyword `llm_chat`/`llm_complete` takes): a new keyword on the real function otherwise breaks every
 fake that lists them, as `think_tokens` once did. `chatroute_unit.py` skips its idle check while a
 real run is going, and `examples_unit.py` part 2 makes one live Node 1 call, so don't run the suite
-in the middle of a timing measurement. For GUI or queue changes,
+in the middle of a timing measurement. The suite's exit code catches a test that crashes, exits
+non-zero or prints `N FAILED`; most older tests only print True/False per case, so read the output
+too, and make new tests print `PASS`/`FAIL` per check, then `ALL PASS` or `N FAILED`, and
+`sys.exit(1)` on a failure (as `bigfile_unit.py` does). (Before 2026-11-02 each test's status came
+from the end of a pipe, so no unit test could fail the suite.) For GUI or queue changes,
 an end-to-end run through the window is the real test: `scripts/tests/ultra_max_e2e.py smoke`
 (Ultra, MAX and Low on small tasks; about an hour) drives a hidden ClusterWindow.
 
@@ -148,6 +152,13 @@ behaviours the goals rely on: tomllib has no 64-bit limit, rejects `0x_1`, and r
 nested arrays (so no deep TOML cases); struct raises struct.error, not OverflowError, for a huge int
 packed as `f`, so no case depends on that.
 
+A battery scores only the file each run kept. `scripts/tests/score_candidates.py <set> [-P 8]
+[--failed-only]` scores every candidate of every run in `battery_results_<set>.json` (and each
+`final_` file) with the same checker on Node 2, P containers at once (set 4's 337 files took about
+15 minutes), into `candidate_scores_<set>.json`; Node 1 isn't used. `furthest_sim.py <set>` then
+replays each run's log through the pipeline's `progress()` ranking and prints, per run, the kept
+file's score, the furthest candidate's (what a failed run now saves) and the best candidate's.
+
 Reading results: a FAILED run whose final file still scores full marks means the pipeline rejected
 correct code, almost always a wrong hand-computed expected value in a test. Look in
 `Z:\runs\<run>\pipeline.log` for the diagnosis and BLAME lines, and run a candidate's own test with
@@ -174,6 +185,20 @@ quiet period before switching back and closed first (fixed: the window that swit
 back at once, `queueguard_unit.py`; battery.py also waits for the switch back). A window keeps the
 code it loaded: compare a window's start time with your edits (`Get-Process -Id N | Select StartTime`)
 before relying on a fix in it.
+Set 4 full (2026-11-02, 20 h): every Low/Medium/High run failed and Ultra/MAX passed toml and struct;
+pyexpr failed everywhere. Kept-file scores pyexpr 887/180/0/757/1213 of 1234, toml 271/697/732/920/975
+of 1037, struct 658/712/1164/1314/1298 of 1315 (Low..MAX). First battery where Ultra and MAX differ:
+MAX's pyexpr 1213 vs Ultra's best candidate 972 (Ultra peaked on attempt 4 and regressed), toml 975 vs
+920 (MAX's adversarial test and mutation testing); struct a draw. MAX 1.1-1.8x output tokens. The 16k
+levels fail on 800-900-line files: pyexpr/high's first file had placeholder functions and edits with
+1,500 answer tokens came back empty 28 of 36 times; struct/high's self-test had wrong hand-worked
+bytes, corrected one per attempt. Fixed in `bigfile_unit.py`: a failed run keeps the furthest
+candidate (`progress()`; replayed on the 11 failures: 8,913 of the best 9,158 points vs 7,271 kept);
+missing stdlib imports added; placeholder functions rejected; edits keep 4,000 answer tokens when
+thinking. Not fixed: MAX's acceptance test generated invalid Python (`4 - not 4`) and failed every
+candidate alike for its last two attempts (diagnosis: both); a stand-in control run would misfire on
+FAIL lines without values. Fix bases still come from the latest attempt (Ultra pyexpr's regression);
+using the furthest candidate as the base is untested.
 
 Live checks on two saved failures (`tests/data/`): `scripts/tests/inplace_live.py [1|2]`, about a
 minute with Node 1 free. Part 1 replays the in-place fix of a wrong adversarial value (must be one

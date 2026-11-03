@@ -37,6 +37,7 @@ Exit code: 0 passed, 1 failed (attempts or time ran out), 2 stopped by an error.
 """
 import argparse
 import ast
+import importlib
 import json
 import os
 import re
@@ -134,6 +135,7 @@ class AgentState(TypedDict):
     retests_used: int
     indep_last: dict        # the last independent-test diagnosis: {"role", "fails", "blame", "attempt"}
     best_passed: dict       # the last version that passed, kept while the reviewer's fixes run
+    furthest: dict          # the tested candidate that got furthest; a failed run saves it as its final file
     started: float
     time_limit_s: int
     existing_code: str
@@ -496,6 +498,80 @@ def static_problems(code, filename):
         if type(m).__name__ in _UNDEFINED:
             found.append(f"line {m.lineno}: {m.message % m.message_args}")
     return found
+
+
+_NO_AUTO_IMPORT = {"antigravity", "this"}       # importing these does something
+
+
+def add_missing_imports(code, filename):
+    """Standard-library modules the code uses as `name.attr` but never imports get `import name` at the
+    top. Edits forget them (set 4's toml run on Low lost both attempt-3 candidates to `re.` calls
+    without `import re`), and a forgotten import is never a design choice. Only when every attribute
+    the code takes from that name exists in the module, so a misspelt variable that happens to share a
+    module's name (`token.type`) still gets reported. Returns (code, [names added])."""
+    try:
+        from pyflakes import checker
+        tree = ast.parse(code, filename)
+    except (ImportError, SyntaxError):
+        return code, []
+    undefined = {m.message_args[0] for m in checker.Checker(tree, filename=filename).messages
+                 if type(m).__name__ == "UndefinedName"}
+    attrs = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id in undefined:
+            attrs.setdefault(n.value.id, set()).add(n.attr)
+    names = []
+    for name in sorted(attrs):
+        if (name not in getattr(sys, "stdlib_module_names", ()) or name.startswith("_")
+                or name in _NO_AUTO_IMPORT):
+            continue
+        try:
+            module = importlib.import_module(name)
+        except Exception:
+            continue
+        if all(hasattr(module, a) for a in attrs[name]):
+            names.append(name)
+    if not names:
+        return code, []
+    # After the module docstring and any `from __future__` imports; else after leading comments.
+    body, i = tree.body, 0
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        i = 1
+    while i < len(body) and isinstance(body[i], ast.ImportFrom) and body[i].module == "__future__":
+        i += 1
+    lines = code.splitlines(keepends=True)
+    at = body[i - 1].end_lineno if i else 0
+    while not i and at < len(lines) and lines[at].lstrip().startswith("#"):
+        at += 1
+    if at and not lines[at - 1].endswith("\n"):
+        lines[at - 1] += "\n"
+    lines[at:at] = [f"import {name}\n" for name in names]
+    return "".join(lines), names
+
+
+def placeholder_functions(code):
+    """Module-level functions whose whole body (past a docstring) is `raise NotImplementedError`: a
+    file left unfinished. Set 4's pyexpr run on High kept one for nine attempts (`evaluate` and
+    `_main` were placeholders after 750 lines). Methods are left alone: an abstract method is a
+    normal design. Returns the names."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return []
+    names = []
+    for fn in tree.body:
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = fn.body
+        if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                and isinstance(body[0].value.value, str):
+            body = body[1:]
+        if len(body) == 1 and isinstance(body[0], ast.Raise) and body[0].exc is not None:
+            exc = body[0].exc.func if isinstance(body[0].exc, ast.Call) else body[0].exc
+            if isinstance(exc, ast.Name) and exc.id == "NotImplementedError":
+                names.append(fn.name)
+    return names
 
 
 # Put in front of the independent tester's code: loads the script without running its main block.
@@ -1058,6 +1134,35 @@ def passed_silently(rc, out, err):
     if any(not _ZERO_FAILS.search(ln) for ln in failure_lines(out + "\n" + err, 10 ** 6).splitlines()):
         return 0
     return sum(1 for ln in out.splitlines() if _PASS_LINE.match(ln))
+
+
+def progress(c):
+    """How far a tested candidate got, comparable across attempts: its own test passed, then how many
+    independent tests it passed, then the share of its own checks that passed. A crash, a timeout or
+    an error exit with no FAIL line counts as one more failed check: one PASS line and then a
+    traceback is not a perfect score (set 4's pyexpr run on Low)."""
+    lines = (c.get("stdout") or "").splitlines()
+    passes = sum(1 for ln in lines if _PASS_LINE.match(ln))
+    fails = sum(1 for ln in lines if re.match(r"\s*FAIL", ln, re.IGNORECASE))
+    rc = c.get("rc")
+    if rc != 0 and (not fails or rc is None or rc in (124, 137) or rc < 0
+                    or "Traceback (most recent call last)" in (c.get("stderr") or "")):
+        fails += 1
+    indep = sum(1 for run in (c.get("tests_out") or {}).values() if run[0] == 0)
+    return (rc == 0, indep, round(passes / (passes + fails), 4) if passes + fails else 0.0), passes, fails
+
+
+def furthest_so_far(state, results):
+    """The tested candidate that got furthest in the whole run; a later one wins a tie. A failed run
+    saves it as its final file: the last attempt's code can be much worse (set 4's toml run on Low
+    saved a version the static check had rejected, scoring 271/1037, over attempt 1's 718/1037)."""
+    best = dict(state.get("furthest") or {})
+    for c in results:
+        rank, passes, fails = progress(c)
+        if c.get("code") and (not best or list(rank) >= best["rank"]):
+            best = {"attempt": state["attempt"], "k": c["k"], "code": c["code"], "rank": list(rank),
+                    "passes": passes, "fails": fails}
+    return best
 
 
 def run_error(res, elapsed, what, limit=None):
@@ -1917,7 +2022,10 @@ def engineer_edits(state, system, blocks, think, n, reason="too long"):
     ask += EDIT_FORMAT.format(what="previous version")
     want_out, min_out, answer_min = 4000, 1500, 1500
     if think:
-        want_out, min_out = want_out + THINK_TOKENS, min_out + 1500
+        # Thinking gets what is left after 4,000 tokens for the edits. With only 1,500 kept, set 4's
+        # High run on a 770-line file thought for 5-7k tokens of an 8.3k room, and 28 of 36 replies
+        # were cut off before one complete edit block.
+        want_out, min_out, answer_min = want_out + THINK_TOKENS, min_out + 1500, 4000
     replies = llm_complete("Engineer, edits", system, blocks[:-1] + [block("Instructions:", ask)], want_out,
                            min_out, think=think, n=n, answer_min=answer_min, with_reasoning=True)
     out, problems = [], {}
@@ -2097,11 +2205,22 @@ def engineer_node(state):
                 cand.update(status="syntax", error=f"The file doesn't compile:\nSyntaxError on line "
                                                    f"{e.lineno}: {e.msg}\n    {(e.text or '').rstrip()}")
             else:
+                code, added = add_missing_imports(code, target)
+                if added:
+                    cand["code"] = code
+                    print(f"    Candidate {k}: added the missing import{'s' if len(added) > 1 else ''} "
+                          f"of {', '.join(added)}.")
                 problems = static_problems(code, target)
+                stubs = placeholder_functions(code)
                 if problems:
                     cand.update(status="static", error=(
                         "A static check found names that are used but never defined. Each one crashes "
                         "when its line runs, even if the test never reaches it:\n" + "\n".join(problems)))
+                elif stubs:
+                    cand.update(status="static", error=(
+                        f"Placeholder function(s) that only raise NotImplementedError: {', '.join(stubs)}. "
+                        "Every check that reaches one fails. Write them in full; a simple approach that "
+                        "works beats an unfinished clever one."))
         if cand["status"] == "coded":
             folder = cand_dir(state, attempt, k)
             os.makedirs(folder, exist_ok=True)
@@ -2369,15 +2488,16 @@ def sandbox_executor_node(state):
         if not c["exec_ok"] and c["exec_error"] and c["rc"] == 0 and c["failed_test"] in ("", "probe"):
             print("    " + c["exec_error"].splitlines()[0])
     known = dict(state["probe_verdicts"], **verdict_updates)
+    furthest = furthest_so_far(state, results)
     if any(c["exec_ok"] for c in results):
-        return {"status": "EXECUTED", "candidates": candidates, "probe_verdicts": known}
+        return {"status": "EXECUTED", "candidates": candidates, "probe_verdicts": known, "furthest": furthest}
     # Nothing passed: fix the candidate that got furthest (its own test passed, then most output).
     best = max(results, key=lambda c: (c["rc"] == 0, c["failed_test"] == "probe", len(c["stdout"])))
     kind = "indep" if best["indep_failed"] else ("differential" if best["failed_test"] == "probe" else "runtime")
     output = best["stdout"] + ("\n" + best["indep_stdout"] if best["indep_stdout"] else "")
     return fail(state, kind, best["exec_error"], code=best["code"], candidates=candidates,
                 execution_output=output, execution_stderr=best["stderr"],
-                failed_test=best["failed_test"], probe_verdicts=known)
+                failed_test=best["failed_test"], probe_verdicts=known, furthest=furthest)
 
 
 VERIFIER_SYSTEM = ("You are a strict QA reviewer. You decide whether a script's test run really "
@@ -3245,6 +3365,15 @@ def finalize_node(state):
                      execution_output=b["execution_output"], execution_stderr=b["execution_stderr"],
                      verdict=b["verdict"] + f" (A reviewer later found possible problems, but {why}, "
                                             "so this passing version was kept.)")
+    far = state.get("furthest") or {}
+    if state["status"] != "PASSED" and far and far["code"].strip() != (state["code"] or "").strip():
+        how = ("its own test passed" if far["rank"][0]
+               else f"{far['passes']} of {far['passes'] + far['fails']} of its own checks passed")
+        print(f"\n[i] Saving the candidate that got furthest as the final file (attempt {far['attempt']}, "
+              f"candidate {far['k']}: {how}), not the last attempt's code.")
+        state = dict(state, code=far["code"], verdict=(state.get("verdict") or "") + (
+            f" (The final file is attempt {far['attempt']}'s candidate {far['k']}, which got furthest: {how}. "
+            "The error shown is the last attempt's.)"))
     result_file = save_result_file(state)
     if state["status"] == "PASSED":
         dest, backup = promote(state)
@@ -3554,7 +3683,7 @@ def main(argv=None):
         "repeat_tests": profile["repeat_tests"], "interface": "", "spec": "", "tests": {},
         "test_checks": {}, "test_feedback": {}, "failed_test": "", "regression": [], "probe": "",
         "probe_verdicts": {}, "mutation_done": False, "retest": False, "retests_used": 0, "indep_last": {},
-        "best_passed": {},
+        "best_passed": {}, "furthest": {},
         "started": time.time(), "time_limit_s": profile["time_limit_s"],
         "existing_code": "", "memory_context": "", "memory_summary": "", "research_brief": "",
         "web_brief": "", "plan": "", "checks": [], "candidates": [], "winner": 0, "code": "",
