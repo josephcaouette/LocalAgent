@@ -529,6 +529,27 @@ with the best of all its candidates in brackets where better (`score_candidates.
   (TOML on Low lost both candidates of an attempt to `re.` calls without `import re`); placeholder
   functions are rejected by name; and edits keep 4,000 tokens for their answer when the model thinks
   first.
+- **Fixed since: tests meet two stand-ins, and a wrong test gets a last chance** (`standin_unit.py`,
+  `lastchance_unit.py`; see steps 4 and 7 of [How a run works](#how-a-run-works)). On MAX's two saved
+  acceptance tests the stand-in check found both generator bugs, and a third that no run had seen:
+  printing the failure of its big-number check took `repr()` of a 100,000-digit integer, past
+  Python's 4,300-digit limit (no candidate failed that check, so the crash never showed). On the 6
+  saved tests that winning candidates passed, it found nothing.
+- **Starting fixes from the furthest candidate made no measurable difference.** The three High runs
+  were repeated with `--fix-base furthest` and the fixes above. The expression evaluator rose from 0
+  to 622 (843 for its best candidate), TOML fell from 732 to 543, and struct from 1,164 to 853 (858).
+  The fix went back to an earlier version only three times, all in the struct run, so run-to-run
+  variation explains both directions; `latest` stays the default.
+- **Most fixes on the 16k server never reached a test.** Of the re-run's 120 candidate slots, 32 were
+  fix replies with an edit that matched nowhere and 38 came back without any edit; 33 candidates were
+  tested. Replaying one fix request live (`edits_live.py`) showed both kinds. With the 680-line file
+  filling most of the window, the model had about 1,300 tokens to think, kept reasoning in the answer
+  and ran out of room before its first edit. Or it replaced a whole 100-line function and its copy of
+  the function differed from the file in two comment lines. And an attempt where nothing applied
+  passed on only "your edits couldn't be applied", so the next one didn't know what it was fixing.
+  All three are fixed (`editmatch_unit.py`, with the two saved replies): on the replayed request 3 of
+  4 replies now apply, against 0 of 4 before. Failed replies are now kept in `model_reply.txt`; they
+  used to be saved empty.
 
 **On every level.**
 
@@ -573,6 +594,13 @@ with the best of all its candidates in brackets where better (`score_candidates.
      a script: no `--test` mode, or only bare values (a plan in JSON compiles as Python too).
    - At the same time: the tester writes `acceptance_test.py` (High and above), the adversary writes
      `adversarial_test.py` (MAX), and the prober writes `probe_cases.py` (Ultra and MAX).
+   - **Stand-in check:** each new or revised independent test first runs against two stand-ins for
+     the script that implement nothing and answer differently: one is truthy and equal to
+     everything, the other falsy and equal to nothing. A failure the test reports the same way
+     against both (a FAIL line with the same value, or the same crash in its own code) can't come
+     from the script's answer, so it goes back to the writer, up to twice, before any candidate is
+     blamed. Checks that expect an exception, or that run the script as a program, are left out:
+     neither stand-in raises or prints anything a test looks for.
    - Meanwhile, Node 2 starts one test container per candidate.
 5. **Testing:** each candidate runs in its own container on Node 2:
    - its own `python3 <file> --test`, then each independent test and the kept regression checks, then
@@ -591,7 +619,9 @@ with the best of all its candidates in brackets where better (`score_candidates.
    own test, or an independent test is wrong) and the engineer tries again. Lines that report
    failures are always shown to it, wherever they appear in the output. If only an independent
    test was wrong, its writer fixes it and the **same candidates are tested again** without being
-   rewritten (up to 3 times per run).
+   rewritten (up to 3 times per run). That holds after the last attempt too: when the attempts run
+   out with time left and the candidates failed only an independent test, the failure still gets one
+   diagnosis, and if it blames the test alone, the test is fixed and the same code tested once more.
    - The writer fixes a wrong test **in place**: small search-and-replace edits to just the
      disputed checks, so the checks that already passed can't change. (Rewriting the whole test
      re-rolled every hand-computed value: in the battery below, a MAX run fixed its adversarial test
@@ -605,7 +635,14 @@ with the best of all its candidates in brackets where better (`score_candidates.
      sends edits instead. Before, the run stopped there with an error. When it thinks first, the
      thinking gets only what is left after 4,000 tokens for the edits themselves: with 1,500 kept,
      a High run in the fourth battery thought through most of an 8,300-token room, and 28 of 36 edit
-     replies were cut off before one complete edit.
+     replies were cut off before one complete edit. A reply that still runs out of room while
+     thinking is finished from its own notes, without thinking again. A SEARCH part that matches
+     nowhere exactly is used where it can only mean one place: the same lines once indentation and
+     spacing are ignored (the replacement is re-indented to fit), or, for 3 lines or more, the one
+     place between matching first and last lines where at most 1 line in 10 differs. Models retype a
+     little when they copy a long passage: a fix that replaced a whole 100-line function failed
+     because its copy wrote `i.e.,` for `i.e.` in a comment. When no candidate of an attempt can be
+     tested, the next attempt is still told the failure it was fixing.
    - On Low and Medium, when checks fail without a crash, the diagnosis thinks briefly (up to
      3,000 tokens) before deciding whether the code or the self-test's expected value is wrong.
    - On High and above the diagnosis thinks first, sees the spec, and is told when several
@@ -679,11 +716,13 @@ python run_langgraph_pipeline.py --goal="..." [--target=name.py] [--attach=path 
 experiments; normally they use the level's budget. Raising it to 8,000 on MAX didn't reduce the
 wrong expected values in tests (see the five-task battery above).
 
-`--fix-base furthest` (being tested; `latest` is the default) starts each fix from the candidate that
+`--fix-base furthest` (experimental; `latest` is the default) starts each fix from the candidate that
 got furthest in the whole run, rather than from the best of the attempt that just failed, and tells
 the engineer what the worse attempt tried. It returns to the same version at most twice. In the
 fourth battery, the expression evaluator on Ultra peaked on attempt 4 (972 of 1,234 reference cases),
-and its later fixes, each built on the attempt before, ended at 757.
+and its later fixes, each built on the attempt before, ended at 757. Repeating the battery's three
+High runs with it settled nothing: it went back only three times, in a run where most fixes failed to
+apply for other reasons (since fixed). Ultra, where the slide happened, is the place to try it next.
 
 ## Web research
 

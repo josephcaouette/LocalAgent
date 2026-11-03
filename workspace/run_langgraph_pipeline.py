@@ -37,6 +37,7 @@ Exit code: 0 passed, 1 failed (attempts or time ran out), 2 stopped by an error.
 """
 import argparse
 import ast
+import difflib
 import importlib
 import json
 import os
@@ -133,6 +134,7 @@ class AgentState(TypedDict):
     mutation_done: bool
     retest: bool            # the diagnosis blamed only the test: fix it and re-test the same code
     retests_used: int
+    last_chance_used: bool  # the one diagnosis allowed after the last attempt (see last_chance)
     indep_last: dict        # the last independent-test diagnosis: {"role", "fails", "blame", "attempt"}
     best_passed: dict       # the last version that passed, kept while the reviewer's fixes run
     furthest: dict          # the tested candidate that got furthest; a failed run saves it as its final file
@@ -1748,16 +1750,63 @@ def setup_note():
             "subprocess.CompletedProcess with text stdout and stderr. Don't repeat that setup.\n")
 
 
+PROBLEM_MARK = "\n\nThe problem you were fixing:\n"
 EDIT_BLOCK = re.compile(r"^<{7} ?SEARCH[ \t]*\n(.*?)^={7}[ \t]*\n(.*?)^>{7} ?REPLACE[ \t]*$", re.S | re.M)
 EDIT_FORMAT = ("Reply with only edits in this format, one block per change. Copy the SEARCH lines exactly from "
                "the {what}, with enough lines to be unique; leave the part after ======= empty to delete them.\n"
                "<<<<<<< SEARCH\n<lines copied from the {what}>\n=======\n<replacement lines>\n>>>>>>> REPLACE")
 
 
+def _spaced(line):
+    return " ".join(line.split())
+
+
+def loose_place(lines, want):
+    """Where a SEARCH part that matches nowhere exactly was meant to go: (start, end, indentation
+    shift for the replacement), or None when that isn't certain. First the one place with the same
+    lines once indentation and spacing are ignored; then, for a part of 3 or more lines, the one place
+    between matching first and last lines, about as long, where nearly all lines are the same (at
+    most 1 in 10 different). Models retype a little when they copy a long passage: in set 4's High
+    re-run, fixes that replaced a whole 100-line function failed because two comment lines in the
+    copy differed ("i.e.," for "i.e.", "(p - 1)" for "(p-1)")."""
+    keep = [i for i, ln in enumerate(want) if ln.strip()]
+    if not keep:
+        return None
+    want = want[keep[0]:keep[-1] + 1]
+    w, have = [_spaced(ln) for ln in want], [_spaced(ln) for ln in lines]
+    n = len(w)
+
+    def shift(i):
+        return (len(lines[i]) - len(lines[i].lstrip())) - (len(want[0]) - len(want[0].lstrip()))
+    same = [i for i in range(len(lines) - n + 1) if have[i:i + n] == w]
+    if len(same) == 1:
+        return same[0], same[0] + n, shift(same[0])
+    if same or n < 3:
+        return None
+    slack = max(2, n // 10)
+    places = [(i, j) for i in range(len(lines)) if have[i] == w[0]
+              for j in range(max(i + 1, i + n - 1 - slack), min(len(lines), i + n + slack)) if have[j] == w[-1]
+              if difflib.SequenceMatcher(None, w, have[i:j + 1], autojunk=False).ratio() >= 0.9]
+    if len(places) != 1:
+        return None
+    i, j = places[0]
+    return i, j + 1, shift(i)
+
+
+def reindent(lines, shift):
+    """Move lines right (shift > 0) or left by shift spaces, keeping blank lines blank."""
+    if shift > 0:
+        return [" " * shift + ln if ln.strip() else ln for ln in lines]
+    if shift < 0:
+        return [ln[min(-shift, len(ln) - len(ln.lstrip(" "))):] for ln in lines]
+    return lines
+
+
 def apply_edits(text, reply):
     """Apply the SEARCH/REPLACE blocks in a reply to text: (new text, edits applied, problem).
     Each SEARCH part must match exactly one place: whole lines (ignoring trailing spaces), or
-    failing that, one exact piece of text."""
+    failing that, one exact piece of text, or failing that, the one place loose_place finds (the
+    replacement is then re-indented by the difference)."""
     edits = EDIT_BLOCK.findall(reply)
     if not edits:
         return text, 0, "came back without any edit blocks"
@@ -1773,9 +1822,15 @@ def apply_edits(text, reply):
             text = "\n".join(lines)
             continue
         count = len(hits) or text.count(search)
-        if count != 1:
+        if count == 1:
+            text = text.replace(search, replace, 1)
+            continue
+        place = loose_place(lines, want) if count == 0 else None
+        if not place:
             return text, 0, f"has an edit that matches {count} places"
-        text = text.replace(search, replace, 1)
+        start, end, shift = place
+        lines[start:end] = reindent(replace.split("\n"), shift) if replace else []
+        text = "\n".join(lines)
     return text, len(edits), ""
 
 
@@ -1864,7 +1919,7 @@ def write_test(state, role="acceptance"):
     if state["tests"].get(role) and state["test_feedback"].get(role):
         fixed = fix_test_in_place(state, role, system, blocks)
         if fixed:
-            return fixed
+            return standin_review(state, role, system, blocks, fixed)
     if state["tests"].get(role):
         update = "Update this test so it covers every acceptance check above. Keep the parts that are right."
         feedback = state["test_feedback"].get(role, "")
@@ -1905,7 +1960,7 @@ def write_test(state, role="acceptance"):
         if problem:
             print(f"    [!] {name}: the test {problem}; skipping it this attempt.")
             return ""
-    return full
+    return standin_review(state, role, system, blocks, full)
 
 
 def test_problem(target, role, code):
@@ -1921,6 +1976,257 @@ def test_problem(target, role, code):
         first = re.sub(r"line (\d+)", lambda m: f"line {int(m.group(1)) - shift}", problems[0], count=1)
         return full, f"uses a name it never defines ({first})"
     return full, ""
+
+
+STANDIN_CHECK = True        # run each new or revised independent test against two stand-ins first
+
+# A stand-in for the script that implements nothing: every name is a class whose call returns a
+# placeholder, so a test runs to its end against it. Stand-in A's placeholder is truthy and equal to
+# everything, B's falsy and equal to nothing; as a program, A prints one line and exits 0, B another
+# and exits 3. A check that prints the same FAIL line against both never depended on the answer.
+STANDIN = '''"""Stand-in @NAME@ for the script under test: it implements nothing (added by the pipeline)."""
+import sys
+
+TRUTHY = @TRUTHY@
+
+
+class StandInValue@NAME@:
+    def __repr__(self):
+        return "<stand-in @NAME@ value>"
+
+    __str__ = __repr__
+
+    def __eq__(self, other):
+        return TRUTHY
+
+    def __ne__(self, other):
+        return not TRUTHY
+
+    __lt__ = __le__ = __gt__ = __ge__ = __contains__ = __eq__
+
+    def __hash__(self):
+        return @INT@
+
+    def __bool__(self):
+        return TRUTHY
+
+    def __len__(self):
+        return @LEN@
+
+    def __int__(self):
+        return @INT@
+
+    def __float__(self):
+        return @FLOAT@
+
+    def __iter__(self):
+        return iter([self] if TRUTHY else [])
+
+    def _same(self, *args, **kwargs):
+        return self
+
+    __call__ = __getitem__ = __add__ = __radd__ = __sub__ = __rsub__ = __mul__ = __rmul__ = _same
+    __truediv__ = __rtruediv__ = __floordiv__ = __rfloordiv__ = __mod__ = __rmod__ = _same
+    __pow__ = __rpow__ = __neg__ = __pos__ = __abs__ = __invert__ = _same
+    __and__ = __rand__ = __or__ = __ror__ = __xor__ = __rxor__ = __lshift__ = __rshift__ = _same
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return self
+
+
+class _StandInClass(type):
+    def __call__(cls, *args, **kwargs):
+        sys.__stdout__.write("@@stand-in call@@\\n")
+        sys.__stdout__.flush()
+        return StandInValue@NAME@()
+
+    def __getattr__(cls, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return StandInValue@NAME@()
+
+
+def __getattr__(name):
+    if name.startswith("__") and name.endswith("__"):
+        raise AttributeError(name)
+    # an error class of every common kind, so a check like issubclass(CycleError, ValueError) passes
+    return _StandInClass("StandIn@NAME@_" + name, (ValueError, TypeError, KeyError, IndexError,
+                                                   ZeroDivisionError, RuntimeError), {})
+
+
+if __name__ == "__main__":
+    print("<stand-in @NAME@ output>")
+    sys.stderr.write("<stand-in @NAME@ output>\\n")
+    sys.exit(@EXIT@)
+'''
+# truthy, int, len, float, exit code: as different as possible, so derived values differ too
+_STANDINS = {"A": ("True", "17", "17", "float('nan')", "0"), "B": ("False", "-42", "42", "float('-inf')", "3")}
+# Put in front of the test: marks each run of the script as a program in the test's own output. What a
+# check reads from such a run (its output) is the same nothing for both stand-ins, so the FAIL lines
+# that follow, up to the script's next call, are left out.
+STANDIN_PRELUDE = '''# --- stand-in check (added by the pipeline): mark each run of the script as a program ---
+import subprocess as _si_sp
+import sys as _si_sys
+
+_si_init = _si_sp.Popen.__init__
+
+
+def _si_marked(self, args, *rest, **kwargs):
+    if "@TARGET@" in str(args):
+        _si_sys.__stdout__.write("@@stand-in program@@\\n")
+        _si_sys.__stdout__.flush()
+    _si_init(self, args, *rest, **kwargs)
+
+
+_si_sp.Popen.__init__ = _si_marked
+'''
+_GOT = re.compile(r"\bgot\b", re.IGNORECASE)
+_STANDIN_MENTION = re.compile(r"stand-?in", re.IGNORECASE)
+# "expected ValueError, got no exception": an exception check; neither stand-in raises, a script may.
+_EXPECTS_ERROR = re.compile(r"\bexpected\W{0,3}[A-Z]\w*(?:Error|Exception|Exit)\b")
+
+
+def standin_code(name):
+    truthy, integer, length, real, code = _STANDINS[name]
+    return (STANDIN.replace("@NAME@", name).replace("@TRUTHY@", truthy).replace("@INT@", integer)
+            .replace("@LEN@", length).replace("@FLOAT@", real).replace("@EXIT@", code))
+
+
+def standin_runs(state, role, full):
+    """The test's merged, unbuffered output against stand-ins A and B, each in its own box."""
+    test_name = TEST_FILES[role]
+
+    def one(name):
+        box = f"standin-{role}-a{state['attempt']}-{name.lower()}"
+        folder = box_dir(state, box)
+        os.makedirs(folder, exist_ok=True)
+        prelude = STANDIN_PRELUDE.replace("@TARGET@", state["target_file"])
+        for fname, text in ((state["target_file"], standin_code(name)), (test_name, prelude + full)):
+            with open(os.path.join(folder, fname), "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        try:
+            res = run_in_box(state, box, ["timeout", "-k", "3", str(test_timeout(state)), "sh", "-c",
+                                          f"python3 -u /work/{test_name} 2>&1"])
+            return res.stdout or ""
+        except subprocess.TimeoutExpired:
+            return ""
+        finally:
+            remove_boxes(state, [box])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        return tuple(pool.map(one, ["A", "B"]))
+
+
+def crash_point(out, target):
+    """'<innermost frame> | <exception line>' for a test that died with a traceback, else ''. A crash
+    inside the stand-in itself (the script's file) doesn't count: the stand-in caused it."""
+    i = out.rfind("Traceback (most recent call last):")
+    if i < 0:
+        return ""
+    lines = [ln for ln in out[i:].splitlines() if ln.strip()]
+    frames = [ln.strip() for ln in lines if ln.strip().startswith('File "')]
+    if not frames or f"/work/{target}" in frames[-1]:
+        return ""
+    return f"{frames[-1]} | {lines[-1].strip()}"
+
+
+def _standin_fails(out):
+    """A stand-in run's FAIL lines, leaving out those printed after a run of the script as a program
+    and before its next call (see STANDIN_PRELUDE)."""
+    fails, after_program = [], False
+    for ln in out.splitlines():
+        s = ln.strip()
+        if s == "@@stand-in program@@":
+            after_program = True
+        elif s == "@@stand-in call@@":
+            after_program = False
+        elif re.match(r"FAIL", s, re.IGNORECASE) and not after_program:
+            fails.append(s)
+    return fails
+
+
+def standin_findings(out_a, out_b, target):
+    """What the test reports the same way against both stand-ins: FAIL lines with a got-value that
+    don't mention a stand-in and don't expect an exception, and a crash in the test's own code. Such a
+    result can't come from the script's answer (set 4's MAX acceptance test fed Python's eval
+    expressions its generator made invalid, and its generator once recursed without end)."""
+    fails_b = set(_standin_fails(out_b))
+    found = []
+    for ln in _standin_fails(out_a):
+        if (ln in fails_b and _GOT.search(ln) and not _STANDIN_MENTION.search(ln)
+                and not _EXPECTS_ERROR.search(ln) and ln not in found):
+            found.append(ln)
+    crash = crash_point(out_a, target)
+    if (crash and crash == crash_point(out_b, target) and not _STANDIN_MENTION.search(crash)
+            and "AssertionError" not in crash):
+        found.append(f"(the test itself crashed: {crash})")
+    return found
+
+
+def repair_standin(state, role, system, blocks, full, found):
+    """One request to fix the checks the stand-ins showed up, as edits. Returns the test or ''."""
+    target, name = state["target_file"], ROLE_NAMES[role]
+    old = full[len(test_header(target)):]
+    ask = ("Your test was run against two stand-ins for the script. Both implement nothing and answer "
+           "differently: one says yes to everything and equals everything, the other says no and equals "
+           "nothing. These results came out exactly the same both times, so they don't depend on the "
+           "script's answer:\n" + "\n".join(found[:12]) + "\n"
+           "Usually the test's own input generator makes inputs its reference rejects, or its reference "
+           "fails or crashes. Fix exactly those checks: an input your reference rejects is invalid, so "
+           "expect the script to reject it the way the goal says, or skip it. Keep any that really do "
+           "depend on the script, and change nothing else.\n" + EDIT_FORMAT.format(what="test"))
+    try:
+        raw, finish = llm_chat(name, system, blocks + [
+            block("Your test:", old, trim=2, code=True, min_chars=4000), block("Task:", ask)],
+            want_out=2500, min_out=600, temperature=0.2)
+    except ContextTooSmall:
+        return ""
+    new, n, problem = apply_edits(old, raw) if finish != "length" else (old, 0, "was cut off")
+    if not problem and new.strip() == old.strip():
+        problem = "changed nothing"
+    fixed = ""
+    if not problem:
+        fixed, problem = test_problem(target, role, new)
+    if problem:
+        print(f"    [i] {name}: the fix for the stand-in findings {problem}.")
+        return ""
+    print(f"    {name}: fixed {n} place{'' if n == 1 else 's'} the stand-ins showed up.")
+    return fixed
+
+
+def standin_review(state, role, system, blocks, full):
+    """Run a new or revised test against the two stand-ins before any candidate meets it. What it
+    reports the same way against both goes back to its writer once; whatever is left is noted at the
+    end of the test, where the diagnosis and the writer's next revision see it."""
+    if not STANDIN_CHECK or not full:
+        return full
+    name = ROLE_NAMES[role]
+
+    def findings(test):
+        try:
+            return standin_findings(*standin_runs(state, role, test), state["target_file"])
+        except Exception as e:          # never let the check cost the test
+            print(f"    [i] {name}: the stand-in check couldn't run ({short(e)}).")
+            return []
+    found = findings(full)
+    for _ in range(2):              # twice: a fixed crash can uncover what it hid (set 4's MAX test)
+        if not found:
+            return full
+        print(f"    [i] {name}: {len(found)} result(s) came out the same against two stand-ins that answer "
+              f"differently, e.g. {found[0][:150]}; asking for a fix.")
+        fixed = repair_standin(state, role, system, blocks, full, found)
+        if not fixed:
+            break
+        full, found = fixed, findings(fixed)
+    if not found:
+        return full
+    print(f"    [i] {name}: {len(found)} still do; the test keeps a note for the diagnosis.")
+    note = ("\n\n# --- stand-in check (added by the pipeline) ---\n# These results came out exactly the same "
+            "against two stand-ins for the script that implement nothing and answer differently,\n# so they "
+            "don't depend on the script's answer (the test's input generator or reference may be wrong):\n"
+            + "\n".join("# " + ln[:300] for ln in found[:12]) + "\n")
+    return full.rstrip() + note
 
 
 PROBE_FILE = "probe_cases.py"
@@ -2034,6 +2340,31 @@ def engineer_edits(state, system, blocks, think, n, reason="too long"):
         want_out, min_out, answer_min = want_out + THINK_TOKENS, min_out + 1500, 4000
     replies = llm_complete("Engineer, edits", system, blocks[:-1] + [block("Instructions:", ask)], want_out,
                            min_out, think=think, n=n, answer_min=answer_min, with_reasoning=True)
+    cut = [i for i, (raw, finish, _notes) in enumerate(replies)
+           if think and finish == "length" and not EDIT_BLOCK.search(raw)]
+    if cut:
+        # A big file in a small window leaves little thinking room, and thinking that runs past its
+        # budget carries on in the answer: in set 4's High re-run (16k, a 680-line file, about 1,300
+        # tokens of thinking) such replies used all 4,000 answer tokens without one edit block. As
+        # the engineer does for whole files, finish them from their own notes without thinking again.
+        print(f"    [i] {len(cut)} of {len(replies)} edit replies ran out of room while still thinking; "
+              "finishing them from their own notes, without thinking again.")
+
+        def finish_one(i):
+            raw, _finish, notes = replies[i]
+            if raw:
+                notes += "\n\n(Then, in the answer, which was cut off:)\n" + raw
+            try:
+                return llm_complete("Engineer, edits", system, blocks[:-1] + [
+                    block("Your notes from thinking this through (cut short). Don't think again: write the "
+                          "edits now.", notes, trim=2, keep="tail", min_chars=2000),
+                    block("Instructions:", ask)], 4000, 1500, think=False, with_reasoning=True)[0]
+            except ContextTooSmall as e:
+                print(f"    [i] Edit reply {i + 1} can't be finished from its notes ({short(e)}).")
+                return replies[i]
+        with ThreadPoolExecutor(max_workers=len(cut)) as pool:   # not _llm_pool: this can run inside it
+            for i, reply in zip(cut, list(pool.map(finish_one, cut))):
+                replies[i] = reply
     out, problems = [], {}
     for k, (raw, _finish, notes) in enumerate(replies, 1):
         code, count, problem = apply_edits(state["code"], raw)   # a cut-off reply keeps its complete edits
@@ -2041,7 +2372,7 @@ def engineer_edits(state, system, blocks, think, n, reason="too long"):
             problem = "changed nothing"
         if problem:
             problems[k] = problem
-            out.append(("", "stop", notes))
+            out.append((raw, "stop", notes))        # kept in the candidate's model_reply.txt
         else:
             print(f"    Candidate {k}: {count} edit{'' if count == 1 else 's'} to the previous version.")
             out.append((f"{TICK3}python\n{code}\n{TICK3}", "stop", notes))
@@ -2190,7 +2521,7 @@ def engineer_node(state):
         code, _ = extract_code(raw)
         cand = {"k": k, "code": code, "status": "coded", "error": "", "independent": diverse}
         if k in edit_problems:
-            cand.update(status="no_code", error=(
+            cand.update(status="no_code", code="", error=(
                 f"Your edits to the previous version couldn't be applied: the reply {edit_problems[k]}. "
                 "Copy each SEARCH part exactly from the previous version, with enough lines to be unique."))
         elif finish == "length":
@@ -2272,8 +2603,11 @@ def engineer_node(state):
         discard_containers(state, attempt, n)
         first = candidates[0]
         msg = first["error"]
-        if first["status"] == "truncated" and state["error"]:
-            msg += "\n\nThe problem you were fixing:\n" + tail(state["error"], 3000)
+        if state["error"]:
+            # No candidate could be tested, so nothing new was learned about the code: keep what the fix
+            # was for. (In set 4's High re-run, two attempts in a row were told only that their edits
+            # couldn't be applied, and had to guess what to fix.)
+            msg += PROBLEM_MARK + tail(state["error"].split(PROBLEM_MARK)[-1], 3000)
         return fail(state, first["status"], msg, candidates=candidates,
                     code=first["code"] if first["status"] in ("syntax", "static") else state["code"], **updates)
     return {"candidates": candidates, "status": "CODED", "error": "", "failure_kind": "", **updates}
@@ -2752,6 +3086,12 @@ def consensus_note(state, role="self"):
 def error_condenser_node(state):
     raw_error = state["error"]
     indep = state["failure_kind"] == "indep" and bool(state["tests"].get(state["failed_test"]))
+    if out_of_budget(state):
+        # Only reached through last_chance(): no attempts left, but a wrong test needs no new code.
+        print(f"\n[i] No attempts left, but the candidates passed their own tests and only "
+              f"{TEST_LABELS.get(state['failed_test'], 'an independent test')} failed: one more diagnosis, "
+              "in case the test alone is wrong.")
+        return dict(diagnose_independent_failure(state) if indep else {}, last_chance_used=True)
     if indep:
         return diagnose_independent_failure(state)
     if state["judges"] > 1 and state["failure_kind"] == "runtime":
@@ -3509,10 +3849,22 @@ def route_after_engineer(state):
     return "finalize" if out_of_budget(state) else "engineer"
 
 
+def last_chance(state):
+    """The attempts are used up, but time is left and the candidates got past their own tests: only an
+    independent test failed. A wrong test needs no new code, so it gets one more diagnosis, and if
+    that blames the test alone, one re-test of the same code. Set 4's expression evaluator on MAX
+    ended this way: on its 16th and last attempt, four candidates that had passed their own tests
+    failed only because the acceptance test's generator wrote expressions Python itself rejects."""
+    return (state["attempt"] > state["max_attempts"]
+            and time.time() - state["started"] <= state["time_limit_s"]
+            and state["failure_kind"] == "indep" and not state.get("last_chance_used")
+            and state["retests_used"] < MAX_RETESTS)
+
+
 def route_after_executor(state):
     if state["status"] == "EXECUTED":
         return "verifier"
-    return "finalize" if out_of_budget(state) else "condenser"
+    return "condenser" if not out_of_budget(state) or last_chance(state) else "finalize"
 
 
 def _after_pass(state):
@@ -3538,7 +3890,9 @@ def route_after_mutation(state):
 
 
 def route_after_condenser(state):
-    return "retest" if state["retest"] else "engineer"
+    if state["retest"]:
+        return "retest"
+    return "finalize" if out_of_budget(state) else "engineer"     # (after a last-chance diagnosis)
 
 
 def route_after_retest(state):
@@ -3597,7 +3951,7 @@ def build_graph():
     g.add_conditional_edges("verifier", route_after_verifier, ["finalize", "engineer", "critic", "mutation"])
     g.add_conditional_edges("critic", route_after_critic, ["engineer", "finalize", "mutation"])
     g.add_conditional_edges("mutation", route_after_mutation, ["engineer", "finalize"])
-    g.add_conditional_edges("condenser", route_after_condenser, ["retest", "engineer"])
+    g.add_conditional_edges("condenser", route_after_condenser, ["retest", "engineer", "finalize"])
     g.add_conditional_edges("retest", route_after_retest, ["verifier", "condenser", "engineer", "finalize"])
     g.add_edge("finalize", END)
     return g.compile()
@@ -3714,6 +4068,7 @@ def main(argv=None):
         "repeat_tests": profile["repeat_tests"], "interface": "", "spec": "", "tests": {},
         "test_checks": {}, "test_feedback": {}, "failed_test": "", "regression": [], "probe": "",
         "probe_verdicts": {}, "mutation_done": False, "retest": False, "retests_used": 0, "indep_last": {},
+        "last_chance_used": False,
         "best_passed": {}, "furthest": {},
         "started": time.time(), "time_limit_s": profile["time_limit_s"],
         "existing_code": "", "memory_context": "", "memory_summary": "", "research_brief": "",

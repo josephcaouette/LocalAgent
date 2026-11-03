@@ -18,6 +18,7 @@ def fake_chat(label, system, blocks, want_out, min_out, temperature=None, think=
 
 
 p.llm_chat = fake_chat
+p.STANDIN_CHECK = False        # the stand-in check has its own test (standin_unit.py)
 state = {"target_file": "f.py", "goal": "g", "spec": "", "checks": ["c"], "interface": "f()", "tests": {},
          "test_feedback": {}, "test_checks": {}, "lvl": config.level_settings("high"), "allow_network": False}
 full = p.write_test(state, "acceptance")

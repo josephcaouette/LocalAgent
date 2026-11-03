@@ -82,7 +82,7 @@ if "2" in PARTS:
     code = open(os.path.join(folder, "glob_low.py"), encoding="utf-8").read()
     res = sandbox({"glob_low.py": code}, "python3 /work/glob_low.py --test")
     err = p.run_error(res, 0.5, "Its own test (python3 glob_low.py --test)")
-    state = {"attempt": 3, "max_attempts": 3, "judges": 1, "failure_kind": "runtime", "goal": rec["goal"],
+    state = {"attempt": 3, "max_attempts": 3, "started": time.time(), "time_limit_s": 3600, "judges": 1, "failure_kind": "runtime", "goal": rec["goal"],
              "spec": "", "checks": [], "code": code, "tests": {}, "failed_test": "self", "error": err,
              "candidates": [{"k": 1, "rc": 1, "failed_test": "self", "independent": False, "stdout": res.stdout}],
              "lvl": config.level_settings("low"), "run_id": "inplace-live", "task_key": "inplace-live"}

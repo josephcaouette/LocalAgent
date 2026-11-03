@@ -1,0 +1,211 @@
+<<<<<<< SEARCH
+def _double_to_mantissa_exp(x: float):
+    m, e = x.as_integer_ratio()
+    sign = m < 0
+    m = abs(m)
+    # m is an integer; e is the exponent such that x = m * 2**e.
+    return m, e, sign
+
+
+def _round_to_target(m: int, e: int, spec: dict):
+    p = spec["precision"]
+    # We want to represent x = m * 2**e as a p-bit significand.
+    # Find the position of the LSB of the target significand.
+    # The target significand (for a normal number) has its MSB at bit (p-1).
+    # The value x has its MSB at bit (m.bit_length() - 1 + e).
+    msb_pos = m.bit_length() - 1 + e
+    # The target LSB is at bit (msb_pos - (p - 1)).
+    lsb_pos = msb_pos - (p - 1)
+    # Scale m so that its LSB aligns with lsb_pos.
+    # scaled = m * 2**(e - lsb_pos) = m * 2**(e - msb_pos + p - 1)
+    shift = e - lsb_pos
+    if shift >= 0:
+        scaled = m << shift
+        rem = 0
+    else:
+        s = -shift
+        scaled = m >> s
+        rem = m & ((1 << s) - 1)
+
+    # Round to nearest, ties to even.
+    if rem:
+        half = 1 << (s - 1)
+        if rem > half:
+            scaled += 1
+        elif rem == half:
+            if scaled & 1:
+                scaled += 1
+        # rem < half: round down
+    else:
+        # No remainder: exact.
+        pass
+
+    # Carry check.
+    if scaled >= (1 << p):
+        scaled >>= 1
+        lsb_pos += 1
+
+    # Determine exponent for the target.
+    # For a normal number, the exponent is such that the MSB of the significand
+    # is at bit (p-1), i.e. the value is significand * 2**(lsb_pos - (p-1)).
+    target_exp = lsb_pos - (p - 1)
+
+    if scaled == 0:
+        return 0, 0
+
+    if scaled < (1 << (p - 1)):
+        # Subnormal: the significand is scaled, exponent is min_exp.
+        # Value = scaled * 2**(lsb_pos - (p-1)) but we want it as a fraction
+        # of 2**min_exp.  min_exp = -(p-1) - (bias-1) ... use spec.
+        # For subnormals, value = scaled * 2**(min_exp - (p - 1) + (p - 1))
+        # Actually: subnormal value = scaled * 2**(min_exp - (p - 1) + (p - 1))
+        # Let's just use: value = scaled * 2**(lsb_pos - (p-1)) and we want
+        # to express as (scaled') * 2**(min_exp) where scaled' is integer.
+        # min_exp - (p-1) is the scale of the LSB of a subnormal.
+        sub_lsb = spec["min_exp"] - (p - 1)
+        delta = lsb_pos - sub_lsb
+        if delta >= 0:
+            sub = scaled << delta
+            if sub >= (1 << (p - 1)):
+                # Rounded up into normal range.
+                return sub, spec["min_exp"]
+            return sub, spec["min_exp"]
+        else:
+            # Below subnormal range: round to zero (or nearest subnormal).
+            # For simplicity, round to zero.
+            return 0, 0
+
+    # Normal.
+    exp = target_exp
+    if exp > spec["max_exp"]:
+        raise OverflowError("float out of range")
+    if exp < spec["min_exp"]:
+        # Should be subnormal; handle as above.
+        sub_lsb = spec["min_exp"] - (p - 1)
+        delta = lsb_pos - sub_lsb
+        if delta >= 0:
+            sub = scaled << delta
+            if sub >= (1 << (p - 1)):
+                return sub, spec["min_exp"]
+            return sub, spec["min_exp"]
+        return 0, 0
+
+    return scaled, exp
+
+
+def _encode_float(m: int, exp: int, spec: dict, sign: bool) -> int:
+    p = spec["precision"]
+    bias = spec["bias"]
+    bits = spec["bits"]
+
+    if m == 0:
+        return (1 << (bits - 1)) if sign else 0
+
+    if m >= (1 << (p - 1)):
+        biased_exp = exp + bias
+        fraction = m ^ (1 << (p - 1))
+        return (int(sign) << (bits - 1)) | (biased_exp << (p - 1)) | fraction
+    else:
+        fraction = m & ((1 << (p - 1)) - 1)
+        return (int(sign) << (bits - 1)) | fraction
+=======
+def _double_to_mantissa_exp(x: float):
+    m, e = x.as_integer_ratio()
+    sign = m < 0
+    m = abs(m)
+    # m is an integer; e is the exponent such that x = m * 2**e.
+    return m, e, sign
+
+
+def _round_to_target(m: int, e: int, spec: dict):
+    p = spec["precision"]
+    min_exp = spec["min_exp"]
+    max_exp = spec["max_exp"]
+
+    if m == 0:
+        return 0, 0
+
+    # x = m * 2**e.  Choose the normal significand whose MSB is aligned with
+    # the MSB of x, then round to p bits.
+    bl = m.bit_length()
+    lsb_pos = bl + e - p
+    shift = e - lsb_pos  # p - bl
+
+    if shift >= 0:
+        scaled = m << shift
+        rem = 0
+    else:
+        s = -shift
+        scaled = m >> s
+        rem = m & ((1 << s) - 1)
+
+    # Round to nearest, ties to even.
+    if rem:
+        half = 1 << (s - 1)
+        if rem > half:
+            scaled += 1
+        elif rem == half and (scaled & 1):
+            scaled += 1
+
+    # Carry: the rounded significand may need one more bit.
+    if scaled >= (1 << p):
+        scaled >>= 1
+        lsb_pos += 1
+
+    # Normal significand: S in [2**(p-1), 2**p-1], value = S * 2**(exp).
+    if scaled >= (1 << (p - 1)):
+        exp = lsb_pos - (p - 1)
+        if exp > max_exp:
+            raise OverflowError("float out of range")
+        if exp < min_exp:
+            # Rounded down into the subnormal range.
+            sub_lsb = min_exp - (p - 1)
+            delta = lsb_pos - sub_lsb
+            if delta >= 0:
+                sub = scaled << delta
+                if sub >= (1 << (p - 1)):
+                    return sub, min_exp
+                return sub, min_exp
+            # Below the smallest subnormal: round to zero.
+            return 0, 0
+        return scaled, exp
+
+    # Subnormal: value = S * 2**(min_exp - (p-1)), S in [1, 2**(p-1)-1].
+    sub_lsb = min_exp - (p - 1)
+    delta = lsb_pos - sub_lsb
+    if delta >= 0:
+        sub = scaled << delta
+        if sub >= (1 << (p - 1)):
+            return sub, min_exp
+        return sub, min_exp
+
+    # Below the subnormal LSB: round to nearest subnormal, ties to even.
+    s = -delta
+    sub = scaled >> s
+    rem = scaled & ((1 << s) - 1)
+    half = 1 << (s - 1)
+    if rem > half:
+        sub += 1
+    elif rem == half and (sub & 1):
+        sub += 1
+    if sub >= (1 << (p - 1)):
+        return sub, min_exp
+    return sub, min_exp
+
+
+def _encode_float(m: int, exp: int, spec: dict, sign: bool) -> int:
+    p = spec["precision"]
+    bias = spec["bias"]
+    bits = spec["bits"]
+
+    if m == 0:
+        return (1 << (bits - 1)) if sign else 0
+
+    if m >= (1 << (p - 1)):
+        biased_exp = exp + bias
+        fraction = m ^ (1 << (p - 1))
+        return (int(sign) << (bits - 1)) | (biased_exp << (p - 1)) | fraction
+
+    fraction = m & ((1 << (p - 1)) - 1)
+    return (int(sign) << (bits - 1)) | fraction
+>>>>>>> REPLACE

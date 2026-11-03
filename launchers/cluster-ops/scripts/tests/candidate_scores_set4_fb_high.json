@@ -1,0 +1,104 @@
+{
+ "20261102-234552": {
+  "task": "pyexpr",
+  "level": "high",
+  "state": "FAILED",
+  "kept": "SCORE 622/1234",
+  "cands": {
+   "a1c2": "364/1234",
+   "a1c3": "843/1234",
+   "a1c4": "624/1234",
+   "a6c3": "624/1234",
+   "a8c4": "624/1234",
+   "a9c3": "620/1234",
+   "a9c4": "622/1234",
+   "a10c1": "625/1234",
+   "a10c2": "625/1234",
+   "a10c3": "622/1234",
+   "final": "622/1234"
+  },
+  "parts": {
+   "a1c2": "fixed=50/171 random=62/700 invalid=251/320 big=1/43",
+   "a1c3": "fixed=117/171 random=411/700 invalid=304/320 big=11/43",
+   "a1c4": "fixed=98/171 random=283/700 invalid=224/320 big=19/43",
+   "a6c3": "fixed=98/171 random=283/700 invalid=224/320 big=19/43",
+   "a8c4": "fixed=98/171 random=283/700 invalid=224/320 big=19/43",
+   "a9c3": "fixed=104/171 random=280/700 invalid=213/320 big=23/43",
+   "a9c4": "fixed=97/171 random=279/700 invalid=224/320 big=22/43",
+   "a10c1": "fixed=100/171 random=279/700 invalid=224/320 big=22/43",
+   "a10c2": "fixed=100/171 random=279/700 invalid=224/320 big=22/43",
+   "a10c3": "fixed=97/171 random=279/700 invalid=224/320 big=22/43",
+   "final": "fixed=97/171 random=279/700 invalid=224/320 big=22/43"
+  }
+ },
+ "20261103-003602": {
+  "task": "toml",
+  "level": "high",
+  "state": "FAILED",
+  "kept": "SCORE 543/1037",
+  "cands": {
+   "a1c4": "515/1037",
+   "a2c3": "532/1037",
+   "a2c4": "531/1037",
+   "a3c1": "531/1037",
+   "a3c3": "531/1037",
+   "a3c4": "531/1037",
+   "a4c3": "531/1037",
+   "a5c2": "531/1037",
+   "a5c3": "531/1037",
+   "a5c4": "531/1037",
+   "a6c2": "531/1037",
+   "a6c3": "531/1037",
+   "a6c4": "531/1037",
+   "a7c1": "543/1037",
+   "final": "543/1037"
+  },
+  "parts": {
+   "a1c4": "fixed=93/154 valid=41/423 invalid=381/460",
+   "a2c3": "fixed=108/154 valid=43/423 invalid=381/460",
+   "a2c4": "fixed=108/154 valid=42/423 invalid=381/460",
+   "a3c1": "fixed=108/154 valid=42/423 invalid=381/460",
+   "a3c3": "fixed=108/154 valid=42/423 invalid=381/460",
+   "a3c4": "fixed=108/154 valid=42/423 invalid=381/460",
+   "a4c3": "fixed=108/154 valid=42/423 invalid=381/460",
+   "a5c2": "fixed=108/154 valid=42/423 invalid=381/460",
+   "a5c3": "fixed=108/154 valid=42/423 invalid=381/460",
+   "a5c4": "fixed=108/154 valid=42/423 invalid=381/460",
+   "a6c2": "fixed=108/154 valid=42/423 invalid=381/460",
+   "a6c3": "fixed=108/154 valid=42/423 invalid=381/460",
+   "a6c4": "fixed=108/154 valid=42/423 invalid=381/460",
+   "a7c1": "fixed=116/154 valid=46/423 invalid=381/460",
+   "final": "fixed=116/154 valid=46/423 invalid=381/460"
+  }
+ },
+ "20261103-011823": {
+  "task": "struct",
+  "level": "high",
+  "state": "FAILED",
+  "kept": "SCORE 853/1315",
+  "cands": {
+   "a1c2": "645/1315",
+   "a1c3": "593/1315",
+   "a2c1": "855/1315",
+   "a2c3": "855/1315",
+   "a2c4": "855/1315",
+   "a3c1": "855/1315",
+   "a4c4": "855/1315",
+   "a5c4": "858/1315",
+   "a9c4": "853/1315",
+   "final": "853/1315"
+  },
+  "parts": {
+   "a1c2": "fixed=103/132 pack=262/420 unpack=138/239 calcsize=120/120 floats=22/404",
+   "a1c3": "fixed=83/132 pack=260/420 unpack=120/239 calcsize=120/120 floats=10/404",
+   "a2c1": "fixed=89/132 pack=319/420 unpack=238/239 calcsize=120/120 floats=89/404",
+   "a2c3": "fixed=89/132 pack=319/420 unpack=238/239 calcsize=120/120 floats=89/404",
+   "a2c4": "fixed=89/132 pack=319/420 unpack=238/239 calcsize=120/120 floats=89/404",
+   "a3c1": "fixed=89/132 pack=319/420 unpack=238/239 calcsize=120/120 floats=89/404",
+   "a4c4": "fixed=89/132 pack=319/420 unpack=238/239 calcsize=120/120 floats=89/404",
+   "a5c4": "fixed=95/132 pack=318/420 unpack=238/239 calcsize=120/120 floats=87/404",
+   "a9c4": "fixed=87/132 pack=319/420 unpack=238/239 calcsize=120/120 floats=89/404",
+   "final": "fixed=87/132 pack=319/420 unpack=238/239 calcsize=120/120 floats=89/404"
+  }
+ }
+}

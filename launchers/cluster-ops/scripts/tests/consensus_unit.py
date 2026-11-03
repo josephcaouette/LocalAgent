@@ -1,6 +1,7 @@
 """Deep diagnosis: identical failures across independent candidates can correct the spec (fake LLM)."""
 import os
 import sys
+import time
 
 sys.path.insert(0, r"Z:\workspace")
 os.chdir(r"Z:\workspace")
@@ -27,7 +28,7 @@ p.report = lambda *a, **k: None
 def state(independent, n=5, same=True):
     cands = [{"k": k, "rc": 1, "failed_test": "self", "independent": independent,
               "stdout": out if same or k == 1 else out.replace("02-01", f"03-0{k}")} for k in range(1, n + 1)]
-    return {"attempt": 2, "max_attempts": 16, "judges": 5, "failure_kind": "runtime", "goal": "cron",
+    return {"attempt": 2, "max_attempts": 16, "started": time.time(), "time_limit_s": 3600, "judges": 5, "failure_kind": "runtime", "goal": "cron",
             "spec": "SPEC with example ... 2024-02-05", "checks": ["c1"], "code": "x = 1", "tests": {},
             "failed_test": "self", "error": "self-test failed\n" + out, "candidates": cands, "task_key": "t",
             "run_id": "t", "lvl": config.level_settings("max")}

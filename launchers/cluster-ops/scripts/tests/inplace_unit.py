@@ -47,6 +47,7 @@ def fake_chat(label, system, blocks, want_out, min_out, temperature=None, think=
 
 
 p.llm_chat = fake_chat
+p.STANDIN_CHECK = False        # the stand-in check has its own test (standin_unit.py)
 target = "calc.py"
 state = {"target_file": target, "goal": "g", "spec": "", "checks": ["c"], "interface": "evaluate(expr)",
          "tests": {"adversarial": p.test_header(target) + "import sys\ntarget_eval = lambda e: 0\n" + OLD},

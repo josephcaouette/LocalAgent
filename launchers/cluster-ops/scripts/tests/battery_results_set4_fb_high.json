@@ -1,0 +1,35 @@
+[
+ {
+  "task": "pyexpr",
+  "level": "high",
+  "state": "FAILED",
+  "run_id": "20261102-234552",
+  "attempt": "10",
+  "elapsed_s": "3005",
+  "tokens_out": 336704,
+  "digest": true,
+  "check": "SCORE 622/1234\nPARTS fixed=97/171 random=279/700 invalid=224/320 big=22/43\nfixed: '2 ** 3 ** 2' -> got 64, expected 512\nfixed: '-2 ** 2' -> got raised IndexError, expected -4\nfixed: '(-2) ** 2' -> got raised IndexError, expected 4\nfixed: '2 ** -1' -> got raised IndexError, expected raised ValueError\nfixed: '2 * -3 ** 2' -> got raised IndexError, expected -18\nfixed: '-3 // 2' -> got raised IndexError, expected -2"
+ },
+ {
+  "task": "toml",
+  "level": "high",
+  "state": "FAILED",
+  "run_id": "20261103-003602",
+  "attempt": "10",
+  "elapsed_s": "2536",
+  "tokens_out": 332562,
+  "digest": true,
+  "check": "SCORE 543/1037\nPARTS fixed=116/154 valid=46/423 invalid=381/460\nfixed: 'a = -9223372036854775809' -> got {'a': 9223372036854775809}, expected {'a': -9223372036854775809}\nfixed: 'a = +0x1' -> got {'a': 1}, expected raised ValueError\nfixed: 'a = 1_0.0_1' -> got raised ValueError, expected {'a': 10.01}\nfixed: 'a = 0.0_1' -> got raised ValueError, expected {'a': 0.01}\nfixed: 'a = -nan' -> got raised ValueError, expected {'a': nan}\nfixed: 'a = -0.0' -> got raised ValueError, expected {'a': -0.0}"
+ },
+ {
+  "task": "struct",
+  "level": "high",
+  "state": "FAILED",
+  "run_id": "20261103-011823",
+  "attempt": "10",
+  "elapsed_s": "2280",
+  "tokens_out": 333893,
+  "digest": true,
+  "check": "SCORE 853/1315\nPARTS fixed=87/132 pack=319/420 unpack=238/239 calcsize=120/120 floats=89/404\nfixed: pack('<e', 65504.0) -> got b'\\xff/', expected b'\\xff{'\nfixed: pack('<e', 65519.99) -> got raised OverflowError, expected b'\\xff{'\nfixed: pack('<e', 65520.0) -> got b'\\x000', expected raised OverflowError\nfixed: pack('<e', 65536.0) -> got b'\\x000', expected raised OverflowError\nfixed: pack('<e', -65520.0) -> got b'\\x00\\xb0', expected raised OverflowError\nfixed: pack('<e', 5.960464477539063e-08) -> got raised OverflowError, expected b'\\x01\\x00'"
+ }
+]

@@ -197,13 +197,32 @@ levels fail on 800-900-line files: pyexpr/high's first file had placeholder func
 bytes, corrected one per attempt. Fixed in `bigfile_unit.py`: a failed run keeps the furthest
 candidate (`progress()`; replayed on the 11 failures: 8,913 of the best 9,158 points vs 7,271 kept);
 missing stdlib imports added; placeholder functions rejected; edits keep 4,000 answer tokens when
-thinking. Not fixed: MAX pyexpr's acceptance-test generator had two bugs found one per attempt (a
-recursion with no base case on attempt 15, caught with a real `0x__1` script bug; then invalid Python
-such as `4 - not 4` on attempt 16, the last), so the run ended with four candidates that had passed
-their own tests failing only that test. `--fix-base furthest` (default `latest`, `fixbase_unit.py`)
-starts each fix from the furthest candidate instead of the latest attempt's best (Ultra pyexpr's
-regression), returning to the same version at most twice; first tried on set 4's High runs with
-`BATTERY_TAG=_fb BATTERY_EXTRA="--fix-base furthest" battery.py level set4 high` (2026-11-02).
+thinking. MAX pyexpr's acceptance-test generator had two bugs found one per attempt (a recursion with
+no base case on attempt 15, caught with a real `0x__1` script bug; then invalid Python such as
+`4 - not 4` on attempt 16, the last), so the run ended with four candidates that had passed their own
+tests failing only that test. Fixed (2026-11-03): the **stand-in check** (`standin_review`, switch
+`STANDIN_CHECK`; `standin_unit.py`) runs each new or revised independent test against two stand-ins
+that implement nothing (A truthy/equal to all, B falsy/equal to none) and sends back to the writer
+(up to 2 rounds) any FAIL line with a value, or crash in the test's own code, that is identical for
+both; it found both MAX bugs plus a third (a 100,000-digit `repr()` past the 4,300-digit limit), and
+`standin_replay.py [copy.py]` gave 0 findings on the 6 saved tests winners passed. The **last chance**
+(`last_chance()`, `lastchance_unit.py`): attempts used up, time left, only an independent test failing
+-> one diagnosis, and one re-test if it blames the test. `--fix-base furthest` (default `latest`,
+`fixbase_unit.py`) starts each fix from the furthest candidate (Ultra pyexpr's regression), at most
+twice per version. Its High re-run (`BATTERY_TAG=_fb`, 2026-11-03, `battery_results_set4_fb_high.json`)
+was inconclusive: pyexpr 0 -> 622 (best 843), toml 732 -> 543, struct 1164 -> 853 (858), with only 3
+go-backs, all in struct; latest stays the default; try it on Ultra next.
+That re-run showed why the 16k levels fail on big files: of 120 candidate slots, 32 fix replies had an
+edit matching nowhere and 38 had no edit; 33 candidates were tested. `scripts/tests/edits_live.py [RUN
+CAND N]` replays a fix request through `engineer_edits` (Node 1, ~3 min) and diagnoses each failed
+SEARCH part: thinking overran its ~1,300-token budget into the answer, or a 100-line SEARCH copy
+differed in two comment lines. Fixed (`editmatch_unit.py`, saved replies in `tests/data/edits_case/`):
+`loose_place()` matching (spacing/indent-insensitive, else first and last lines anchored with at most
+1 line in 10 different, unique only), finishing cut-off edit replies from their notes, carrying
+`PROBLEM_MARK` ("The problem you were fixing") through an attempt where nothing applied, and keeping
+failed replies in `model_reply.txt`. Live: 0 of 4 replies applied before, 3 of 4 after.
+To test a pipeline change while a battery runs (the live file must not change mid-battery), edit a
+copy and run unit tests against it with `python scripts/tests/devtest.py COPY.py TEST_unit.py`.
 
 Live checks on two saved failures (`tests/data/`): `scripts/tests/inplace_live.py [1|2]`, about a
 minute with Node 1 free. Part 1 replays the in-place fix of a wrong adversarial value (must be one
