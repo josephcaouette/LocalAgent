@@ -152,8 +152,10 @@ behaviours the goals rely on: tomllib has no 64-bit limit, rejects `0x_1`, and r
 nested arrays (so no deep TOML cases); struct raises struct.error, not OverflowError, for a huge int
 packed as `f`, so no case depends on that.
 
+`battery.py level set4 high` runs one level on every task (results in
+`battery_results_<set><TAG>_<level>.json`), for checking a change on the runs that showed a problem.
 A battery scores only the file each run kept. `scripts/tests/score_candidates.py <set> [-P 8]
-[--failed-only]` scores every candidate of every run in `battery_results_<set>.json` (and each
+[--failed-only] [--results set4_fb_high]` scores every candidate of every run in `battery_results_<set>.json` (and each
 `final_` file) with the same checker on Node 2, P containers at once (set 4's 337 files took about
 15 minutes), into `candidate_scores_<set>.json`; Node 1 isn't used. `furthest_sim.py <set>` then
 replays each run's log through the pipeline's `progress()` ranking and prints, per run, the kept
@@ -195,10 +197,13 @@ levels fail on 800-900-line files: pyexpr/high's first file had placeholder func
 bytes, corrected one per attempt. Fixed in `bigfile_unit.py`: a failed run keeps the furthest
 candidate (`progress()`; replayed on the 11 failures: 8,913 of the best 9,158 points vs 7,271 kept);
 missing stdlib imports added; placeholder functions rejected; edits keep 4,000 answer tokens when
-thinking. Not fixed: MAX's acceptance test generated invalid Python (`4 - not 4`) and failed every
-candidate alike for its last two attempts (diagnosis: both); a stand-in control run would misfire on
-FAIL lines without values. Fix bases still come from the latest attempt (Ultra pyexpr's regression);
-using the furthest candidate as the base is untested.
+thinking. Not fixed: MAX pyexpr's acceptance-test generator had two bugs found one per attempt (a
+recursion with no base case on attempt 15, caught with a real `0x__1` script bug; then invalid Python
+such as `4 - not 4` on attempt 16, the last), so the run ended with four candidates that had passed
+their own tests failing only that test. `--fix-base furthest` (default `latest`, `fixbase_unit.py`)
+starts each fix from the furthest candidate instead of the latest attempt's best (Ultra pyexpr's
+regression), returning to the same version at most twice; first tried on set 4's High runs with
+`BATTERY_TAG=_fb BATTERY_EXTRA="--fix-base furthest" battery.py level set4 high` (2026-11-02).
 
 Live checks on two saved failures (`tests/data/`): `scripts/tests/inplace_live.py [1|2]`, about a
 minute with Node 1 free. Part 1 replays the in-place fix of a wrong adversarial value (must be one

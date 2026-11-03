@@ -1,6 +1,6 @@
 """Score every candidate a battery's runs wrote, not only the file each run kept.
 
-    python score_candidates.py set4 [-P 8] [--failed-only]
+    python score_candidates.py set4 [-P 8] [--failed-only] [--results set4_fb_high]
 
 Reads battery_results_<set>.json, finds each run's candidate files (Z:\\runs\\<run>\\a<N>c<M>\\<target>)
 and its final file, and runs the set's checker on all of them in the sandbox on Node 2, P at a time,
@@ -54,14 +54,16 @@ def main():
     set_ = sys.argv[1]
     par = int(sys.argv[sys.argv.index("-P") + 1]) if "-P" in sys.argv else 8
     failed_only = "--failed-only" in sys.argv
-    tag = os.environ.get("BATTERY_TAG", "")
+    tag = os.environ.get("BATTERY_TAG", "")           # the suffix of the runs' target names
+    # --results set4_fb_high reads battery_results_set4_fb_high.json (a `level` or tagged battery)
+    name = sys.argv[sys.argv.index("--results") + 1] if "--results" in sys.argv else set_ + tag
     timeout, memory = LIMITS.get(set_, (300, "512m"))
-    with open(os.path.join(HERE, f"battery_results_{set_}{tag}.json"), encoding="utf-8") as f:
+    with open(os.path.join(HERE, f"battery_results_{name}.json"), encoding="utf-8") as f:
         results = json.load(f)
     jobs, runs = find_jobs(results, tag, failed_only)
     print(f"{len(jobs)} files in {len(runs)} runs; {par} at a time on Node 2", flush=True)
 
-    remote = f"/tmp/score_{set_}{tag}"
+    remote = f"/tmp/score_{name}"
     subprocess.run(SSH + [f"rm -rf {remote} && mkdir -p {remote}/out"], check=True)
     subprocess.run(["scp", "-q", "-o", "BatchMode=yes", os.path.join(HERE, CHECKS[set_]),
                     f"{config.SSH_TARGET}:{remote}/checks.py"], check=True)
@@ -96,7 +98,7 @@ def main():
         if len(lines) > 1 and lines[1].startswith("PARTS"):
             runs[rid]["parts"][cand] = lines[1][6:].strip()
 
-    out_path = os.path.join(HERE, f"candidate_scores_{set_}{tag}.json")
+    out_path = os.path.join(HERE, f"candidate_scores_{name}.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(runs, f, indent=1)
     for rid, run in runs.items():

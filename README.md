@@ -517,12 +517,11 @@ with the best of all its candidates in brackets where better (`score_candidates.
   step 11 of [How a run works](#how-a-run-works)). Replayed on the 11 failed runs' logs, that keeps
   8,913 of the 9,158 points their best candidates reach, against 7,271 before; no run loses more
   than 11.
-- **A wrong test that no rule catches.** MAX's acceptance test for the evaluator generated random
-  expressions that Python itself rejects (`4 - not 4`) and failed every candidate the same way on
-  its last two attempts; the diagnosis blamed both the code and the test. Running a failing test
-  against a stand-in that implements nothing would show which failures don't depend on the script,
-  but a test that prints `FAIL precedence` without values would match too and get correct code
-  blamed, so the pipeline doesn't do it.
+- **MAX's evaluator ran out of attempts on a broken test.** Its acceptance test's random generator
+  had two bugs. On attempt 15 it recursed with no base case and crashed; the diagnosis caught that
+  and a real script bug (`0x__1` accepted) together. Fixing the recursion exposed the second bug on
+  attempt 16, the last: the generator wrote expressions Python itself rejects (`4 - not 4`) and
+  failed four candidates that had passed their own tests.
 - **Every run got its summary.** The battery's window switched vLLM back 75 seconds after the last
   run, and Node 1 wrote all 15 summaries while the battery waited.
 - **Fixed since, each with a unit test (`bigfile_unit.py`):** a failed run keeps the candidate that
@@ -673,11 +672,18 @@ Exit codes from the command line: 0 passed, 1 failed, 2 stopped by an error.
 python run_langgraph_pipeline.py --goal="..." [--target=name.py] [--attach=path ...]
                                  [--allow-network] [--research] [--accuracy=low|medium|high|ultra|max]
                                  [--no-memory] [--no-ingest] [--helper-think=TOKENS]
+                                 [--fix-base=latest|furthest]
 ```
 
 `--helper-think` sets how much the test writers (tester, adversary, prober) may think, for
 experiments; normally they use the level's budget. Raising it to 8,000 on MAX didn't reduce the
 wrong expected values in tests (see the five-task battery above).
+
+`--fix-base furthest` (being tested; `latest` is the default) starts each fix from the candidate that
+got furthest in the whole run, rather than from the best of the attempt that just failed, and tells
+the engineer what the worse attempt tried. It returns to the same version at most twice. In the
+fourth battery, the expression evaluator on Ultra peaked on attempt 4 (972 of 1,234 reference cases),
+and its later fixes, each built on the attempt before, ended at 757.
 
 ## Web research
 

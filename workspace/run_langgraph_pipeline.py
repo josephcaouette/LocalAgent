@@ -1160,8 +1160,14 @@ def furthest_so_far(state, results):
     for c in results:
         rank, passes, fails = progress(c)
         if c.get("code") and (not best or list(rank) >= best["rank"]):
+            kind = ("indep" if c.get("indep_failed") else
+                    "differential" if c.get("failed_test") == "probe" else "runtime")
             best = {"attempt": state["attempt"], "k": c["k"], "code": c["code"], "rank": list(rank),
-                    "passes": passes, "fails": fails}
+                    "passes": passes, "fails": fails, "returns": 0,
+                    # how it failed, for a fix that starts from it (--fix-base furthest)
+                    "error": c.get("exec_error") or "", "kind": kind, "failed_test": c.get("failed_test") or "",
+                    "output": (c.get("stdout") or "") + ("\n" + c["indep_stdout"] if c.get("indep_stdout") else ""),
+                    "stderr": c.get("stderr") or ""}
     return best
 
 
@@ -2493,6 +2499,25 @@ def sandbox_executor_node(state):
         return {"status": "EXECUTED", "candidates": candidates, "probe_verdicts": known, "furthest": furthest}
     # Nothing passed: fix the candidate that got furthest (its own test passed, then most output).
     best = max(results, key=lambda c: (c["rc"] == 0, c["failed_test"] == "probe", len(c["stdout"])))
+    if FIX_BASE == "furthest" and furthest.get("error") and furthest["code"].strip() != best["code"].strip():
+        # Start the next fix from the furthest candidate of the whole run, not this attempt's best.
+        # Set 4's pyexpr run on Ultra peaked on attempt 4 (972 of 1,234 reference cases) and its later
+        # fixes, each built on the attempt before, ended at 757. Going back to the same version is
+        # allowed twice, then the run carries on from its latest code.
+        back = furthest["attempt"] < state["attempt"]
+        if not back or furthest.get("returns", 0) < 2:
+            note = ""
+            if back:
+                print(f"    [i] This attempt's candidates got less far than attempt {furthest['attempt']}'s "
+                      f"candidate {furthest['k']}; the next fix starts again from that version.")
+                note = (f"(This fix starts again from attempt {furthest['attempt']}'s version, which got further "
+                        f"than attempt {state['attempt']}'s candidates. Their best failed like this, so don't "
+                        f"repeat that change:\n{head(best['exec_error'], 800)})\n\n")
+                furthest = dict(furthest, returns=furthest.get("returns", 0) + 1)
+            return fail(state, furthest["kind"], note + furthest["error"], code=furthest["code"],
+                        candidates=candidates, execution_output=furthest["output"],
+                        execution_stderr=furthest["stderr"], failed_test=furthest["failed_test"],
+                        probe_verdicts=known, furthest=furthest)
     kind = "indep" if best["indep_failed"] else ("differential" if best["failed_test"] == "probe" else "runtime")
     output = best["stdout"] + ("\n" + best["indep_stdout"] if best["indep_stdout"] else "")
     return fail(state, kind, best["exec_error"], code=best["code"], candidates=candidates,
@@ -3597,6 +3622,9 @@ def parse_args(argv):
     p.add_argument("--no-ingest", action="store_true", help="don't store the result in long-term memory")
     p.add_argument("--helper-think", type=int, default=None,
                    help="thinking budget for the tester, adversary and prober (tests and benchmarks)")
+    p.add_argument("--fix-base", choices=["latest", "furthest"], default="latest",
+                   help="after a failed attempt, fix this attempt's best candidate (latest) or the one that "
+                        "got furthest in the whole run (furthest; being tested)")
     return p.parse_args(argv)
 
 
@@ -3637,6 +3665,7 @@ def describe_level(name, p):
 
 NO_MEMORY = False      # --no-memory
 NO_INGEST = False      # --no-ingest
+FIX_BASE = "latest"    # --fix-base
 
 
 def main(argv=None):
@@ -3664,8 +3693,10 @@ def main(argv=None):
         sys.stdout = Tee(sys.stdout, os.path.join(config.RUNS_DIR, run_id, "pipeline.log"))
     except OSError as e:
         print(f"[i] Not saving a log file for this run ({e}).")
-    global THINK_TOKENS, NO_MEMORY, NO_INGEST
-    NO_MEMORY, NO_INGEST = args.no_memory, args.no_ingest
+    global THINK_TOKENS, NO_MEMORY, NO_INGEST, FIX_BASE
+    NO_MEMORY, NO_INGEST, FIX_BASE = args.no_memory, args.no_ingest, args.fix_base
+    if FIX_BASE != "latest":
+        print(f"[i] Fixes start from the candidate that got furthest so far (--fix-base {FIX_BASE}).")
     profile_name = args.accuracy or ("medium" if args.overnight else config.DEFAULT_ACCURACY)
     profile = config.level_settings(profile_name)
     if args.helper_think:

@@ -104,6 +104,8 @@ elif MODE == "one":                    # battery.py one set1 TASK LEVEL
     MATRIX = [(sys.argv[3], sys.argv[4])]
 elif MODE == "umax":                   # Ultra then MAX on each task, back to back
     MATRIX = [(t, lvl) for t in TASKS for lvl in ("ultra", "max")]
+elif MODE == "level":                  # battery.py level set4 high: one level on every task
+    MATRIX = [(t, sys.argv[3]) for t in TASKS]
 else:
     MATRIX = [(t, lvl) for lvl in ("low", "medium", "high") for t in TASKS] + TOP
 
@@ -208,7 +210,7 @@ for j in jobs:
         say("      ", line[:250])
 # Only a full battery writes battery_results_<set>.json; a quick, one-off or tagged run gets its own
 # file, so it can't replace a whole battery's results.
-suffix = TAG + ("" if MODE == "full" else f"_{MODE}")
+suffix = TAG + ("" if MODE == "full" else f"_{sys.argv[3]}" if MODE == "level" else f"_{MODE}")
 with open(os.path.join(HERE, f"battery_results_{SET}{suffix}.json"), "w", encoding="utf-8") as f:
     json.dump(results, f, indent=1)
 say("BATTERY DONE")
