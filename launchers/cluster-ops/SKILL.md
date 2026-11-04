@@ -223,6 +223,24 @@ differed in two comment lines. Fixed (`editmatch_unit.py`, saved replies in `tes
 failed replies in `model_reply.txt`. Live: 0 of 4 replies applied before, 3 of 4 after.
 To test a pipeline change while a battery runs (the live file must not change mid-battery), edit a
 copy and run unit tests against it with `python scripts/tests/devtest.py COPY.py TEST_unit.py`.
+Set 4 v2 (2026-11-03, 23.6 h, `BATTERY_TAG=_v2`, `battery_results_set4_v2.json`): kept pyexpr
+544/727/250/706/6, toml 765/805/910/990 (passed)/673, struct 638/1040/1274/1302/1232 (Low..MAX). The 16k
+levels gained (Low+Medium+High kept 6,953 vs 5,301; 38 edit replies finished from notes); Ultra/MAX
+lost (1 pass vs 4; v1's logs were pruned, so no side-by-side): pyexpr/max hit a dead end (10 attempts of
+fixes of one broken parser, after the diagnosis put implementation details into the interface),
+toml/max never passed its own self-test, struct U/M self-test bytes blamed 4-5 times. Stand-in check:
+2 real findings, both unrepaired, and 2 false alarms (51/76 exception checks worded "got no error" /
+"got no exception"); fixed: `_EXPECTS_ERROR` covers those wordings, `test_problem` adds missing stdlib
+imports to tests, failed repair replies saved as `Z:\runs\<run>\standin-<role>-a<N>-reply.txt`, and
+`standin_unit.py` reads `tests/data/standin_case/` (run folders get pruned; v1's MAX tests were lost
+that way). Failed runs kept 11,862 of the 14,068 points their best candidates reach: `final_pick()`
+(`FINAL_PICK`, `FINAL_PICK_RATIO` 0.7, `finalpick_unit.py`) now runs a failed High+ run's final
+independent tests on every distinct candidate (~1 min per 25) and overrules the furthest one when it
+passes under 70% of the top share. `finalpick_sim.py <name> [-P 8]` (BATTERY_TAG for target names;
+Node 2 only, ~20 min for 576 test runs) replays that: 7,937 of 8,325 vs 6,353 kept; ratios 0.6-0.8 all
+give it; always taking the top share gives 7,410 (struct/ultra's test held wrong bytes). Open: a
+restart when every candidate fails the same way for several attempts; interface corrections that
+prescribe implementation instead of behaviour.
 
 Live checks on two saved failures (`tests/data/`): `scripts/tests/inplace_live.py [1|2]`, about a
 minute with Node 1 free. Part 1 replays the in-place fix of a wrong adversarial value (must be one

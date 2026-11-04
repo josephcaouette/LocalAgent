@@ -551,6 +551,51 @@ with the best of all its candidates in brackets where better (`score_candidates.
   4 replies now apply, against 0 of 4 before. Failed replies are now kept in `model_reply.txt`; they
   used to be saved empty.
 
+**The fourth battery again** (2026-11-03, same setup, 15 runs in 24 hours), with the stand-in check,
+the last chance and the edit fixes above. Each cell is the first battery's kept file, then this one's,
+with this one's best candidate in brackets where better:
+
+| | Low | Medium | High | Ultra | MAX |
+|---|---|---|---|---|---|
+| Expressions (1,234) | 887 → 544 (634) | 180 → 727 | 0 → 250 (937) | 757 → 706 (1,009) | 1,213 → 6 (602) |
+| TOML (1,037) | 271 → 765 | 697 → 805 | 732 → 910 (974) | passed: 920 → passed: **990** (992) | passed: 975 → 673 (975) |
+| struct (1,315) | 658 → 638 (764) | 712 → 1,040 (1,056) | 1,164 → 1,274 | passed: **1,314** → 1,302 | passed: 1,298 → 1,232 (1,252) |
+
+- **The 16k levels gained most.** Low, Medium and High kept 6,953 points against 5,301, and High's
+  best candidates reached 3,185 against 1,929. High tested 80 candidates against 43, and across the
+  three levels 38 fix replies that ran out of room while thinking were finished from their notes.
+  Nothing passed on 16k.
+- **Ultra and MAX did worse: one pass against four.** One run per cell can't tell the changes from
+  luck, and the first battery's Ultra and MAX logs had been pruned by then. The logs show three
+  things. The expression evaluator on MAX hit a dead end: for its last 10 attempts, the candidates
+  (each a fix of the same version) failed their own tests with the same `ValueError` on valid
+  expressions, often all five alike. It began right after the diagnosis wrote implementation details
+  into the interface for every later step ("the parser must terminate on the explicit end-of-input
+  token, use unique AST operator codes..."). TOML on MAX never had a candidate pass its own self-test
+  in 16 attempts, while
+  the file grew from 1,000 to 1,600 lines. struct on Ultra and MAX had their self-tests' hand-worked
+  half-precision bytes blamed 4 and 5 times; their code matched 1,302 and 1,232 of 1,315 cases.
+- **Failed runs kept worse files than they had:** 11,862 points kept of the 14,068 their best
+  candidates reach. The furthest-candidate rank trusts a passing self-test, and the evaluator on MAX
+  kept a candidate whose own test passed while it rejected `1 + 2 * 3` (6 points; its best had 602).
+  Fixed (step 11 of [How a run works](#how-a-run-works), `finalpick_unit.py`): a failed run now
+  judges its candidates by its final independent tests, but overrules the furthest one only at a
+  large gap. Replayed on the 8 failed High, Ultra and MAX runs (`finalpick_sim.py`), that keeps 7,937
+  of the 8,325 points their best candidates reach, against 6,353; any threshold from 60% to 80% gives
+  the same, and on the three High runs of the fix-base re-run it changes nothing. Always taking the
+  top share would keep only 7,410: struct on Ultra's test held wrong bytes and favoured a candidate
+  that shared them (753 against 1,302).
+- **The stand-in check found 2 real test bugs and raised 2 false alarms.** On High, the expression
+  evaluator's test crashed printing a 100,000-digit number (the 4,300-digit limit again), and
+  struct's crashed in its reference call to `struct.calcsize`. Neither repair worked: one came back
+  without edits, the other used `struct.error` without `import struct` (a forgotten standard-library
+  import is now added to tests as it is to candidates, and a failed repair's reply is saved). On MAX,
+  51 and 76 checks that expect an exception were reported because they were worded "expected error,
+  got no error" and "got no exception". Neither stand-in raises, so such checks are now left out
+  however they're worded (`standin_unit.py` keeps all four tests). The writers rightly changed
+  nothing, and those runs rarely got past their own self-tests anyway.
+- **The last chance never fired:** no run ended with only an independent test failing.
+
 **On every level.**
 
 - **Static check (pyflakes):** rejects a candidate that uses a name it never defines, a crash
@@ -558,6 +603,7 @@ with the best of all its candidates in brackets where better (`score_candidates.
   (when the code uses `re.split` and every other `re.` name it uses exists in `re`), since it is
   never a design choice. Functions that only raise `NotImplementedError` are rejected as
   placeholders, named in the message (methods are left alone: an abstract method is normal).
+  Independent tests get the same import fix.
 - **Repeat runs (Medium and above):** catch tests that only pass sometimes (randomness, timing, or
   leftover files).
 - **Failure lines first:** when a test fails, the lines that report failures are always shown, wherever
@@ -599,8 +645,9 @@ with the best of all its candidates in brackets where better (`score_candidates.
      everything, the other falsy and equal to nothing. A failure the test reports the same way
      against both (a FAIL line with the same value, or the same crash in its own code) can't come
      from the script's answer, so it goes back to the writer, up to twice, before any candidate is
-     blamed. Checks that expect an exception, or that run the script as a program, are left out:
-     neither stand-in raises or prints anything a test looks for.
+     blamed. Checks that expect an exception, however they word it ("expected ValueError", "got no
+     error", "did not raise"), or that run the script as a program, are left out: neither stand-in
+     raises or prints anything a test looks for.
    - Meanwhile, Node 2 starts one test container per candidate.
 5. **Testing:** each candidate runs in its own container on Node 2:
    - its own `python3 <file> --test`, then each independent test and the kept regression checks, then
@@ -684,7 +731,11 @@ with the best of all its candidates in brackets where better (`score_candidates.
     the largest share of its own checks), which is what **Talk about result** explains. Before, it
     kept the last attempt's code, which can be far worse: in the fourth battery, the TOML run on Low
     kept a version the static check had rejected (271 of 1,037 reference cases) over its first
-    attempt's (718).
+    attempt's (718). On High and above, it then runs the final version of each independent test on
+    every different candidate (about a minute for 25) and keeps the one that passes the largest share
+    of their checks instead, if the furthest passes under 70% of that share. A weak self-test can pass
+    on a broken candidate, and shares of a candidate's own checks compare self-tests that change every
+    attempt; but independent tests can be wrong too, so a small lead doesn't count.
 
 ### What a run leaves behind
 

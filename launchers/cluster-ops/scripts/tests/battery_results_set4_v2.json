@@ -1,0 +1,167 @@
+[
+ {
+  "task": "pyexpr",
+  "level": "low",
+  "state": "FAILED",
+  "run_id": "20261103-022749",
+  "attempt": "3",
+  "elapsed_s": "694",
+  "tokens_out": 69458,
+  "digest": true,
+  "check": "SCORE 544/1234\nPARTS fixed=69/171 random=183/700 invalid=287/320 big=5/43\nfixed: '1 + 2 * 3' -> got raised ValueError, expected 7\nfixed: '(1 + 2) * 3' -> got raised ValueError, expected 9\nfixed: '2 ** 3 ** 2' -> got raised TypeError, expected 512\nfixed: '-2 ** 2' -> got raised TypeError, expected -4\nfixed: '(-2) ** 2' -> got raised TypeError, expected 4\nfixed: '2 * -3 ** 2' -> got raised ValueError, expected -18"
+ },
+ {
+  "task": "toml",
+  "level": "low",
+  "state": "FAILED",
+  "run_id": "20261103-022748",
+  "attempt": "3",
+  "elapsed_s": "472",
+  "tokens_out": 54195,
+  "digest": true,
+  "check": "SCORE 765/1037\nPARTS fixed=119/154 valid=236/423 invalid=410/460\nfixed: 'a = 1__2' -> got {'a': 12}, expected raised ValueError\nfixed: 'a = 1_' -> got {'a': 1}, expected raised ValueError\nfixed: 'a = 5.' -> got {'a': 5.0}, expected raised ValueError\nfixed: 'a = -nan' -> got raised ValueError, expected {'a': nan}\nfixed: 'a = {\\nb = 1}' -> got {'a': {'b': 1}}, expected raised ValueError\nfixed: '[a.b]\\n[a]' -> got raised ValueError, expected {'a': {'b': {}}}"
+ },
+ {
+  "task": "struct",
+  "level": "low",
+  "state": "FAILED",
+  "run_id": "20261103-023544",
+  "attempt": "3",
+  "elapsed_s": "756",
+  "tokens_out": 76153,
+  "digest": true,
+  "check": "SCORE 638/1315\nPARTS fixed=87/132 pack=254/420 unpack=123/239 calcsize=110/120 floats=64/404\nfixed: pack('<e', 65519.99) -> got raised OverflowError, expected b'\\xff{'\nfixed: pack('<e', 5.960464477539063e-08) -> got raised OverflowError, expected b'\\x01\\x00'\nfixed: pack('<e', 2.9802322387695312e-08) -> got raised OverflowError, expected b'\\x00\\x00'\nfixed: pack('<e', 2.980232238769532e-08) -> got raised OverflowError, expected b'\\x01\\x00'\nfixed: pack('<e', 4.470348358154297e-08) -> got raised OverflowError, expected b'\\x01\\x00'\nfixed: pack('<e', 6.103515625e-05) -> got b'\\x00<', expected b'\\x00\\x04'"
+ },
+ {
+  "task": "pyexpr",
+  "level": "medium",
+  "state": "FAILED",
+  "run_id": "20261103-023927",
+  "attempt": "8",
+  "elapsed_s": "2190",
+  "tokens_out": 172206,
+  "digest": true,
+  "check": "SCORE 727/1234\nPARTS fixed=117/171 random=312/700 invalid=273/320 big=25/43\nfixed: '7 // 0' -> got raised IndexError, expected raised ZeroDivisionError\nfixed: '7 % 0' -> got raised IndexError, expected raised ZeroDivisionError\nfixed: '0 // 0' -> got raised IndexError, expected raised ZeroDivisionError\nfixed: '1 < 2 < 3' -> got raised ValueError, expected True\nfixed: '3 > 2 > 1' -> got raised ValueError, expected True\nfixed: '1 < 3 > 2' -> got raised ValueError, expected True"
+ },
+ {
+  "task": "toml",
+  "level": "medium",
+  "state": "FAILED",
+  "run_id": "20261103-024824",
+  "attempt": "8",
+  "elapsed_s": "2813",
+  "tokens_out": 235107,
+  "digest": true,
+  "check": "SCORE 805/1037\nPARTS fixed=127/154 valid=263/423 invalid=415/460\nfixed: 'a = +0x1' -> got {'a': 1}, expected raised ValueError\nfixed: '[a.b]\\n[a]' -> got raised TomlParseError, expected {'a': {'b': {}}}\nfixed: 'a = \"\"\"\\nx\"\"\"' -> got {'a': 'x\"\"'}, expected {'a': 'x'}\nfixed: 'a = \"\"\"x\\\\\\n   y\"\"\"' -> got {'a': 'xy\"\"'}, expected {'a': 'xy'}\nfixed: \"a = '''\\nx'''\" -> got {'a': \"x''\"}, expected {'a': 'x'}\nfixed: '[ a . b ]\\nc=1' -> got raised TomlParseError, expected {'a': {'b': {'c': 1}}}"
+ },
+ {
+  "task": "struct",
+  "level": "medium",
+  "state": "FAILED",
+  "run_id": "20261103-031601",
+  "attempt": "8",
+  "elapsed_s": "2138",
+  "tokens_out": 242422,
+  "digest": true,
+  "check": "SCORE 1040/1315\nPARTS fixed=123/132 pack=306/420 unpack=183/239 calcsize=120/120 floats=308/404\nfixed: pack('<e', inf) -> got b'\\xff\\x7f', expected b'\\x00|'\nfixed: pack('<e', -inf) -> got b'\\xff\\xff', expected b'\\x00\\xfc'\nfixed: pack('<e', nan) -> got b'\\x00|', expected b'\\x00~'\nfixed: pack('<e', nan) -> got b'\\x00\\xfc', expected b'\\x00\\xfe'\nfixed: pack('<f', nan) -> got b'\\x00\\x00\\x80\\x7f', expected b'\\x00\\x00\\xc0\\x7f'\nfixed: pack('<f', nan) -> got b'\\x00\\x00\\x80\\xff', expected b'\\x00\\x00\\xc0\\xff'"
+ },
+ {
+  "task": "pyexpr",
+  "level": "high",
+  "state": "FAILED",
+  "run_id": "20261103-035143",
+  "attempt": "10",
+  "elapsed_s": "3798",
+  "tokens_out": 330978,
+  "digest": true,
+  "check": "SCORE 250/1234\nPARTS fixed=45/171 random=41/700 invalid=162/320 big=2/43\nfixed: '1 + 2 * 3' -> got raised IndexError, expected 7\nfixed: '(1 + 2) * 3' -> got raised ValueError, expected 9\nfixed: '2 ** 3 ** 2' -> got raised IndexError, expected 512\nfixed: '-2 ** 2' -> got raised ValueError, expected -4\nfixed: '(-2) ** 2' -> got raised ValueError, expected 4\nfixed: '2 ** -1' -> got raised IndexError, expected raised ValueError"
+ },
+ {
+  "task": "toml",
+  "level": "high",
+  "state": "FAILED",
+  "run_id": "20261103-045512",
+  "attempt": "10",
+  "elapsed_s": "3884",
+  "tokens_out": 390768,
+  "digest": true,
+  "check": "SCORE 910/1037\nPARTS fixed=144/154 valid=326/423 invalid=440/460\nfixed: 'a = +0x1' -> got {'a': 1}, expected raised ValueError\nfixed: 'a = -nan' -> got raised ValueError, expected {'a': nan}\nfixed: 'a.b = 1\\n[a]' -> got {'a': {'b': 1}}, expected raised ValueError\nfixed: '[a]\\nb.c = 1\\n[a.b]' -> got {'a': {'b': {'c': 1}}}, expected raised ValueError\nfixed: '[ [a] ]' -> got {'a': [{}]}, expected raised ValueError\nfixed: 'a = inf\\nb = -inf\\nc = +nan' -> got raised ValueError, expected {'a': inf, 'b': -inf, 'c': nan}"
+ },
+ {
+  "task": "struct",
+  "level": "high",
+  "state": "FAILED",
+  "run_id": "20261103-060002",
+  "attempt": "10",
+  "elapsed_s": "2714",
+  "tokens_out": 356148,
+  "digest": true,
+  "check": "SCORE 1274/1315\nPARTS fixed=125/132 pack=414/420 unpack=212/239 calcsize=120/120 floats=403/404\nfixed: pack('<0p', b'x') -> got raised ValueError, expected b''\nfixed: pack('<300p', b'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx... -> got b'\\xffxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..., expected b'\\xffxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...\nfixed: pack('<257p', b'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy... -> got b'\\xffyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy..., expected b'\\xffyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy...\nfixed: pack(' <i', 1) -> got b'\\x01\\x00\\x00\\x00', expected raised ValueError\nfixed: pack('<c', bytearray(b'a')) -> got b'a', expected raised ValueError\nfixed: pack('<d', '1.0') -> got b'\\x00\\x00\\x00\\x00\\x00\\x00\\xf0?', expected raised ValueError"
+ },
+ {
+  "task": "pyexpr",
+  "level": "ultra",
+  "state": "FAILED",
+  "run_id": "20261103-064602",
+  "attempt": "12",
+  "elapsed_s": "11090",
+  "tokens_out": 1246963,
+  "digest": true,
+  "check": "SCORE 706/1234\nPARTS fixed=104/171 random=278/700 invalid=310/320 big=14/43\nfixed: '1 + 2 * 3' -> got raised AttributeError, expected 7\nfixed: '(1 + 2) * 3' -> got raised TypeError, expected 9\nfixed: '2 ** 3 ** 2' -> got raised TypeError, expected 512\nfixed: '-2 ** 2' -> got raised TypeError, expected -4\nfixed: '(-2) ** 2' -> got raised TypeError, expected 4\nfixed: '2 * -3 ** 2' -> got raised TypeError, expected -18"
+ },
+ {
+  "task": "pyexpr",
+  "level": "max",
+  "state": "FAILED",
+  "run_id": "20261103-095058",
+  "attempt": "16",
+  "elapsed_s": "14714",
+  "tokens_out": 1979925,
+  "digest": true,
+  "check": "SCORE 6/1234\nPARTS fixed=4/171 random=0/700 invalid=0/320 big=2/43\nfixed: '1 + 2 * 3' -> got raised ValueError, expected 7\nfixed: '(1 + 2) * 3' -> got raised ValueError, expected 9\nfixed: '2 * -3 ** 2' -> got no answer in time, expected -18\nfixed: '-3 // 2' -> got raised IndexError, expected -2\nfixed: '-3 % 2' -> got raised ValueError, expected 1\nfixed: '3 // -2' -> got no answer in time, expected -2"
+ },
+ {
+  "task": "toml",
+  "level": "ultra",
+  "state": "PASSED",
+  "run_id": "20261103-135619",
+  "attempt": "5",
+  "elapsed_s": "4975",
+  "tokens_out": 617771,
+  "digest": true,
+  "check": "SCORE 990/1037\nPARTS fixed=148/154 valid=384/423 invalid=458/460\nfixed: 'a = 1e+05' -> got raised ValueError, expected {'a': 100000.0}\nfixed: '[a.b]\\n[a]' -> got raised ValueError, expected {'a': {'b': {}}}\nfixed: '[[a.b]]\\n[a]\\nc = 1' -> got raised ValueError, expected {'a': {'b': [{}], 'c': 1}}\nfixed: 'a = 1 b = 2' -> got {'a': 1, 'b': 2}, expected raised ValueError\nfixed: '[x.y.z]\\n[x]\\nw = 1' -> got raised ValueError, expected {'x': {'y': {'z': {}}, 'w': 1}}\nfixed: '[a.b.c]\\n[a.b]\\n[a]' -> got raised ValueError, expected {'a': {'b': {'c': {}}}}"
+ },
+ {
+  "task": "toml",
+  "level": "max",
+  "state": "FAILED",
+  "run_id": "20261103-151916",
+  "attempt": "16",
+  "elapsed_s": "12664",
+  "tokens_out": 1591798,
+  "digest": true,
+  "check": "SCORE 673/1037\nPARTS fixed=124/154 valid=157/423 invalid=392/460\nfixed: 'a = 01' -> got {'a': 1.0}, expected raised ValueError\nfixed: 'a = +0x1' -> got {'a': 1}, expected raised ValueError\nfixed: 'a = -nan' -> got raised ValueError, expected {'a': nan}\nfixed: 'a = -0.0' -> got {'a': 0.0}, expected {'a': -0.0}\nfixed: 'a.b = 1\\n[a]' -> got {'a': {'b': 1}}, expected raised ValueError\nfixed: '[a]\\nb.c = 1\\n[a.b]' -> got {'a': {'b': {}}, 'b': {'c': 1}}, expected raised ValueError"
+ },
+ {
+  "task": "struct",
+  "level": "ultra",
+  "state": "FAILED",
+  "run_id": "20261103-185026",
+  "attempt": "12",
+  "elapsed_s": "10470",
+  "tokens_out": 1265740,
+  "digest": true,
+  "check": "SCORE 1302/1315\nPARTS fixed=125/132 pack=417/420 unpack=236/239 calcsize=120/120 floats=404/404\nfixed: pack('<e', 65520.0) -> got b'\\xff{', expected raised OverflowError\nfixed: pack('<e', -65520.0) -> got b'\\xff\\xfb', expected raised OverflowError\nfixed: pack('<f', 3.4028235677973366e+38) -> got b'\\xff\\xff\\x7f\\x7f', expected raised OverflowError\nfixed: pack('<300p', b'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx... -> got b'\\xffxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..., expected b'\\xffxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...\nfixed: pack('<257p', b'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy... -> got b'\\xffyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy..., expected b'\\xffyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy...\nfixed: pack(' <i', 1) -> got b'\\x01\\x00\\x00\\x00', expected raised ValueError"
+ },
+ {
+  "task": "struct",
+  "level": "max",
+  "state": "FAILED",
+  "run_id": "20261103-214501",
+  "attempt": "16",
+  "elapsed_s": "15047",
+  "tokens_out": 2012890,
+  "digest": true,
+  "check": "SCORE 1232/1315\nPARTS fixed=118/132 pack=361/420 unpack=236/239 calcsize=120/120 floats=397/404\nfixed: pack('<e', 5.960464477539063e-08) -> got b'\\x00\\x00', expected b'\\x01\\x00'\nfixed: pack('<e', 2.980232238769532e-08) -> got b'\\x00\\x00', expected b'\\x01\\x00'\nfixed: pack('<e', 4.470348358154297e-08) -> got b'\\x00\\x00', expected b'\\x01\\x00'\nfixed: pack('<f', 1.401298464324817e-45) -> got b'\\x00\\x00\\x00\\x00', expected b'\\x01\\x00\\x00\\x00'\nfixed: pack('<f', 7.006492321624087e-46) -> got b'\\x00\\x00\\x00\\x00', expected b'\\x01\\x00\\x00\\x00'\nfixed: pack('<d', 5e-324) -> got b'\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00', expected b'\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00'"
+ }
+]

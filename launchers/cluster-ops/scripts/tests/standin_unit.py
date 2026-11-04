@@ -4,13 +4,14 @@ reports the same way against both can't come from the script's answer, so it goe
 writer before any candidate is blamed. Set 4's MAX acceptance test for the expression evaluator had
 two such bugs, found one attempt at a time: its generator recursed without end (attempt 15), then
 fed Python's eval expressions it rejects (attempt 16, the last).
-Part 1: the comparison on made-up outputs. Part 2: the repair flow (fake model). Part 3: the saved
-tests in the sandbox (Node 2): both broken MAX tests are caught, and tests that winning candidates
-passed come out clean."""
+Part 1: the comparison on made-up outputs. Part 2: the repair flow (fake model). Part 3: saved tests
+from set 4's second battery in the sandbox (Node 2), from tests/data/standin_case/cases.json."""
+import json
 import os
 import shutil
 import sys
 
+HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, r"Z:\workspace")
 os.chdir(r"Z:\workspace")
 import config  # noqa: E402
@@ -21,17 +22,19 @@ checks = []
 
 # --- 1. The comparison --------------------------------------------------------------------------
 EVAL = "FAIL: random 28 ((4 - not 4) ^ True) expected 'eval no exception', got 'SyntaxError: invalid syntax'"
-out_a = "\n".join(["PASS: cli", EVAL, "FAIL: value 1+2 expected 3, got <stand-in A value>",
-                   "FAIL: rejects 1+ expected 'ValueError', got 'no exception'", "FAIL: bare label",
-                   "FAIL: count expected 5, got 17"])
-out_b = "\n".join(["FAIL: cli expected 0, got 3", EVAL, "FAIL: value 1+2 expected 3, got <stand-in B value>",
-                   "FAIL: rejects 1+ expected 'ValueError', got 'no exception'", "FAIL: bare label",
-                   "FAIL: count expected 5, got 42"])
+# Exception checks as set 4's second battery worded them (51 and 76 such lines were sent back to the
+# MAX testers as findings before these wordings were recognised).
+EXC = ["FAIL: rejects 1+ expected 'ValueError', got 'no exception'", "FAIL: 1//0 expected error, got no error",
+       "FAIL: invalid-lone-cr expected ok, got no exception", "FAIL: 2 ** -1 did not raise ValueError"]
+out_a = "\n".join(["PASS: cli", EVAL, "FAIL: value 1+2 expected 3, got <stand-in A value>"] + EXC
+                  + ["FAIL: bare label", "FAIL: count expected 5, got 17"])
+out_b = "\n".join(["FAIL: cli expected 0, got 3", EVAL, "FAIL: value 1+2 expected 3, got <stand-in B value>"] + EXC
+                  + ["FAIL: bare label", "FAIL: count expected 5, got 42"])
 found = p.standin_findings(out_a, out_b, "pyexpr_max.py")
 checks += [
     ("the same FAIL line with a got-value against both is found", found == [EVAL]),
     ("a line that names a stand-in value is left alone", not any("stand-in" in f for f in found)),
-    ("an exception check (neither stand-in raises) is left alone", not any("ValueError" in f for f in found)),
+    ("exception checks, however worded, are left alone (neither stand-in raises)", not any(f in EXC for f in found)),
     ("a FAIL line without a value is left alone", "FAIL: bare label" not in found),
 ]
 crash = ('Traceback (most recent call last):\n  File "/work/acceptance_test.py", line 170, in <module>\n'
@@ -99,47 +102,23 @@ checks.append(("review: switched off, nothing runs", p.standin_review(state, "ac
 p.STANDIN_CHECK = True
 p.standin_runs, p.llm_chat = real_runs, real_chat
 
-# --- 3. The saved tests, in the sandbox -----------------------------------------------------------
+# --- 3. Saved tests, in the sandbox ---------------------------------------------------------------
+# From set 4's second battery: the two MAX tests whose exception checks were taken for findings (they
+# must come out clean); two High tests with a real bug each, found in the run but not repaired (a
+# FAIL message built with repr() of a 100,000-digit int, past Python's 4,300-digit limit; a reference
+# call to struct.calcsize that raises for every candidate); and the test TOML's Ultra winner passed.
+# The first battery's MAX tests, where the check found its first bugs (invalid expressions for eval,
+# endless recursion), were pruned with their runs before they were saved here.
 RUNS = config.RUNS_DIR
-# The two MAX tests first crash in their own code when the big-number check fails: building the FAIL
-# message takes repr() of a 100,000-digit int, past Python's 4,300-digit limit (no candidate failed
-# that check, so no run saw it). "+digits" copies them with that limit lifted, as a writer's fix would,
-# which uncovers the bugs the run met: invalid expressions for eval (a16) and endless recursion (a15).
-SAVED = [  # (run, folder, test file, target, expected)
-    ("20261102-100936", "a16c1", "acceptance_test.py", "pyexpr_max.py", "digits"),
-    ("20261102-100936", "a15c1", "acceptance_test.py", "pyexpr_max.py", "digits"),
-    ("20261102-100936", "a16c1", "acceptance_test.py+digits", "pyexpr_max.py", "eval"),
-    ("20261102-100936", "a15c1", "acceptance_test.py+digits", "pyexpr_max.py", "recursion"),
-    ("20261102-161028", "a10c3", "acceptance_test.py", "toml_max.py", "clean"),     # passed runs: a winner
-    ("20261102-161028", "a10c3", "adversarial_test.py", "toml_max.py", "clean"),    # passed these tests
-    ("20261102-143412", "a8c3", "acceptance_test.py", "toml_ultra.py", "clean"),
-    ("20261102-202246", "a8c4", "acceptance_test.py", "struct_max.py", "clean"),
-    ("20261102-202246", "a8c4", "adversarial_test.py", "struct_max.py", "clean"),
-    ("20261102-183130", "a7c4", "acceptance_test.py", "struct_ultra.py", "clean"),
-]
+case = os.path.join(HERE, "data", "standin_case")
 shutil.rmtree(os.path.join(RUNS, "unit-standin"), ignore_errors=True)
-for k, (run, cand, fname, target, want) in enumerate(SAVED, 1):
-    path = os.path.join(RUNS, run, cand, fname.split("+")[0])
-    if not os.path.exists(path):
-        checks.append((f"saved {run}/{cand}/{fname}: file missing (runs older than the newest 30 are deleted)", True))
-        continue
-    test = open(path, encoding="utf-8").read().replace("\r\n", "\n")
-    if fname.endswith("+digits"):
-        marker = "# --- independent acceptance test ---\n"
-        test = test.replace(marker, marker + "import sys as _s4300\n_s4300.set_int_max_str_digits(0)\n", 1)
-    role = "adversarial" if fname.startswith("adversarial") else "acceptance"
-    st = dict(state, target_file=target, attempt=100 + k)
-    found = p.standin_findings(*p.standin_runs(st, role, test), target)
+for k, c in enumerate(json.load(open(os.path.join(case, "cases.json"), encoding="utf-8")), 1):
+    test = open(os.path.join(case, c["file"]), encoding="utf-8").read()
+    st = dict(state, target_file=c["target"], attempt=100 + k)
+    found = p.standin_findings(*p.standin_runs(st, c["role"], test), c["target"])
     shown = "; ".join(f[:90] for f in found[:2])
-    if want == "digits":
-        ok = len(found) == 1 and "Exceeds the limit (4300 digits)" in found[0]
-    elif want == "eval":
-        ok = found and all("eval no exception" in f for f in found)
-    elif want == "recursion":
-        ok = found and any("RecursionError" in f for f in found)
-    else:
-        ok = found == []
-    checks.append((f"saved {run[-6:]}/{cand}/{fname} ({target}): {want} -> {len(found)} found {shown}", bool(ok)))
+    ok = found == [] if c["expect"] == "clean" else len(found) == 1 and c["expect"] in found[0]
+    checks.append((f"saved {c['file']} ({c['from']}): {c['expect']} -> {len(found)} found {shown}", ok))
 shutil.rmtree(os.path.join(RUNS, "unit-standin"), ignore_errors=True)
 
 failed = [name for name, ok in checks if not ok]

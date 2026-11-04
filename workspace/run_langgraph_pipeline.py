@@ -1964,13 +1964,22 @@ def write_test(state, role="acceptance"):
 
 
 def test_problem(target, role, code):
-    """(full test file, '' or what's wrong with it) for an independent test's code."""
-    full = test_header(target) + code.strip() + "\n"
-    shift = len(test_header(target).splitlines())       # report lines as the writer numbered them
+    """(full test file, '' or what's wrong with it) for an independent test's code. A forgotten
+    standard-library import is added at the top of the test's own part, as for candidates (set 4's
+    struct test on High lost its stand-in repair to `struct.error` without `import struct`)."""
+    header = test_header(target)
+    full = header + code.strip() + "\n"
+    shift = len(header.splitlines())                    # report lines as the writer numbered them
     try:
         compile(full, TEST_FILES[role], "exec")
     except SyntaxError as e:
         return full, f"doesn't compile (line {(e.lineno or shift) - shift}: {e.msg})"
+    _, added = add_missing_imports(full, TEST_FILES[role])
+    if added:
+        print(f"    [i] {ROLE_NAMES[role]}: added the missing import{'s' if len(added) > 1 else ''} of "
+              f"{', '.join(added)} to the test.")
+        full = header + "".join(f"import {name}\n" for name in added) + code.strip() + "\n"
+        shift += len(added)
     problems = static_problems(full, TEST_FILES[role])
     if problems:
         first = re.sub(r"line (\d+)", lambda m: f"line {int(m.group(1)) - shift}", problems[0], count=1)
@@ -2084,8 +2093,16 @@ _si_sp.Popen.__init__ = _si_marked
 '''
 _GOT = re.compile(r"\bgot\b", re.IGNORECASE)
 _STANDIN_MENTION = re.compile(r"stand-?in", re.IGNORECASE)
-# "expected ValueError, got no exception": an exception check; neither stand-in raises, a script may.
-_EXPECTS_ERROR = re.compile(r"\bexpected\W{0,3}[A-Z]\w*(?:Error|Exception|Exit)\b")
+# An exception check: "expected ValueError, got no exception", "expected error, got no error",
+# "expected ok, got no exception", "did not raise". Neither stand-in raises, so such checks fail
+# alike against both whatever the test is like; a script may raise. (Set 4's v2 battery: 51 and 76
+# lines like these were sent back to the MAX testers as findings, which their writers rightly ignored.)
+_EXPECTS_ERROR = re.compile(
+    r"\bexpected\W{0,3}[A-Z]\w*(?:Error|Exception|Exit)\b"
+    r"|\bexpected\W{0,3}(?:an?\W+)?(?:error|exception|raise|rejection|failure)\b"
+    r"|\bgot\W{0,3}(?:no|nothing)\b(?:\W+\w+){0,2}?\W+(?:exception|error|raised?)\b"
+    r"|\b(?:no|nothing)\W+(?:exceptions?|errors?)\W+(?:was\W+|were\W+)?raised\b"
+    r"|\bdid(?:n't|\W+not)\W+raise\b", re.IGNORECASE)
 
 
 def standin_code(name):
@@ -2190,6 +2207,12 @@ def repair_standin(state, role, system, blocks, full, found):
         fixed, problem = test_problem(target, role, new)
     if problem:
         print(f"    [i] {name}: the fix for the stand-in findings {problem}.")
+        try:                                # keep the reply for inspection
+            with open(os.path.join(config.RUNS_DIR, state["run_id"], f"standin-{role}-a{state['attempt']}-reply.txt"),
+                      "w", encoding="utf-8", newline="\n") as f:
+                f.write(raw)
+        except OSError:
+            pass
         return ""
     print(f"    {name}: fixed {n} place{'' if n == 1 else 's'} the stand-ins showed up.")
     return fixed
@@ -3713,6 +3736,75 @@ def run_stats(state):
 
 _FINALIZE_STARTED = threading.Event()
 
+FINAL_PICK = True           # a failed run judges its candidates by its final independent tests
+FINAL_PICK_RATIO = 0.7      # ... and overrules the furthest candidate only below this share of the best's
+
+
+def final_pick(state):
+    """A failed run with independent tests runs their final versions on every different candidate it
+    wrote. When the candidate it would keep passes under FINAL_PICK_RATIO of the share of their checks
+    that the best one passes, the best one is kept instead: {"code", "name", "share", "kept_share"},
+    else None. The furthest-candidate rank trusts a passing self-test, which a weak self-test makes
+    meaningless, and compares own-check shares across self-tests that change every attempt. Independent
+    tests are written from the spec, but they can be wrong too, so only a large gap overrules. In set
+    4's second battery the 8 failed High/Ultra/MAX runs kept 6,353 of the 8,325 points their best
+    candidates reach; this rule keeps 7,937 (any ratio from 0.6 to 0.8 does), while always taking the
+    top share keeps 7,410, because struct on Ultra's test held wrong hand-worked bytes and favoured a
+    candidate that shared them (finalpick_sim.py)."""
+    tests = {role: text for role, text in (state.get("tests") or {}).items() if text}
+    run_dir, target = os.path.join(config.RUNS_DIR, state["run_id"]), state["target_file"]
+    if not tests or not os.path.isdir(run_dir):
+        return None
+    latest = {}                                     # code -> (attempt, k) of its latest copy
+    for d in os.listdir(run_dir):
+        m = re.fullmatch(r"a(\d+)c(\d+)", d)
+        if m and os.path.isfile(os.path.join(run_dir, d, target)):
+            with open(os.path.join(run_dir, d, target), encoding="utf-8") as f:
+                code = f.read().strip()
+            latest[code] = max(latest.get(code, (0, 0)), (int(m.group(1)), int(m.group(2))))
+    current = (state["code"] or "").strip()
+    if not current or not latest or set(latest) == {current}:
+        return None
+    names = {code: f"a{a}c{k}" for code, (a, k) in latest.items()}
+    names.setdefault(current, "kept")
+
+    def share(code):
+        box = f"final-{names[code]}"
+        folder = box_dir(state, box)
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, target), "w", encoding="utf-8", newline="\n") as f:
+            f.write(code + "\n")
+        shares = []
+        try:
+            for role, text in tests.items():
+                with open(os.path.join(folder, TEST_FILES[role]), "w", encoding="utf-8", newline="\n") as f:
+                    f.write(text)
+                try:
+                    res = run_in_box(state, box, ["timeout", "-k", "3", str(test_timeout(state)),
+                                                  "python3", "-u", f"/work/{TEST_FILES[role]}"])
+                    run = {"stdout": res.stdout, "stderr": res.stderr, "rc": res.returncode}
+                except subprocess.TimeoutExpired:
+                    run = {"stdout": "", "stderr": "", "rc": 124}
+                _rank, passes, fails = progress(run)
+                shares.append(passes / (passes + fails) if passes + fails else 0.0)
+        finally:
+            remove_boxes(state, [box])
+            shutil.rmtree(folder, ignore_errors=True)
+        return sum(shares) / len(shares)
+    print(f"\n[i] Judging the run's {len(names)} different candidates by the final version"
+          f"{'s' if len(tests) > 1 else ''} of {' and '.join(TEST_LABELS[r] for r in tests)}...")
+    report(state, phase="choosing the final file")
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        shares = dict(zip(names, pool.map(share, list(names))))
+    top = max(shares, key=lambda c: (shares[c], latest.get(c, (0, 0))))
+    if top == current or shares[current] >= FINAL_PICK_RATIO * shares[top]:
+        print(f"    The candidate kept passes {shares[current]:.0%} of the checks and the best "
+              f"({names[top]}) {shares[top]:.0%}: it stays.")
+        return None
+    print(f"    {names[top]} passes {shares[top]:.0%} of the checks, the candidate kept only "
+          f"{shares[current]:.0%}: saving {names[top]} instead.")
+    return {"code": top, "name": names[top], "share": shares[top], "kept_share": shares[current]}
+
 
 def finalize_node(state):
     _FINALIZE_STARTED.set()
@@ -3731,14 +3823,26 @@ def finalize_node(state):
                      verdict=b["verdict"] + f" (A reviewer later found possible problems, but {why}, "
                                             "so this passing version was kept.)")
     far = state.get("furthest") or {}
+    verdict = state.get("verdict") or ""
     if state["status"] != "PASSED" and far and far["code"].strip() != (state["code"] or "").strip():
         how = ("its own test passed" if far["rank"][0]
                else f"{far['passes']} of {far['passes'] + far['fails']} of its own checks passed")
         print(f"\n[i] Saving the candidate that got furthest as the final file (attempt {far['attempt']}, "
               f"candidate {far['k']}: {how}), not the last attempt's code.")
-        state = dict(state, code=far["code"], verdict=(state.get("verdict") or "") + (
+        state = dict(state, code=far["code"], verdict=verdict + (
             f" (The final file is attempt {far['attempt']}'s candidate {far['k']}, which got furthest: {how}. "
             "The error shown is the last attempt's.)"))
+    if state["status"] == "FAILED" and FINAL_PICK:
+        picked = None
+        try:
+            picked = final_pick(state)
+        except Exception as e:              # the sandbox must never cost a failed run its final file
+            print(f"    [i] Couldn't judge the candidates by the final tests ({short(e)}); keeping this one.")
+        if picked:
+            state = dict(state, code=picked["code"], verdict=verdict + (
+                f" (The final file is {picked['name']}: on the final independent tests it passed "
+                f"{picked['share']:.0%} of the checks, against {picked['kept_share']:.0%} for the candidate that "
+                "got furthest by its own test. The error shown is the last attempt's.)"))
     result_file = save_result_file(state)
     if state["status"] == "PASSED":
         dest, backup = promote(state)

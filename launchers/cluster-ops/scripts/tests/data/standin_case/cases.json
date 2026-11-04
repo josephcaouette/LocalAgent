@@ -1,0 +1,37 @@
+[
+ {
+  "file": "pyexpr_max_acceptance.py",
+  "role": "acceptance",
+  "target": "pyexpr_max_v2.py",
+  "expect": "clean",
+  "from": "20261103-095058/a1c2"
+ },
+ {
+  "file": "toml_max_adversarial.py",
+  "role": "adversarial",
+  "target": "toml_max_v2.py",
+  "expect": "clean",
+  "from": "20261103-151916/a1c1"
+ },
+ {
+  "file": "pyexpr_high_acceptance.py",
+  "role": "acceptance",
+  "target": "pyexpr_high_v2.py",
+  "expect": "digits",
+  "from": "20261103-035143/a1c1"
+ },
+ {
+  "file": "struct_high_acceptance.py",
+  "role": "acceptance",
+  "target": "struct_high_v2.py",
+  "expect": "struct.error",
+  "from": "20261103-060002/a1c1"
+ },
+ {
+  "file": "toml_ultra_winner_acceptance.py",
+  "role": "acceptance",
+  "target": "toml_ultra_v2.py",
+  "expect": "clean",
+  "from": "20261103-135619/a5c2"
+ }
+]
