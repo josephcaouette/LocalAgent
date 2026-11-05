@@ -6,7 +6,7 @@ utilities, can research the web for them, remembers what worked, and explains it
 | Node | Hardware | Role |
 |---|---|---|
 | Node 1, 192.168.254.24 | i7-14700K, RTX 4090, 32 GB, Windows 11 + WSL2 | vLLM serving Qwen3.8-27B (4-bit, CUDA graphs, speculative decoding); the Agent Cluster window and the pipeline |
-| Node 2, 192.168.254.25 | Dual Xeon E5-2620 v2, 64 GB ECC, 5 TB RAID volume, Ubuntu 24.04 | The file share (`/mnt/blackboard`, mapped as `Z:\` on Node 1), Redis, Qdrant, SearXNG, the web dashboard, the test sandbox |
+| Node 2, 192.168.254.25 | Dual Xeon E5-2620 v2, 128 GB ECC, 5 TB RAID volume, Ubuntu 24.04 | The file share (`/mnt/blackboard`, mapped as `Z:\` on Node 1), Redis, Qdrant, SearXNG, the web dashboard, the test sandbox |
 | Node 3, 192.168.254.26 | MSI laptop, RTX 2070 8 GB, Ubuntu 24.04 | Ollama: `qwen3-embedding:0.6b` embeddings, background memory summaries, chat fallback, and page reading while Node 1 is busy (`qwen3.5:9b`) |
 
 ## Contents
@@ -49,7 +49,9 @@ This repository is the share's root folder on Node 2. `.gitignore` allows only t
   - `agent_dashboard.py`: web dashboard on port 8080 (runs as a Docker service on Node 2).
   - `background_ingest.py`, `reindex_memory.py`, `agent_common.py`: long-term memory and shared helpers.
   - `run_digest.py`: the plain-English run summaries Node 1 writes while the queue is idle.
-  - Every other `.py` file is a utility the agent built.
+  - Every other `.py` file is a utility the agent built, apart from the first prototypes of
+    2026-10-27, kept for reference: `run_crew_pipeline.py` (CrewAI), `run_agent_loop.py`,
+    `run_agent_loopOLD.py` and `sync_memory.py`.
 - `docker/`: `docker-compose.yml` (Redis, Qdrant, SearXNG, dashboard), the sandbox image's
   Dockerfile and SearXNG's settings.
 - `launchers/`: the Agent Cluster window (`cluster_launcher/`), the fallback `.bat` files, Node 1's
@@ -191,15 +193,15 @@ of this tab (the status-check lines are hidden), and it keeps running when you c
 |---|---|---|
 | Preset | Fast | **Fast** for daily use. **Long context (32k)** for very large files or chats: about half speed, because speculative decoding is off so the bigger context fits. **Old model** (Qwen2.5-Coder-32B) as a fallback. Saving records which preset the values match, or "Custom" |
 | Model | `RedHatAI/Qwen3.8-27B-INT4` | The Hugging Face model. A new name downloads on first start. The pipeline uses whatever vLLM serves |
-| Context | 16,384 | Most tokens one request may hold (prompt plus answer). About 12,000 words or 1,500 lines of code. The pipeline measures and trims prompts to fit. Above 16k, vLLM's working memory jumps from 0.6 to 2.8 GiB, so fewer requests fit at once |
+| Context length | 16,384 | Most tokens one request may hold (prompt plus answer). About 12,000 words or 1,500 lines of code. The pipeline measures and trims prompts to fit. Above 16k, vLLM's working memory jumps from 0.6 to 2.8 GiB, so fewer requests fit at once |
 | GPU memory | 0.92 | Share of the 4090 vLLM claims. It holds the model (~17 GB), working memory, and the **KV cache**: the model's short-term memory of the text it's working on. See the table below |
 | Parallel requests | 8 | Most requests served at once. Candidates, the tester, judges, research and chat share them. KV cache is the real limit, not this |
-| KV cache type | fp8 | 8-bit short-term memory: twice the room of 16-bit, with no noticeable quality loss |
+| KV cache | fp8 | 8-bit short-term memory: twice the room of 16-bit, with no noticeable quality loss |
 | Attention backend | TRITON_ATTN | FlashInfer can't build here with fp8, so Triton is used. Leave it |
 | Speculative decoding (MTP), draft tokens | on, 2 | The model's built-in predictor guesses 2 tokens ahead; the full model checks them in one step. About 94% of guesses are right, which is most of why output runs at ~104 tokens/s instead of ~35. The output is identical to running without it |
 | CUDA graphs | on | Records the GPU's work once and replays it. Roughly tripled speed; costs ~1 GB and ~60 s of start-up. Off adds `--enforce-eager` (troubleshooting only) |
 | Prefix caching | off | Reuses work when requests start with the same text. Doesn't combine well with this model's design and speculative decoding. The 32k preset turns it on |
-| Text-only | on | Skips the model's image encoder, which leaves more memory for KV cache |
+| Text only (skip vision) | on | Skips the model's image encoder, which leaves more memory for KV cache |
 | Reasoning parser | qwen3 | Keeps the model's private thinking separate from its answer. Required for thinking |
 | Extra arguments | empty | Any other vLLM flags. Shell symbols are rejected |
 
@@ -249,6 +251,25 @@ Keep it that way: a monitor on the 4090 would use some of its memory.
   - **Show command:** the exact command line.
   - **Open log file:** the full log in Notepad.
 - If vLLM fails to start, the Activity log shows the reason with a hint.
+
+**Reading vLLM's log.** While it works, vLLM prints a line like this every 10 seconds, followed by
+the number of requests waiting and how full the KV cache is:
+
+```
+Avg prompt throughput: 628.1 tokens/s, Avg generation throughput: 204.0 tokens/s, Running: 5 reqs
+```
+
+- **Generation throughput** is the number to watch: how fast the model writes, summed over the
+  requests it's serving. On the 32k server that's about 52 tokens/s for one request and 230-250 for
+  five.
+- **Prompt throughput reads 0.0 most of the time, and that's normal.** vLLM books a request's whole
+  prompt in the one reading where its first reply token comes out, counting only what it had to
+  compute (text reused from its cache is left out). Reading a prompt takes a second or two and
+  writing the reply takes minutes, so in 6 hours of a test battery 96% of readings showed 0.0 and the
+  rest jumped between 40 and 4,134 tokens/s. A spike is the tokens booked in those 10 seconds divided
+  by 10, not how fast the GPU reads.
+- **Waiting** requests are normal for a moment when several arrive together. A KV cache near 100%
+  for long stretches means the load needs more cache than the server has (see the A/B above).
 
 ### Cluster tab
 
@@ -706,13 +727,13 @@ with this one's best candidate in brackets where better:
      read too. (In the second battery a CSV run went round this loop nine times.)
    - **A dead end gets a fresh start.** When three attempts in a row get less far than the best of
      their line of fixes (by the same measure as the furthest candidate in step 11), the next attempt
-     writes fresh candidates from the goal and spec (on High and above each with a different
-     approach), told how the set-aside version failed, instead of fixing it again. That happens at
-     most twice per run, and the count starts over so the fresh line has time to climb. Fixes inherit
-     their version's design: in the fourth battery's second run, the expression evaluator on MAX
-     spent its last 10 attempts fixing one parser that rejected every valid expression. Replayed on
-     that battery's logs (`restart_sim.py`), the rule fires in 4 stuck runs and never in the run that
-     passed; earlier candidates stay on disk for the final pick.
+     writes fresh candidates from the goal and spec, thinking first (on High and above each with a
+     different approach), told how the set-aside version failed, instead of fixing it again. That
+     happens at most twice per run, and the count starts over so the fresh line has time to climb.
+     Fixes inherit their version's design: in the fourth battery's second run, the expression
+     evaluator on MAX spent its last 10 attempts fixing one parser that rejected every valid
+     expression. Replayed on that battery's logs (`restart_sim.py`), the rule fires in 4 stuck runs
+     and never in the run that passed; earlier candidates stay on disk for the final pick.
    - **A test that fails with nothing failing goes back to its writer.** When an independent test
      exits with an error for every candidate alike while printing only PASS lines (no FAIL line, no
      traceback, no timeout), its own bookkeeping is wrong: it goes back to its writer and the same
@@ -767,11 +788,15 @@ with this one's best candidate in brackets where better:
 Exit codes from the command line: 0 passed, 1 failed, 2 stopped by an error.
 
 ```
-python run_langgraph_pipeline.py --goal="..." [--target=name.py] [--attach=path ...]
+python run_langgraph_pipeline.py (--goal="..." | --goal-file=FILE) [--target=name.py] [--attach=path ...]
                                  [--allow-network] [--research] [--accuracy=low|medium|high|ultra|max]
                                  [--no-memory] [--no-ingest] [--helper-think=TOKENS]
                                  [--fix-base=latest|furthest]
 ```
+
+`--goal-file` reads the goal from a UTF-8 text file, which is safer than quoting a long goal on the
+command line (the test batteries use it). `--overnight` still works as the old name for
+`--accuracy=medium`.
 
 `--helper-think` sets how much the test writers (tester, adversary, prober) may think, for
 experiments; normally they use the level's budget. Raising it to 8,000 on MAX didn't reduce the
@@ -863,10 +888,14 @@ runs the queue starts at once.
 
 | Setting | Value | Meaning |
 |---|---|---|
+| `LLM_BASE_URL` | http://127.0.0.1:8001 | Where vLLM answers. `127.0.0.1`, not `localhost`: Windows tries IPv6 first, and each new connection to WSL then waits about 2 s |
+| `LLM_MODEL` | RedHatAI/Qwen3.8-27B-INT4 | The model the pipeline expects. If vLLM serves another one, it uses that |
+| `LLM_FALLBACK_CONTEXT` | 8192 | Context size assumed only if vLLM doesn't report its own |
+| `LLM_ENABLE_THINKING` | False | Whether calls think by default. Off is several times faster; the settings below and each level's `think_engineer` turn thinking on where it pays |
 | `ENGINEER_MAX_OUTPUT` | 12000 | Longest file the engineer may write, in tokens. A file is also kept to half the context window: 8,192 tokens (about 600-800 lines) with the 16k server, the full 12,000 with the 32k preset |
 | `LLM_TEMPERATURE`, `LLM_TOP_P`, `LLM_TOP_K` | 0.7, 0.8, 20 | How adventurous word choice is (the model maker's values). Lower is more predictable. Thinking calls use 0.6 / 0.95. The randomness is what makes candidates differ |
 | `THINK_PLANNER`, `THINK_VERIFIER` | True | Let those steps think first |
-| `THINK_TOKENS` | 5000 | Default thinking budget (Low and Medium use it; High sets its own) |
+| `THINK_TOKENS` | 5000 | Default thinking budget (Low and Medium use it; High and above set their own) |
 | `LLM_TIMEOUT` | 1200 | Seconds before one request is abandoned (generous because runs share the GPU) |
 
 **Helpers and Node 3**
@@ -901,6 +930,7 @@ runs the queue starts at once.
 
 | Setting | Value | Meaning |
 |---|---|---|
+| `SANDBOX_IMAGE`, `SANDBOX_PYTHON` | agent-sandbox:latest, 3.11 | The test image (built from `docker/sandbox/Dockerfile`) and its Python version, which the prompts and the result chat name |
 | `SANDBOX_TIMEOUT`, `SANDBOX_MEMORY`, `SANDBOX_CPUS`, `SANDBOX_PIDS` | 20 s, 1g, 2, 128 | Limits per test run (the process limit stops runaway spawning) |
 | `SANDBOX_PACKAGES` | requests, redis, psutil, yaml | Libraries available in tests. To add one, add it to `docker/sandbox/Dockerfile` **and** this list, then rebuild the image (`docker compose build` on Node 2) |
 | `SANDBOX_PREWARM` | True | Start test containers while the engineer writes (see below) |
@@ -914,6 +944,19 @@ runs the queue starts at once.
 | `DASHBOARD_MAX_TASKS` | 50 | Runs shown on the web dashboard |
 | `KEEP_HISTORY_PER_FILE` | 20 | Old versions kept per file in `.history` |
 | `PROTECTED_FILES` | the core files | Files the agent may never overwrite |
+| `ACTIVE_STALE_S` | 120 s | A run whose heartbeat is older than this counts as gone (LOST) |
+
+**Pipeline switches** (in `run_langgraph_pipeline.py`, next to the steps they change, for
+experiments; each run reads them when it starts)
+
+| Setting | Value | Meaning |
+|---|---|---|
+| `STANDIN_CHECK` | True | Run each new or revised independent test against two stand-ins before blaming a candidate (step 4 of [How a run works](#how-a-run-works)) |
+| `MAX_RETESTS` | 3 | Re-tests of unchanged code after a blamed test, per run (step 7) |
+| `RESTART_AFTER`, `MAX_RESTARTS` | 3, 2 | Attempts in a row that get less far than their line's best before a fresh start, and fresh starts per run (step 7) |
+| `LOW_DIAGNOSIS_THINK` | 3000 | Thinking for Low and Medium's diagnosis of a check that failed without a crash (step 7) |
+| `FINAL_PICK`, `FINAL_PICK_RATIO` | True, 0.7 | A failed High+ run judges its candidates by its final independent tests, and overrules the furthest one when that passes under 70% of the best share (step 11) |
+| `FIX_BASE` | "latest" | What a fix starts from; set by `--fix-base` |
 
 Optional Redis and Qdrant passwords go in `Z:\config\agent_secrets.env` (template in `config/`).
 That folder is outside the workspace, so tests can't read it, and it's never committed.
@@ -927,8 +970,9 @@ Measured on 2026-10-30:
   - Speed: ~104 tokens/s output for one request and ~2,870 tokens/s reading prompts. With several
     requests at once (candidates, judges), total output reaches ~250-330 tokens/s.
   - CPU and RAM: Node 1's are mostly idle, which is normal.
-  - Node 2's 64 GB and 24 threads are mostly idle too: its services use about 0.3 GB. Its 2013-era
-    CPUs and DDR3 would run a model at only 1-2 tokens/s, so it stores, searches and tests instead.
+  - Node 2's 128 GB and 24 threads are mostly idle too: its services use about 0.6 GB (Qdrant 0.4 GB,
+    on 2026-11-05). Its 2013-era CPUs and DDR3 would run a model at only 1-2 tokens/s, so it stores,
+    searches and tests instead.
 - **Two runs at once.** vLLM serves several requests together. One run fills the GPU only while it
   writes candidates; during planning and checking, most of its capacity sits unused, and a second
   run fills that gap. In the first test, three queued runs (two at once, the third waiting) finished
@@ -1007,6 +1051,8 @@ databases, run folders, logs or secrets.
 | The Chat, Task & Queue and Runs tabs show "Connect Z:" | `Z:` isn't connected. Press Connect Z: and type the share password; the tabs load by themselves |
 | vLLM won't start: "free memory ... less than desired" | Something else is using the GPU. Close it, or press Check free VRAM and start again |
 | Chat says vLLM isn't reachable | vLLM is stopped or still loading (see the Model server tab's log). Start it, or pick Node 3 in the chat |
+| vLLM is down after the PC slept | Sleep can end vLLM without a trace: no vLLM process in WSL, and its log stops with no shutdown line. Press Start everything, or Start vLLM on the Model server tab. A run that was going can't finish; re-run it. For long unattended runs and test batteries, set Windows not to sleep while plugged in (Settings, System, Power) |
+| vLLM's log shows "Avg prompt throughput: 0.0 tokens/s" most of the time | Normal: vLLM counts a prompt only in the 10-second reading where its reply starts. See "Reading vLLM's log" on the [Model server tab](#model-server-tab) |
 | A run shows LOST | Its process ended without finishing (killed, PC restarted). Re-run this goal |
 | A run seems stuck | Its log on the Task & Queue tab shows what it's waiting for. Stop / remove it, or press Reset pipeline on the Cluster tab |
 | A High, Ultra or MAX run waits in the queue | It starts once the runs ahead of it finish, because it needs the GPU to itself (Ultra and MAX then wait about a minute for vLLM to switch to 32k) |
