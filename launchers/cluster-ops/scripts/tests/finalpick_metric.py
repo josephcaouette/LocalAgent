@@ -5,11 +5,13 @@
 finalpick_sim.py saves, per failed run and candidate, (passes, fails, exit code) for each final test
 (finalpick_<name>.json); score_candidates.py saves each candidate's reference score. The pipeline keeps
 the candidate that got furthest and overrules it when its measure is under RATIO of the best one's.
-  share  passes / (passes + fails), averaged over the tests: the pipeline's measure until 2026-11-05.
+  share  passes / (passes + fails), averaged over the tests: the pipeline's measure.
   reach  passes / the most checks that test printed for any candidate, averaged over the tests.
 A test that stops early for one candidate prints fewer checks, so a broken candidate can show a large
 share of very few: in set 4's third battery the evaluator on Ultra kept a candidate passing 68 of 85
-checks (80%, 152 reference cases) over one passing 77 of 395 (19%, 946 cases)."""
+checks (80%, 152 reference cases) over one passing 77 of 395 (19%, 946 cases). Reach fails the other
+way when the test stops early for the right candidates (the second battery's struct on Ultra). On both
+batteries' 11 failed runs: share 10,530, reach 10,642, of 11,716 (2026-11-05), so share stays."""
 import json
 import os
 import re

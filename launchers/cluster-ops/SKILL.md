@@ -261,8 +261,10 @@ test; `lastchance_unit.py`, `silent_unit.py`). Stand-in false alarms fixed: `_EX
 raise", `_BARE_GOT` drops FAIL lines ending in a bare None/True/False (`isinstance` verdicts); standin_unit
 keeps struct/max's two tests (old rule 19 and 1 findings, new 0). Final pick: overruled once (pyexpr/ultra
 a3c3 1 -> a2c3 152) and missed a1c3 (946): the test stopped early for a2c3 (68/85) but ran 395 checks for
-a1c3 (77). `finalpick_metric.py <names>` compares share with reach (passes / most checks printed): reach
-loses on v2 (6,381 vs 6,930; struct/ultra's test stopped early for the right candidates), so share stays.
+a1c3 (77). `finalpick_metric.py <names>` compares share with reach (passes / most checks printed): v2
+reach 6,381 vs share 6,930 (struct/ultra's test stopped early for the right candidates), v3 pyexpr/ultra
+reach 813 vs 152; both batteries (finalpick_set4_v2/v3_umax.json) 10,642 vs 10,530 of 11,716 at any ratio
+0.6-0.8, one bad loss each, so share stays (no change on two opposite cases).
 `restart_sim.py` now skips re-tests and pruned logs; its shares come from log tails, so it's approximate.
 If vLLM is down (the PC slept: no process in WSL, log ends without a shutdown line), start it with the
 window's saved settings: `cl.vllm_script(cl.load_settings()["vllm"])` run detached through `wsl bash

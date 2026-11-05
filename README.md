@@ -656,13 +656,14 @@ kept file, then the second's, then this one's, with this one's best candidate in
   it replaced the furthest candidate (its self-test passed; 1 case) with one matching 152, while the
   run's best (attempt 1, 946 cases) came out lower by share: the final acceptance test stopped after 85
   checks for the 152-case candidate, which passed 68 (80%), and ran 395 for the 946-case one, which
-  passed 77 (19%). Counting passes against the most checks any candidate reached isn't the answer: in
-  the second battery's struct run on Ultra the test stopped early for the right candidates instead (49
-  of 63 passed, against 315 of 341 for one matching 753 cases), and that count would have kept 753
-  instead of 1,302; on that battery's seven failed runs it keeps 6,381 points against the share's
-  6,930 (`finalpick_metric.py`). The share and the 70% rule stay. In the other three failed runs the
-  furthest candidate stayed, within a point of the best share: 1,167, 970 and 1,311 cases kept, against
-  bests of 1,173, 970 and 1,311.
+  passed 77 (19%). Counting passes against the most checks any candidate reached would have kept a
+  candidate matching 813 here, but it fails the other way in the second battery's struct run on Ultra,
+  where the test stopped early for the right candidates (49 of 63 passed, against 315 of 341 for one
+  matching 753 cases): it would have kept 753 instead of 1,302. Over both batteries' 11 failed runs the
+  two come within 1% (10,642 points against the share's 10,530, of the 11,716 their best candidates
+  reach; `finalpick_metric.py`), each losing one run badly, so the share and the 70% rule stay. In the
+  other three failed runs the furthest candidate stayed, within a point of the best share: 1,167, 970
+  and 1,311 cases kept, against bests of 1,173, 970 and 1,311.
 - **The stand-in check found 4 real test bugs; its false alarms are fixed.** Real: the 4,300-digit
   limit in both of the evaluator on MAX's tests, and two crashes in struct on MAX's acceptance test
   (its own `raises()` helper, and a reference call that raised `struct.error`). False, all in struct
