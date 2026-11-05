@@ -3,8 +3,10 @@ second battery the expression evaluator on MAX spent its last 10 attempts fixing
 rejected every valid expression. After RESTART_AFTER attempts in a row whose best candidate got less
 far than the best of their line of fixes, the next attempt writes fresh candidates from the goal and
 spec, told what the dead end was, instead of fixing that version again (at most MAX_RESTARTS per run).
-1. The count (dead_end). 2. Through the executor. 3. The engineer's fresh start."""
+1. The count (dead_end). 2. Through the executor and the re-test node (a re-test doesn't count, and
+re-tests are counted per independent test). 3. The engineer's fresh start."""
 import os
+import shutil
 import sys
 
 sys.path.insert(0, r"Z:\workspace")
@@ -64,6 +66,29 @@ runs.update({1: cand(1, 1, 1, 4, code="a"), 2: cand(2, 1, 3, 3, error="ValueErro
 upd = p.sandbox_executor_node(base)
 checks.append(("executor: the third attempt without progress sets up a fresh start",
                upd["status"] == "FAILED" and upd["restarts"] == 1 and "ValueError: invalid" in upd["restart_note"]))
+# Set 4's third battery: struct on Ultra re-tested two candidates against a test being corrected, the
+# lower ranks set off a restart, and the next re-test passed with those same candidates.
+upd = p.sandbox_executor_node(dict(base, retesting=True))
+checks.append(("executor: a re-test (same code, revised test) neither counts nor restarts",
+               upd["status"] == "FAILED" and not any(k in upd for k in ("stall", "line_best", "restarts", "restart_note"))))
+
+# Through the re-test node: it tells the executor, and counts re-tests per independent test.
+seen = {}
+real_exec = p.sandbox_executor_node
+p.sandbox_executor_node = lambda st: (seen.update(st), {"status": "FAILED", "candidates": st["candidates"]})[1]
+p.prewarm_containers = lambda *a, **k: None
+p.write_test = lambda st, role: p.test_header("t.py") + "print('PASS: fixed')\n"
+rt = dict(base, attempt=10, failed_test="adversarial", checks=["c"], tests={"acceptance": "a", "adversarial": "b"},
+          test_checks={}, test_feedback={}, retests_used=3, retests_by_test={"acceptance": 3}, num_candidates=1,
+          probe="", candidates=[{"k": 1, "status": "coded", "code": "a", "failed_test": "adversarial"}])
+os.makedirs(p.cand_dir(rt, 9, 1), exist_ok=True)
+with open(os.path.join(p.cand_dir(rt, 9, 1), "t.py"), "w", encoding="utf-8") as f:
+    f.write("a\n")
+upd = p.retest_node(rt)
+p.sandbox_executor_node = real_exec
+checks.append(("re-test node: the executor is told it's a re-test, and the count is per test",
+               seen.get("retesting") is True and upd["retests_by_test"] == {"acceptance": 3, "adversarial": 1}
+               and upd["retests_used"] == 4))
 runs[2] = dict(cand(2, 0, 5, 0, code="b"), exec_ok=True)
 upd = p.sandbox_executor_node(base)
 checks.append(("executor: a candidate that passes ends the count", upd["status"] == "EXECUTED" and upd["stall"] == 0))
@@ -116,6 +141,7 @@ out = p.engineer_node(dict(eng, restart_note=""))
 checks.append(("engineer: without a note, a failure is fixed as before",
                "Previous version:" in calls[0]["titles"] and not calls[0]["note"]))
 
+shutil.rmtree(os.path.join(config.RUNS_DIR, "unit-restart"), ignore_errors=True)
 failed = [name for name, ok in checks if not ok]
 for name, ok in checks:
     print(("PASS " if ok else "FAIL ") + name)

@@ -133,7 +133,8 @@ class AgentState(TypedDict):
     probe_verdicts: dict    # the referee's decisions on disputed probe answers, reused later
     mutation_done: bool
     retest: bool            # the diagnosis blamed only the test: fix it and re-test the same code
-    retests_used: int
+    retests_used: int       # re-tests in the whole run
+    retests_by_test: dict   # re-tests per independent test (each gets MAX_RETESTS; see retests_left)
     last_chance_used: bool  # the one diagnosis allowed after the last attempt (see last_chance)
     indep_last: dict        # the last independent-test diagnosis: {"role", "fails", "blame", "attempt"}
     best_passed: dict       # the last version that passed, kept while the reviewer's fixes run
@@ -2098,15 +2099,22 @@ _si_sp.Popen.__init__ = _si_marked
 _GOT = re.compile(r"\bgot\b", re.IGNORECASE)
 _STANDIN_MENTION = re.compile(r"stand-?in", re.IGNORECASE)
 # An exception check: "expected ValueError, got no exception", "expected error, got no error",
-# "expected ok, got no exception", "did not raise". Neither stand-in raises, so such checks fail
-# alike against both whatever the test is like; a script may raise. (Set 4's v2 battery: 51 and 76
-# lines like these were sent back to the MAX testers as findings, which their writers rightly ignored.)
+# "expected ok, got no exception", "did not raise", "128 should raise ValueError". Neither stand-in
+# raises, so such checks fail alike against both whatever the test is like; a script may raise.
+# (Set 4's v2 battery: 51 and 76 lines like these were sent back to the MAX testers as findings, which
+# their writers rightly ignored; the v3 battery added "should raise".)
 _EXPECTS_ERROR = re.compile(
     r"\bexpected\W{0,3}[A-Z]\w*(?:Error|Exception|Exit)\b"
     r"|\bexpected\W{0,3}(?:an?\W+)?(?:error|exception|raise|rejection|failure)\b"
     r"|\bgot\W{0,3}(?:no|nothing)\b(?:\W+\w+){0,2}?\W+(?:exception|error|raised?)\b"
     r"|\b(?:no|nothing)\W+(?:exceptions?|errors?)\W+(?:was\W+|were\W+)?raised\b"
-    r"|\bdid(?:n't|\W+not)\W+raise\b", re.IGNORECASE)
+    r"|\bdid(?:n't|\W+not)\W+raise\b"
+    r"|\b(?:should|must|to|would)\W+(?:have\W+|be\W+)?raised?\b", re.IGNORECASE)
+# A bare None, True or False after "got" is a verdict the test worked out (isinstance(x, tuple), "did it
+# raise?"), not the script's answer, so it comes out the same for both stand-ins whether the test is right
+# or wrong. (Set 4's v3 battery: "unpack tuple expected True, got False", and 19 checks written as
+# isinstance(exc(...), ValueError) that print "expected None, got None", were sent back as findings.)
+_BARE_GOT = re.compile(r"\bgot\W{0,3}(?:None|True|False|null)\W*$", re.IGNORECASE)
 
 
 def standin_code(name):
@@ -2169,14 +2177,15 @@ def _standin_fails(out):
 
 def standin_findings(out_a, out_b, target):
     """What the test reports the same way against both stand-ins: FAIL lines with a got-value that
-    don't mention a stand-in and don't expect an exception, and a crash in the test's own code. Such a
-    result can't come from the script's answer (set 4's MAX acceptance test fed Python's eval
-    expressions its generator made invalid, and its generator once recursed without end)."""
+    don't mention a stand-in, don't expect an exception and don't end in a bare None/True/False, and a
+    crash in the test's own code. Such a result can't come from the script's answer (set 4's MAX
+    acceptance test fed Python's eval expressions its generator made invalid, and its generator once
+    recursed without end)."""
     fails_b = set(_standin_fails(out_b))
     found = []
     for ln in _standin_fails(out_a):
         if (ln in fails_b and _GOT.search(ln) and not _STANDIN_MENTION.search(ln)
-                and not _EXPECTS_ERROR.search(ln) and ln not in found):
+                and not _EXPECTS_ERROR.search(ln) and not _BARE_GOT.search(ln) and ln not in found):
             found.append(ln)
     crash = crash_point(out_a, target)
     if (crash and crash == crash_point(out_b, target) and not _STANDIN_MENTION.search(crash)
@@ -2646,9 +2655,20 @@ def engineer_node(state):
     return {"candidates": candidates, "status": "CODED", "error": "", "failure_kind": "", **updates}
 
 
-MAX_RETESTS = 3     # re-tests of unchanged code after a blamed test, per run
+MAX_RETESTS = 3     # re-tests of unchanged code after a blamed test, per independent test
 RESTART_AFTER = 3   # attempts in a row without progress before the next one starts over (dead_end)
 MAX_RESTARTS = 2    # per run
+
+
+def retests_left(state):
+    """Whether the independent test that failed last may still be fixed and the same code re-tested:
+    MAX_RETESTS for each test, so one test's string of fixes doesn't use up another's. In set 4's third
+    battery, struct on MAX spent all three on its acceptance test by attempt 11. When the diagnosis
+    rightly blamed the adversarial test on attempt 15, the engineer had to rewrite instead, every
+    rewrite failed its own test, and the run failed although the candidate it kept passed every check
+    of both final tests (1,311 of 1,315 reference cases)."""
+    role = state.get("failed_test") if state.get("failed_test") in TEST_FILES else "acceptance"
+    return (state.get("retests_by_test") or {}).get(role, 0) < MAX_RETESTS
 
 
 def dead_end(state, results, best):
@@ -2659,7 +2679,10 @@ def dead_end(state, results, best):
     Fixes inherit their version's design: in set 4's second battery the expression evaluator on MAX
     spent its last 10 attempts fixing one parser that rejected every valid expression. Replayed on
     that battery's logs (restart_sim.py), this fires in 4 stuck runs and never in the run that passed.
-    Earlier candidates stay on disk, so a failed run's final pick still sees them."""
+    Earlier candidates stay on disk, so a failed run's final pick still sees them. A re-test isn't
+    counted (the executor skips this for it): its code is unchanged and only the test moved. In the
+    third battery, struct on Ultra's re-tests of two candidates against a test being corrected set off
+    a restart, and the third re-test then passed with those same candidates."""
     top = max(list(progress(c)[0]) for c in results)
     line_best = state.get("line_best") or []
     if line_best and top < line_best:
@@ -2682,10 +2705,13 @@ def retest_node(state):
     candidates are tested again in this attempt's folders (no rewrite of code that was right)."""
     prev, attempt, target = state["attempt"] - 1, state["attempt"], state["target_file"]
     role = state["failed_test"] if state["failed_test"] in TEST_FILES else "acceptance"
+    by_test = dict(state.get("retests_by_test") or {})
+    by_test[role] = by_test.get(role, 0) + 1
+    used = {"retests_used": state["retests_used"] + 1, "retests_by_test": by_test}
     # Only candidates that got as far as the blamed test (their own test passed) are worth re-testing.
     coded = [c for c in state["candidates"] if c["status"] == "coded" and c.get("failed_test", "") in (role, "")]
     if not coded:
-        return {"status": "RETEST_SKIPPED", "retest": False, "retests_used": state["retests_used"] + 1}
+        return {"status": "RETEST_SKIPPED", "retest": False, **used}
     print(f"\n[Node: Re-test] {TEST_LABELS[role].capitalize()} was wrong; the {ROLE_NAMES[role].lower()} "
           f"fixes it and the same {len(coded)} candidate(s) are tested again ({attempt_label(state)}).")
     report(state, phase=f"fixing {TEST_LABELS[role]} ({attempt_label(state)})", attempt=attempt)
@@ -2693,7 +2719,7 @@ def retest_node(state):
     if not new_test:
         # No containers were started for this attempt yet, so the engineer can use its number.
         print(f"    The {ROLE_NAMES[role].lower()} couldn't fix the test; the engineer takes over instead.")
-        return {"status": "RETEST_SKIPPED", "retest": False, "retests_used": state["retests_used"] + 1}
+        return {"status": "RETEST_SKIPPED", "retest": False, **used}
     try:
         prewarm_containers(state, attempt, state["num_candidates"])
     except OSError:
@@ -2702,8 +2728,8 @@ def retest_node(state):
     feedback = {r: t for r, t in state["test_feedback"].items() if r != role}
     keep = {c["k"] for c in coded}
     candidates = [c if c["k"] in keep else dict(c, status="failed_before") for c in state["candidates"]]
-    updates = {"tests": tests, "test_checks": test_checks, "test_feedback": feedback,
-               "retests_used": state["retests_used"] + 1, "candidates": candidates}
+    updates = {"tests": tests, "test_checks": test_checks, "test_feedback": feedback, **used,
+               "candidates": candidates}
     view = dict(state, **updates)
     for c in coded:
         src, dst = cand_dir(state, prev, c["k"]), cand_dir(state, attempt, c["k"])
@@ -2714,7 +2740,8 @@ def retest_node(state):
             with open(os.path.join(dst, PROBE_FILE), "w", encoding="utf-8", newline="\n") as f:
                 f.write(state["probe"])
     print(f"    Corrected test ready ({len(new_test.splitlines()) - len(test_header(target).splitlines())} lines).")
-    result = sandbox_executor_node(view)              # its candidates carry the new test results
+    # Its candidates carry the new test results. Unchanged code says nothing about a dead end.
+    result = sandbox_executor_node(dict(view, retesting=True))
     return dict(result, **{k: v for k, v in updates.items() if k != "candidates"}, retest=False)
 
 
@@ -2895,7 +2922,7 @@ def sandbox_executor_node(state):
                 "stall": 0}
     # Nothing passed: fix the candidate that got furthest (its own test passed, then most output).
     best = max(results, key=lambda c: (c["rc"] == 0, c["failed_test"] == "probe", len(c["stdout"])))
-    restart = dead_end(state, results, best)
+    restart = {} if state.get("retesting") else dead_end(state, results, best)
     if FIX_BASE == "furthest" and furthest.get("error") and furthest["code"].strip() != best["code"].strip():
         # Start the next fix from the furthest candidate of the whole run, not this attempt's best.
         # Set 4's pyexpr run on Ultra peaked on attempt 4 (972 of 1,234 reference cases) and its later
@@ -3325,7 +3352,7 @@ def diagnose_independent_failure(state):
                        + f"RAW ERROR (tail):\n{tail(state['error'], 2500)}",
               "test_feedback": feedback,
               # Only the test is wrong: fix it and re-test the same code instead of rewriting it.
-              "retest": blame == "test" and state["retests_used"] < MAX_RETESTS,
+              "retest": blame == "test" and retests_left(state),
               "indep_last": {"role": role, "fails": fails, "blame": blame, "attempt": attempt}}
     corr = re.search(r"CORRECTION:\s*(.+)", diagnosis)
     if stuck and corr and blame in ("script", "both"):
@@ -4002,7 +4029,7 @@ def last_chance(state):
     return (state["attempt"] > state["max_attempts"]
             and time.time() - state["started"] <= state["time_limit_s"]
             and state["failure_kind"] == "indep" and not state.get("last_chance_used")
-            and state["retests_used"] < MAX_RETESTS)
+            and retests_left(state))
 
 
 def route_after_executor(state):
@@ -4211,7 +4238,7 @@ def main(argv=None):
         "critic_rounds": profile["critic_rounds"], "critic_used": 0,
         "repeat_tests": profile["repeat_tests"], "interface": "", "spec": "", "tests": {},
         "test_checks": {}, "test_feedback": {}, "failed_test": "", "regression": [], "probe": "",
-        "probe_verdicts": {}, "mutation_done": False, "retest": False, "retests_used": 0, "indep_last": {},
+        "probe_verdicts": {}, "mutation_done": False, "retest": False, "retests_used": 0, "retests_by_test": {}, "indep_last": {},
         "last_chance_used": False,
         "best_passed": {}, "furthest": {}, "line_best": [], "stall": 0, "restarts": 0, "restart_note": "",
         "started": time.time(), "time_limit_s": profile["time_limit_s"],

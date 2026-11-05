@@ -7,7 +7,8 @@ best of the current line of fixes, and after AFTER of them writes fresh candidat
 that line again. This replays each run's pipeline.log (furthest_sim.replay) and prints the attempt
 where the first restart would start, the run's outcome, and the best candidate score before that point
 against the whole run's (candidate_scores_<name>.json). After a restart the run would differ, so only
-the first point is meaningful."""
+the first point is meaningful. A re-test (the same code against a revised test) counts as neither
+progress nor a stall, as in the pipeline."""
 import json
 import os
 import re
@@ -15,16 +16,25 @@ import sys
 
 from furthest_sim import HERE, config, p, replay
 
+RETEST = re.compile(r"^\[Node: Re-test\].*\(attempt (\d+)/\d+\)")
 name = sys.argv[1]
 after = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 runs = json.load(open(os.path.join(HERE, f"candidate_scores_{name}.json"), encoding="utf-8"))
 print(f"{'task':7} {'level':6} {'state':6} {'attempts':>8}  first restart       best before / in all")
 for rid, run in runs.items():
+    log = os.path.join(config.RUNS_DIR, rid, "pipeline.log")
+    if not os.path.isfile(log):
+        print(f"{run['task']:7} {run['level']:6} {run['state']:6} {'-':>8}  (log pruned)")
+        continue
     by_attempt = {}
-    for attempt, k, cand in replay(os.path.join(config.RUNS_DIR, rid, "pipeline.log")):
+    for attempt, k, cand in replay(log):
         by_attempt.setdefault(attempt, []).append((k, list(p.progress(cand)[0])))
+    with open(log, encoding="utf-8", errors="replace") as f:
+        retests = {int(m.group(1)) for m in map(RETEST.match, f) if m}
     line_best, stall, fire = None, 0, None
     for attempt in sorted(by_attempt):
+        if attempt in retests:
+            continue
         top = max(rank for _k, rank in by_attempt[attempt])
         if line_best is not None and top < line_best:
             stall += 1

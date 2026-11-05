@@ -36,15 +36,16 @@ def error_for(rc, out, err, role="adversarial"):
             + p.run_error(res, 0.5, p.TEST_LABELS[role].capitalize(), 60))
 
 
-def state(runs, role="adversarial", retests_used=0):
-    """runs: one (rc, stdout, stderr) per candidate that failed the test."""
+def state(runs, role="adversarial", used=None):
+    """runs: one (rc, stdout, stderr) per candidate that failed the test; used: re-tests per test."""
     cands = [{"k": k, "rc": 0, "status": "coded", "failed_test": role, "independent": True,
               "tests_out": {"acceptance": (0, "PASS a\nALL PASSED\n", "", 0.3), role: (rc, out, err, 0.5)}}
              for k, (rc, out, err) in enumerate(runs, 1)]
     return {"run_id": "unit-silent", "task_key": "t", "attempt": 4, "max_attempts": 16, "failed_test": role,
             "target_file": "json_max.py", "failure_kind": "indep", "goal": "parse json", "spec": "",
             "checks": ["c"], "interface": "parse_json(text) -> value", "code": "def parse_json(t): ...",
-            "tests": {role: "print('test')"}, "test_feedback": {}, "retests_used": retests_used,
+            "tests": {role: "print('test')"}, "test_feedback": {}, "retests_used": sum((used or {}).values()),
+            "retests_by_test": used or {},
             "error": error_for(*runs[0], role=role), "candidates": cands, "indep_last": {}}
 
 
@@ -64,9 +65,11 @@ fb = upd["test_feedback"].get("adversarial", "")
 checks += [("real outputs: decided without a model call", calls == []),
            ("  the test is blamed and the same code re-tested", upd["retest"] and upd["indep_last"]["blame"] == "test"),
            ("  the test's writer is told what to fix", "exit 0 exactly when every check passed" in fb and "code 1" in fb)]
-upd = diagnose(state(real, retests_used=p.MAX_RETESTS))
+upd = diagnose(state(real, used={"adversarial": p.MAX_RETESTS}))
 checks.append(("no re-tests left: still blamed on the test, not re-tested",
                calls == [] and not upd["retest"] and "adversarial" in upd["test_feedback"]))
+upd = diagnose(state(real, used={"acceptance": p.MAX_RETESTS}))
+checks.append(("the acceptance test's re-tests don't use up the adversarial test's", calls == [] and upd["retest"]))
 checks.append(("the acceptance test is handled the same way",
                p.silent_test_failure(state(real[:2], role="acceptance"), "acceptance") == (1, 171, 2)))
 summary = "PASS: a\nPASS: b\nResults: 2 passed, 0 failed\n"

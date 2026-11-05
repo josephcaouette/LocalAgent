@@ -618,6 +618,61 @@ with this one's best candidate in brackets where better:
   nothing, and those runs rarely got past their own self-tests anyway.
 - **The last chance never fired:** no run ended with only an independent test failing.
 
+**The fourth battery's Ultra and MAX runs, a third time** (2026-11-04 and 05, 6 runs in 21 hours),
+with the fresh start, the final pick and the stand-in fixes above. Each cell is the first battery's
+kept file, then the second's, then this one's, with this one's best candidate in brackets where better:
+
+| | Ultra | MAX |
+|---|---|---|
+| Expressions (1,234) | 757 → 706 → 152 (946) | **1,213** → 6 → 1,167 (1,173) |
+| TOML (1,037) | passed: 920 → passed: **990** → passed: 974 (986) | passed: 975 → 673 → 970 |
+| struct (1,315) | passed: **1,314** → 1,302 → passed: 1,208 | passed: 1,298 → 1,232 → 1,311 |
+| Time per run | 129-201 min | 207-271 min |
+| Output tokens | 0.84-1.35 million | 1.63-2.14 million |
+
+- **Two passes, against one and four; 5,782 points kept of 7,172, against 4,909 and 6,477.** MAX kept
+  more on the expression evaluator (1,167 against 152) and struct (1,311 against 1,208) but passed
+  nothing. One run per cell still can't separate the changes from luck.
+- **The fresh start helped where a line was stuck, and misfired where a weak self-test set the bar.**
+  The evaluator on MAX started over twice, and each fresh line jumped: attempt 7 reached 1,151 cases
+  (the best before was 781), and attempt 12 reached 1,173, the run's best. In the second battery the
+  same run spent its last 10 attempts on one broken parser and kept 6. On Ultra, a candidate whose
+  self-test passed while it matched 1 case set the line's best on attempt 3, so attempts 4-6 (853-871
+  cases, failing their own tests) counted as getting less far; the fresh line peaked at 842.
+- **A re-test set off a restart (fixed).** struct on Ultra re-tested two candidates on attempts 9-11
+  against an acceptance test being corrected; the lower ranks set off a restart, and the third re-test
+  passed with those same candidates just before it could happen. A re-test now counts as neither
+  progress nor a stall (`restart_unit.py`).
+- **struct on MAX failed holding a file that passes every final check (fixed).** The candidate it kept
+  (attempt 15) matches 1,311 of 1,315 cases and passes every check of both final tests. On attempt 15 the diagnosis rightly
+  blamed the adversarial test, but the run had spent its 3 re-tests on the acceptance test (attempts 8,
+  10 and 11), so the engineer rewrote the candidates instead, and all five rewrites failed their own
+  tests. Re-tests are now counted per independent test (`lastchance_unit.py`, `silent_unit.py`).
+- **TOML on MAX never started over, which was probably right.** Every self-test stopped at its first
+  failure without a PASS line ("unexpected end of input" in most candidates of 15 of 16 attempts), so
+  every attempt ranked the same, and a tie counts as progress. But its code matched 941-970 cases from
+  attempt 2 on, and fresh candidates (attempt 1: 766) would likely have lost ground.
+- **The final pick overruled once, and a test that stops early misled it.** On the evaluator on Ultra
+  it replaced the furthest candidate (its self-test passed; 1 case) with one matching 152, while the
+  run's best (attempt 1, 946 cases) came out lower by share: the final acceptance test stopped after 85
+  checks for the 152-case candidate, which passed 68 (80%), and ran 395 for the 946-case one, which
+  passed 77 (19%). Counting passes against the most checks any candidate reached isn't the answer: in
+  the second battery's struct run on Ultra the test stopped early for the right candidates instead (49
+  of 63 passed, against 315 of 341 for one matching 753 cases), and that count would have kept 753
+  instead of 1,302; on that battery's seven failed runs it keeps 6,381 points against the share's
+  6,930 (`finalpick_metric.py`). The share and the 70% rule stay. In the other three failed runs the
+  furthest candidate stayed, within a point of the best share: 1,167, 970 and 1,311 cases kept, against
+  bests of 1,173, 970 and 1,311.
+- **The stand-in check found 4 real test bugs; its false alarms are fixed.** Real: the 4,300-digit
+  limit in both of the evaluator on MAX's tests, and two crashes in struct on MAX's acceptance test
+  (its own `raises()` helper, and a reference call that raised `struct.error`). False, all in struct
+  on MAX: checks that expect an exception, worded "128 should raise ValueError, got None" or written as
+  `isinstance(exc(...), ValueError)` and printed as "expected None, got None", and an
+  `isinstance(x, tuple)` check. Findings now leave out "should raise" and a bare None, True or False
+  after "got" (`standin_unit.py` keeps both tests: the old rule finds 19 and 1 in them, the new one
+  none).
+- **The last chance never fired**, as in the second battery.
+
 **On every level.**
 
 - **Static check (pyflakes):** rejects a candidate that uses a name it never defines, a crash
@@ -667,9 +722,11 @@ with this one's best candidate in brackets where better:
      everything, the other falsy and equal to nothing. A failure the test reports the same way
      against both (a FAIL line with the same value, or the same crash in its own code) can't come
      from the script's answer, so it goes back to the writer, up to twice, before any candidate is
-     blamed. Checks that expect an exception, however they word it ("expected ValueError", "got no
-     error", "did not raise"), or that run the script as a program, are left out: neither stand-in
-     raises or prints anything a test looks for.
+     blamed. Left out, because they come out the same against both stand-ins whether the test is
+     right or wrong: checks that expect an exception, however they word it ("expected ValueError",
+     "got no error", "did not raise", "should raise"); checks that end in a bare None, True or False,
+     a verdict the test worked out itself (`isinstance(x, tuple)`); and checks that run the script as
+     a program.
    - Meanwhile, Node 2 starts one test container per candidate.
 5. **Testing:** each candidate runs in its own container on Node 2:
    - its own `python3 <file> --test`, then each independent test and the kept regression checks, then
@@ -688,9 +745,10 @@ with this one's best candidate in brackets where better:
    own test, or an independent test is wrong) and the engineer tries again. Lines that report
    failures are always shown to it, wherever they appear in the output. If only an independent
    test was wrong, its writer fixes it and the **same candidates are tested again** without being
-   rewritten (up to 3 times per run). That holds after the last attempt too: when the attempts run
-   out with time left and the candidates failed only an independent test, the failure still gets one
-   diagnosis, and if it blames the test alone, the test is fixed and the same code tested once more.
+   rewritten (up to 3 times for each independent test, so one test's string of fixes can't use up
+   another's). That holds after the last attempt too: when the attempts run out with time left and
+   the candidates failed only an independent test, the failure still gets one diagnosis, and if it
+   blames the test alone, the test is fixed and the same code tested once more.
    - The writer fixes a wrong test **in place**: small search-and-replace edits to just the
      disputed checks, so the checks that already passed can't change. (Rewriting the whole test
      re-rolled every hand-computed value: in the battery below, a MAX run fixed its adversarial test
@@ -733,7 +791,8 @@ with this one's best candidate in brackets where better:
      Fixes inherit their version's design: in the fourth battery's second run, the expression
      evaluator on MAX spent its last 10 attempts fixing one parser that rejected every valid
      expression. Replayed on that battery's logs (`restart_sim.py`), the rule fires in 4 stuck runs
-     and never in the run that passed; earlier candidates stay on disk for the final pick.
+     and never in the run that passed; earlier candidates stay on disk for the final pick. A re-test
+     doesn't count either way: its code is unchanged, and only the test moved.
    - **A test that fails with nothing failing goes back to its writer.** When an independent test
      exits with an error for every candidate alike while printing only PASS lines (no FAIL line, no
      traceback, no timeout), its own bookkeeping is wrong: it goes back to its writer and the same
@@ -952,7 +1011,7 @@ experiments; each run reads them when it starts)
 | Setting | Value | Meaning |
 |---|---|---|
 | `STANDIN_CHECK` | True | Run each new or revised independent test against two stand-ins before blaming a candidate (step 4 of [How a run works](#how-a-run-works)) |
-| `MAX_RETESTS` | 3 | Re-tests of unchanged code after a blamed test, per run (step 7) |
+| `MAX_RETESTS` | 3 | Re-tests of unchanged code after a blamed test, per independent test (step 7) |
 | `RESTART_AFTER`, `MAX_RESTARTS` | 3, 2 | Attempts in a row that get less far than their line's best before a fresh start, and fresh starts per run (step 7) |
 | `LOW_DIAGNOSIS_THINK` | 3000 | Thinking for Low and Medium's diagnosis of a check that failed without a crash (step 7) |
 | `FINAL_PICK`, `FINAL_PICK_RATIO` | True, 0.7 | A failed High+ run judges its candidates by its final independent tests, and overrules the furthest one when that passes under 70% of the best share (step 11) |

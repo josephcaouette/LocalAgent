@@ -33,5 +33,19 @@
   "target": "toml_ultra_v2.py",
   "expect": "clean",
   "from": "20261103-135619/a5c2"
+ },
+ {
+  "file": "struct_max_v3_acceptance.py",
+  "role": "acceptance",
+  "target": "struct_max_v3.py",
+  "expect": "clean",
+  "from": "20261105-094357/a11c1"
+ },
+ {
+  "file": "struct_max_v3_adversarial.py",
+  "role": "adversarial",
+  "target": "struct_max_v3.py",
+  "expect": "clean",
+  "from": "20261105-094357/a1c1"
  }
 ]

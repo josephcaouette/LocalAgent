@@ -48,7 +48,13 @@ checks += [
     ("time is up: finish", p.route_after_executor(state(started=time.time() - 7200)) == "finalize"),
     ("the candidates' own test failed: finish", p.route_after_executor(state(failure_kind="runtime")) == "finalize"),
     ("the last chance was used: finish", p.route_after_executor(state(last_chance_used=True)) == "finalize"),
-    ("no re-tests left: finish", p.route_after_executor(state(retests_used=p.MAX_RETESTS)) == "finalize"),
+    ("no re-tests left for this test: finish",
+     p.route_after_executor(state(retests_by_test={"acceptance": p.MAX_RETESTS})) == "finalize"),
+    # Set 4's third battery: struct on MAX used all three re-tests on its acceptance test, then couldn't
+    # re-test for the adversarial test, and failed with a candidate that passed every final check.
+    ("another test's re-tests don't count: diagnose once more",
+     p.route_after_executor(state(retests_by_test={"adversarial": p.MAX_RETESTS}, retests_used=p.MAX_RETESTS))
+     == "condenser"),
     ("a pass still goes to the verifier", p.route_after_executor(state(status="EXECUTED")) == "verifier"),
 ]
 

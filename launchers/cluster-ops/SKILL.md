@@ -247,6 +247,23 @@ attempt with nothing testable keeps the note. `restart_sim.py <name> [AFTER]` re
 battery's logs (first firing per run): on set4_v2 it fires in toml/medium (7), pyexpr/max (10),
 toml/max (6), struct/max (10), never in the run that passed. Open: interface corrections that
 prescribe implementation instead of behaviour (pyexpr/max v2's dead end began right after two).
+Set 4 v3 umax (2026-11-04/05, 21 h, `BATTERY_TAG=_v3 battery.py umax set4`, `battery_results_set4_v3_umax.json`,
+`candidate_scores_set4_v3_umax.json`): kept pyexpr 152 (best 946)/1167, toml 974 (passed)/970, struct 1208
+(passed)/1311 (Ultra/MAX); 5,782 of 7,172 points vs v2 4,909 and v1 6,477. Restarts: pyexpr/max twice, each
+fresh line jumped (781 -> 1151, then 1173); pyexpr/ultra once, but a3c3 (weak self-test passed, 1 case) had
+set `line_best`, so attempts 4-6 (853-871) counted as worse; struct/ultra's fired during re-tests (fixed: the
+re-test node passes `retesting=True` and the executor skips `dead_end`). toml/max never restarted (every
+self-test stopped at its first failure, so all attempts tied at the floor) but its code sat at 941-970 from
+attempt 2, so the tie rule stays. struct/max failed holding a correct candidate (a15c5, 1311, 100% of both
+final tests): its 3 re-tests all went to the acceptance test, so the adversarial test's rightful blame on
+attempt 15 forced rewrites that all failed; fixed: `retests_by_test` and `retests_left()` (MAX_RETESTS per
+test; `lastchance_unit.py`, `silent_unit.py`). Stand-in false alarms fixed: `_EXPECTS_ERROR` takes "should
+raise", `_BARE_GOT` drops FAIL lines ending in a bare None/True/False (`isinstance` verdicts); standin_unit
+keeps struct/max's two tests (old rule 19 and 1 findings, new 0). Final pick: overruled once (pyexpr/ultra
+a3c3 1 -> a2c3 152) and missed a1c3 (946): the test stopped early for a2c3 (68/85) but ran 395 checks for
+a1c3 (77). `finalpick_metric.py <names>` compares share with reach (passes / most checks printed): reach
+loses on v2 (6,381 vs 6,930; struct/ultra's test stopped early for the right candidates), so share stays.
+`restart_sim.py` now skips re-tests and pruned logs; its shares come from log tails, so it's approximate.
 If vLLM is down (the PC slept: no process in WSL, log ends without a shutdown line), start it with the
 window's saved settings: `cl.vllm_script(cl.load_settings()["vllm"])` run detached through `wsl bash
 -c`, as `scripts/tests/vllm_ab.py`'s `start()` does (about 45 s on the Fast preset).
