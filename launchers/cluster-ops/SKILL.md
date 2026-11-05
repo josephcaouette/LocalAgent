@@ -238,9 +238,18 @@ that way). Failed runs kept 11,862 of the 14,068 points their best candidates re
 independent tests on every distinct candidate (~1 min per 25) and overrules the furthest one when it
 passes under 70% of the top share. `finalpick_sim.py <name> [-P 8]` (BATTERY_TAG for target names;
 Node 2 only, ~20 min for 576 test runs) replays that: 7,937 of 8,325 vs 6,353 kept; ratios 0.6-0.8 all
-give it; always taking the top share gives 7,410 (struct/ultra's test held wrong bytes). Open: a
-restart when every candidate fails the same way for several attempts; interface corrections that
-prescribe implementation instead of behaviour.
+give it; always taking the top share gives 7,410 (struct/ultra's test held wrong bytes). Dead ends
+(2026-11-04, `dead_end()`, `restart_unit.py`): after `RESTART_AFTER` (3) attempts in a row whose best
+progress() rank is below the best of the current line of fixes (`line_best`; equal counts as progress),
+the executor sets `restart_note` and the engineer writes fresh (diverse on High+) candidates with that
+note instead of fixing; at most `MAX_RESTARTS` (2) per run, and the count starts over after one; an
+attempt with nothing testable keeps the note. `restart_sim.py <name> [AFTER]` replays the rule on a
+battery's logs (first firing per run): on set4_v2 it fires in toml/medium (7), pyexpr/max (10),
+toml/max (6), struct/max (10), never in the run that passed. Open: interface corrections that
+prescribe implementation instead of behaviour (pyexpr/max v2's dead end began right after two).
+If vLLM is down (the PC slept: no process in WSL, log ends without a shutdown line), start it with the
+window's saved settings: `cl.vllm_script(cl.load_settings()["vllm"])` run detached through `wsl bash
+-c`, as `scripts/tests/vllm_ab.py`'s `start()` does (about 45 s on the Fast preset).
 
 Live checks on two saved failures (`tests/data/`): `scripts/tests/inplace_live.py [1|2]`, about a
 minute with Node 1 free. Part 1 replays the in-place fix of a wrong adversarial value (must be one

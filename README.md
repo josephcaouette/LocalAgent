@@ -571,10 +571,11 @@ with this one's best candidate in brackets where better:
   (each a fix of the same version) failed their own tests with the same `ValueError` on valid
   expressions, often all five alike. It began right after the diagnosis wrote implementation details
   into the interface for every later step ("the parser must terminate on the explicit end-of-input
-  token, use unique AST operator codes..."). TOML on MAX never had a candidate pass its own self-test
-  in 16 attempts, while
-  the file grew from 1,000 to 1,600 lines. struct on Ultra and MAX had their self-tests' hand-worked
-  half-precision bytes blamed 4 and 5 times; their code matched 1,302 and 1,232 of 1,315 cases.
+  token, use unique AST operator codes..."); a dead end now gets a fresh start (step 7 of
+  [How a run works](#how-a-run-works)). TOML on MAX never had a candidate pass its own self-test in
+  16 attempts, while the file grew from 1,000 to 1,600 lines. struct on Ultra and MAX had their
+  self-tests' hand-worked half-precision bytes blamed 4 and 5 times; their code matched 1,302 and
+  1,232 of 1,315 cases.
 - **Failed runs kept worse files than they had:** 11,862 points kept of the 14,068 their best
   candidates reach. The furthest-candidate rank trusts a passing self-test, and the evaluator on MAX
   kept a candidate whose own test passed while it rejected `1 + 2 * 3` (6 points; its best had 602).
@@ -703,6 +704,15 @@ with this one's best candidate in brackets where better:
      and must decide for good: blame the test when the goal allows the candidates' reading, or add
      a **correction to the interface**, which the engineer implements exactly and the test writers
      read too. (In the second battery a CSV run went round this loop nine times.)
+   - **A dead end gets a fresh start.** When three attempts in a row get less far than the best of
+     their line of fixes (by the same measure as the furthest candidate in step 11), the next attempt
+     writes fresh candidates from the goal and spec (on High and above each with a different
+     approach), told how the set-aside version failed, instead of fixing it again. That happens at
+     most twice per run, and the count starts over so the fresh line has time to climb. Fixes inherit
+     their version's design: in the fourth battery's second run, the expression evaluator on MAX
+     spent its last 10 attempts fixing one parser that rejected every valid expression. Replayed on
+     that battery's logs (`restart_sim.py`), the rule fires in 4 stuck runs and never in the run that
+     passed; earlier candidates stay on disk for the final pick.
    - **A test that fails with nothing failing goes back to its writer.** When an independent test
      exits with an error for every candidate alike while printing only PASS lines (no FAIL line, no
      traceback, no timeout), its own bookkeeping is wrong: it goes back to its writer and the same

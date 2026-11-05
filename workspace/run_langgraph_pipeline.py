@@ -138,6 +138,10 @@ class AgentState(TypedDict):
     indep_last: dict        # the last independent-test diagnosis: {"role", "fails", "blame", "attempt"}
     best_passed: dict       # the last version that passed, kept while the reviewer's fixes run
     furthest: dict          # the tested candidate that got furthest; a failed run saves it as its final file
+    line_best: list         # the best progress() rank of the current line of fixes (see dead_end)
+    stall: int              # attempts in a row whose best candidate got less far than line_best
+    restarts: int
+    restart_note: str       # set when the next attempt writes fresh candidates instead of fixing
     started: float
     time_limit_s: int
     existing_code: str
@@ -2404,15 +2408,17 @@ def engineer_edits(state, system, blocks, think, n, reason="too long"):
 
 def engineer_node(state):
     attempt, target, n = state["attempt"], state["target_file"], state["num_candidates"]
-    fixing = bool(state["error"])
+    restart = bool(state.get("restart_note"))          # a dead end: write fresh candidates (dead_end)
+    fixing = bool(state["error"]) and not restart
     think = (state["think_engineer"] == "always"
-             or (state["think_engineer"] == "retries" and fixing))
+             or (state["think_engineer"] == "retries" and (fixing or restart)))
     diverse = state["diverse"] and not fixing and n > 1
     roles_needed = [r for r in active_roles(state)
                     if not state["tests"].get(r) or state["test_checks"].get(r) != state["checks"]
                     or state["test_feedback"].get(r)]
     need_probe = state["lvl"]["differential"] and not state["probe"]
-    print(f"\n[Node: Engineer Coder] {'Fixing' if fixing else 'Writing'} {target}: {n} candidate(s)"
+    print(f"\n[Node: Engineer Coder] {'Fixing' if fixing else 'Starting over on' if restart else 'Writing'} "
+          f"{target}: {n} candidate(s)"
           f"{', each with a different approach' if diverse else ''}{', thinking first' if think else ''}"
           f" ({attempt_label(state)})...")
     helpers = [f"the {ROLE_NAMES[r].lower()}" + (" (revising its test)" if state["tests"].get(r) else "")
@@ -2468,6 +2474,7 @@ def engineer_node(state):
             block(WEB_TITLE, state["web_brief"], trim=2),
             block("Notes on referenced code:", state["research_brief"], trim=2),
             block("Similar past solutions (reference only):", state["memory_context"], trim=4),
+            block("Earlier attempts:", state.get("restart_note", "")),
             block("Instructions:", f"Write the complete {target}."),
         ]
 
@@ -2613,7 +2620,8 @@ def engineer_node(state):
         probe = probe_future.result() or probe
         if probe:
             print("    Prober's cases ready.")
-    updates = {"tests": tests, "test_checks": test_checks, "test_feedback": feedback, "probe": probe}
+    updates = {"tests": tests, "test_checks": test_checks, "test_feedback": feedback, "probe": probe,
+               "restart_note": ""}
     for c in candidates:
         if c["status"] == "coded":
             folder = cand_dir(state, attempt, c["k"])
@@ -2631,12 +2639,42 @@ def engineer_node(state):
             # was for. (In set 4's High re-run, two attempts in a row were told only that their edits
             # couldn't be applied, and had to guess what to fix.)
             msg += PROBLEM_MARK + tail(state["error"].split(PROBLEM_MARK)[-1], 3000)
+        # A fresh start that produced nothing testable is tried again rather than lost.
         return fail(state, first["status"], msg, candidates=candidates,
-                    code=first["code"] if first["status"] in ("syntax", "static") else state["code"], **updates)
+                    code=first["code"] if first["status"] in ("syntax", "static") else state["code"],
+                    **dict(updates, restart_note=state.get("restart_note", "")))
     return {"candidates": candidates, "status": "CODED", "error": "", "failure_kind": "", **updates}
 
 
 MAX_RETESTS = 3     # re-tests of unchanged code after a blamed test, per run
+RESTART_AFTER = 3   # attempts in a row without progress before the next one starts over (dead_end)
+MAX_RESTARTS = 2    # per run
+
+
+def dead_end(state, results, best):
+    """State updates after an attempt where nothing passed. Counts the attempts in a row whose best
+    candidate got less far (progress()) than the best of the current line of fixes; after
+    RESTART_AFTER of them, the next attempt writes fresh candidates instead of fixing that line again
+    (at most MAX_RESTARTS times per run), and the count starts over so they have time to climb.
+    Fixes inherit their version's design: in set 4's second battery the expression evaluator on MAX
+    spent its last 10 attempts fixing one parser that rejected every valid expression. Replayed on
+    that battery's logs (restart_sim.py), this fires in 4 stuck runs and never in the run that passed.
+    Earlier candidates stay on disk, so a failed run's final pick still sees them."""
+    top = max(list(progress(c)[0]) for c in results)
+    line_best = state.get("line_best") or []
+    if line_best and top < line_best:
+        stall = state.get("stall", 0) + 1
+    else:
+        stall, line_best = 0, max(line_best, top) if line_best else top
+    if stall < RESTART_AFTER or state.get("restarts", 0) >= MAX_RESTARTS:
+        return {"stall": stall, "line_best": line_best}
+    print(f"    [i] Attempts {state['attempt'] - stall + 1}-{state['attempt']} got no further than the best of "
+          "their line of fixes; the next attempt starts over with fresh candidates.")
+    note = (f"The code of the earlier attempts is set aside: for {stall} attempts in a row, every fix of it got "
+            "less far than the best version before them, so its design looks like a dead end. Write the file "
+            "afresh. The last attempt's best candidate failed like this; don't repeat that design:\n"
+            + head(best["exec_error"], 1200))
+    return {"stall": 0, "line_best": [], "restarts": state.get("restarts", 0) + 1, "restart_note": note}
 
 
 def retest_node(state):
@@ -2853,9 +2891,11 @@ def sandbox_executor_node(state):
     known = dict(state["probe_verdicts"], **verdict_updates)
     furthest = furthest_so_far(state, results)
     if any(c["exec_ok"] for c in results):
-        return {"status": "EXECUTED", "candidates": candidates, "probe_verdicts": known, "furthest": furthest}
+        return {"status": "EXECUTED", "candidates": candidates, "probe_verdicts": known, "furthest": furthest,
+                "stall": 0}
     # Nothing passed: fix the candidate that got furthest (its own test passed, then most output).
     best = max(results, key=lambda c: (c["rc"] == 0, c["failed_test"] == "probe", len(c["stdout"])))
+    restart = dead_end(state, results, best)
     if FIX_BASE == "furthest" and furthest.get("error") and furthest["code"].strip() != best["code"].strip():
         # Start the next fix from the furthest candidate of the whole run, not this attempt's best.
         # Set 4's pyexpr run on Ultra peaked on attempt 4 (972 of 1,234 reference cases) and its later
@@ -2874,12 +2914,12 @@ def sandbox_executor_node(state):
             return fail(state, furthest["kind"], note + furthest["error"], code=furthest["code"],
                         candidates=candidates, execution_output=furthest["output"],
                         execution_stderr=furthest["stderr"], failed_test=furthest["failed_test"],
-                        probe_verdicts=known, furthest=furthest)
+                        probe_verdicts=known, furthest=furthest, **restart)
     kind = "indep" if best["indep_failed"] else ("differential" if best["failed_test"] == "probe" else "runtime")
     output = best["stdout"] + ("\n" + best["indep_stdout"] if best["indep_stdout"] else "")
     return fail(state, kind, best["exec_error"], code=best["code"], candidates=candidates,
                 execution_output=output, execution_stderr=best["stderr"],
-                failed_test=best["failed_test"], probe_verdicts=known, furthest=furthest)
+                failed_test=best["failed_test"], probe_verdicts=known, furthest=furthest, **restart)
 
 
 VERIFIER_SYSTEM = ("You are a strict QA reviewer. You decide whether a script's test run really "
@@ -4173,7 +4213,7 @@ def main(argv=None):
         "test_checks": {}, "test_feedback": {}, "failed_test": "", "regression": [], "probe": "",
         "probe_verdicts": {}, "mutation_done": False, "retest": False, "retests_used": 0, "indep_last": {},
         "last_chance_used": False,
-        "best_passed": {}, "furthest": {},
+        "best_passed": {}, "furthest": {}, "line_best": [], "stall": 0, "restarts": 0, "restart_note": "",
         "started": time.time(), "time_limit_s": profile["time_limit_s"],
         "existing_code": "", "memory_context": "", "memory_summary": "", "research_brief": "",
         "web_brief": "", "plan": "", "checks": [], "candidates": [], "winner": 0, "code": "",
