@@ -1,6 +1,8 @@
 """Compare ways of ranking a failed run's candidates by its final independent tests, offline.
 
-    python finalpick_metric.py set4_v2 set4_fb_high set4_v3_umax [--ratio 0.7]
+    python finalpick_metric.py set4_v2 set4_fb_high set4_v3_umax [--ratio R]
+
+R defaults to the pipeline's FINAL_PICK_RATIO (0.8 since 2026-11-07; 0.7 before).
 
 finalpick_sim.py saves, per failed run and candidate, (passes, fails, exit code) for each final test
 (finalpick_<name>.json); score_candidates.py saves each candidate's reference score. The pipeline keeps
@@ -14,7 +16,9 @@ way when the test stops early for the right candidates (the second battery's str
 batteries' 11 failed runs: share 10,530, reach 10,642, of 11,716 (2026-11-05), so share stays.
 Set 5's 4 failed runs (2026-11-06): share 3,519 at ratio 0.7 and 3,806 at 0.8, reach 3,643 and 3,930,
 of 3,961; set 4 v3's picks are the same at 0.7-0.9. A run whose log has no 'Saving the candidate...'
-line gets its furthest candidate replayed from the log (furthest_sim.replay)."""
+line gets its furthest candidate replayed from the log (furthest_sim.replay). On 2026-11-07 the 9 failed
+runs whose logs remain (set 4 v2 struct/max, v3, set 5) gave share 8,351 at 0.7 and 8,638 at 0.8 (only
+set 5's fmtspec and inflate on Ultra switch), reach 9,136 and 9,423, best 9,613; the pipeline moved to 0.8."""
 import json
 import os
 import re
@@ -26,7 +30,8 @@ import furthest_sim  # noqa: E402  (also puts Z:\workspace on the path)
 
 RUNS = r"Z:\runs"
 FURTHEST = re.compile(r"Saving the candidate that got furthest as the final file \(attempt (\d+), candidate (\d+)")
-ratio = float(sys.argv[sys.argv.index("--ratio") + 1]) if "--ratio" in sys.argv else 0.7
+ratio = (float(sys.argv[sys.argv.index("--ratio") + 1]) if "--ratio" in sys.argv
+         else furthest_sim.p.FINAL_PICK_RATIO)
 names = [a for a in sys.argv[1:] if not a.startswith("--") and not re.fullmatch(r"[\d.]+", a)]
 
 

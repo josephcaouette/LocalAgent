@@ -2,9 +2,11 @@
 battery the failed High/Ultra/MAX runs kept 6,353 of the 8,325 points their best candidates reach:
 the expression evaluator on MAX kept a candidate whose weak self-test passed while it rejected
 `1 + 2 * 3` (6/1234; its best scored 602). The final tests overrule the furthest candidate only when
-it passes under 70% of the share the best passes (struct on Ultra's test held wrong bytes and would
-have swapped a 1,302 file for a 753 one). Part 1 runs three tiny candidates in the sandbox (Node 2);
-part 2 uses made-up test outputs; part 3 is finalize_node."""
+it passes under 80% of the share the best passes: struct on Ultra's test held wrong bytes, and its
+correct file passed 82.5% of the top share (a switch would have swapped a 1,302 file for a 753 one),
+while set 5's decompressor on Ultra kept 77% (574 cases against 673; the line was 70% until
+2026-11-07). Part 1 runs three tiny candidates in the sandbox (Node 2); part 2 uses made-up test
+outputs; part 3 is finalize_node."""
 import os
 import shutil
 import sys
@@ -75,6 +77,11 @@ def lines(passed, failed):
 make({"a1c1": GOOD, "a2c1": HALF, "a3c1": BAD})
 outputs.update({"final-a1c1": Res(lines(92, 8), 1), "final-a2c1": Res(lines(50, 50), 1), "final-a3c1": Res(lines(76, 24), 1)})
 checks.append(("a small gap keeps the candidate (76% against 92%, as struct on Ultra)", p.final_pick(state) is None))
+outputs.update({"final-a1c1": Res(lines(65, 35), 1), "final-a2c1": Res(lines(10, 90), 1),
+                "final-a3c1": Res(lines(50, 50), 1)})
+picked = p.final_pick(state)
+checks.append(("a gap between 70% and 80% overrules it (50% against 65%, as the decompressor on Ultra)",
+               picked is not None and picked["name"] == "a1c1" and picked["kept_share"] == 0.5))
 outputs.update({"final-a1c1": Res(lines(46, 54), 1), "final-a2c1": Res(lines(10, 90), 1),
                 "final-a3c1": Res(lines(21, 79), 1)})
 picked = p.final_pick(state)

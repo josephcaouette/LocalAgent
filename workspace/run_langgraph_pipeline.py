@@ -3847,7 +3847,7 @@ def run_stats(state):
 _FINALIZE_STARTED = threading.Event()
 
 FINAL_PICK = True           # a failed run judges its candidates by its final independent tests
-FINAL_PICK_RATIO = 0.7      # ... and overrules the furthest candidate only below this share of the best's
+FINAL_PICK_RATIO = 0.8      # ... and overrules the furthest candidate only below this share of the best's
 
 
 def final_pick(state):
@@ -3860,7 +3860,10 @@ def final_pick(state):
     4's second battery the 8 failed High/Ultra/MAX runs kept 6,353 of the 8,325 points their best
     candidates reach; this rule keeps 7,937 (any ratio from 0.6 to 0.8 does), while always taking the
     top share keeps 7,410, because struct on Ultra's test held wrong hand-worked bytes and favoured a
-    candidate that shared them (finalpick_sim.py)."""
+    candidate that shared them (finalpick_sim.py); the correct file there passed 82.5% of the top
+    share. In set 5's 4 failed runs, 0.7 kept 3,519 of the 3,961 points and 0.8 keeps 3,806: format
+    specs and the decompressor on Ultra had kept candidates at 70.5% and 77% of the top share, and no
+    other failed run of sets 4 and 5 changes (finalpick_metric.py, 2026-11-07)."""
     tests = {role: text for role, text in (state.get("tests") or {}).items() if text}
     run_dir, target = os.path.join(config.RUNS_DIR, state["run_id"]), state["target_file"]
     if not tests or not os.path.isdir(run_dir):

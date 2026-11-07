@@ -256,9 +256,9 @@ toml/max never passed its own self-test, struct U/M self-test bytes blamed 4-5 t
 imports to tests, failed repair replies saved as `Z:\runs\<run>\standin-<role>-a<N>-reply.txt`, and
 `standin_unit.py` reads `tests/data/standin_case/` (run folders get pruned; v1's MAX tests were lost
 that way). Failed runs kept 11,862 of the 14,068 points their best candidates reach: `final_pick()`
-(`FINAL_PICK`, `FINAL_PICK_RATIO` 0.7, `finalpick_unit.py`) now runs a failed High+ run's final
-independent tests on every distinct candidate (~1 min per 25) and overrules the furthest one when it
-passes under 70% of the top share. `finalpick_sim.py <name> [-P 8]` (BATTERY_TAG for target names;
+(`FINAL_PICK`, `FINAL_PICK_RATIO` 0.8, 0.7 until 2026-11-07; `finalpick_unit.py`) now runs a failed
+High+ run's final independent tests on every distinct candidate (~1 min per 25) and overrules the
+furthest one when it passes under 80% of the top share. `finalpick_sim.py <name> [-P 8]` (BATTERY_TAG for target names;
 Node 2 only, ~20 min for 576 test runs) replays that: 7,937 of 8,325 vs 6,353 kept; ratios 0.6-0.8 all
 give it; always taking the top share gives 7,410 (struct/ultra's test held wrong bytes). Dead ends
 (2026-11-04, `dead_end()`, `restart_unit.py`): after `RESTART_AFTER` (3) attempts in a row whose best
@@ -305,7 +305,9 @@ overruled; fmtspec/ultra kept 62% vs a1c1's 88% (70.5% of the top share). `final
 (`finalpick_set5_umax.json`): kept 3,519, top share always 3,825, best 3,961; `finalpick_metric.py`
 (now replays the furthest candidate when a log lacks the "Saving the candidate" line, printed only when
 it isn't the last attempt's code): ratio 0.8 gives share 3,806 (fmtspec/ultra 0.705 and inflate/ultra
-0.77 switch) and leaves set 4 v2/v3 as they are; reach would also keep inflate/max's a3c1 (892), so share
+0.77 switch) and leaves all 15 failed set 4 runs as they are (v2, fb_high, v3): `FINAL_PICK_RATIO` is 0.8
+since 2026-11-07, and not higher because struct/ultra v2's correct kept file (1302) sat at 0.825 of the top
+share (a5c4, 753). Reach would also keep inflate/max's a3c1 (892), so share
 has lost badly twice (v3 pyexpr/ultra, set 5 inflate/max), reach once (v2 struct/ultra). Per-test re-tests worked
 (strptime U acceptance, M adversarial; both passed after). Stand-in: inflate/ultra's acceptance test
 crashed in its own code (zlib option), gone after the third repair; inflate/max's adversarial KeyError

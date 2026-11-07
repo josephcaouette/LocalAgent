@@ -724,7 +724,11 @@ matched by the file each run kept, with the best candidate in brackets where bet
   every line from 60% to 80% keeps the same files, while always taking the top share lost 527 points in
   the second. Counting passes against the most checks any candidate reached would also have kept the
   decompressor's 892-case candidate on MAX: that count and the share have now each lost one run badly
-  where the other didn't, the share twice, the count once.
+  where the other didn't, the share twice, the count once. **The line is now 80%** (`FINAL_PICK_RATIO`,
+  2026-11-07): of the 19 failed runs replayed from the fourth and fifth batteries, it changes only those
+  two picks (+287 points). It can't go much higher: in the second battery's struct run on Ultra the
+  kept file was correct (1,302 cases) and passed 82.5% of the top share, which went to a candidate
+  matching 753.
 - **Re-tests counted per test worked.** strptime re-tested once on each level, against a wrong
   acceptance test on Ultra and a wrong adversarial test on MAX, and both runs passed afterwards.
 - **The stand-in check caught a broken test.** The decompressor's acceptance test on Ultra crashed in
@@ -885,7 +889,7 @@ matched by the file each run kept, with the best candidate in brackets where bet
     kept a version the static check had rejected (271 of 1,037 reference cases) over its first
     attempt's (718). On High and above, it then runs the final version of each independent test on
     every different candidate (about a minute for 25) and keeps the one that passes the largest share
-    of their checks instead, if the furthest passes under 70% of that share. A weak self-test can pass
+    of their checks instead, if the furthest passes under 80% of that share. A weak self-test can pass
     on a broken candidate, and shares of a candidate's own checks compare self-tests that change every
     attempt; but independent tests can be wrong too, so a small lead doesn't count.
 
@@ -1076,7 +1080,7 @@ experiments; each run reads them when it starts)
 | `MAX_RETESTS` | 3 | Re-tests of unchanged code after a blamed test, per independent test (step 7) |
 | `RESTART_AFTER`, `MAX_RESTARTS` | 3, 2 | Attempts in a row that get less far than their line's best before a fresh start, and fresh starts per run (step 7) |
 | `LOW_DIAGNOSIS_THINK` | 3000 | Thinking for Low and Medium's diagnosis of a check that failed without a crash (step 7) |
-| `FINAL_PICK`, `FINAL_PICK_RATIO` | True, 0.7 | A failed High+ run judges its candidates by its final independent tests, and overrules the furthest one when that passes under 70% of the best share (step 11) |
+| `FINAL_PICK`, `FINAL_PICK_RATIO` | True, 0.8 | A failed High+ run judges its candidates by its final independent tests, and overrules the furthest one when that passes under 80% of the best share (step 11). It was 70% until set 5 |
 | `FIX_BASE` | "latest" | What a fix starts from; set by `--fix-base` |
 
 Optional Redis and Qdrant passwords go in `Z:\config\agent_secrets.env` (template in `config/`).
