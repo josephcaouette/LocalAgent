@@ -11,13 +11,19 @@ A test that stops early for one candidate prints fewer checks, so a broken candi
 share of very few: in set 4's third battery the evaluator on Ultra kept a candidate passing 68 of 85
 checks (80%, 152 reference cases) over one passing 77 of 395 (19%, 946 cases). Reach fails the other
 way when the test stops early for the right candidates (the second battery's struct on Ultra). On both
-batteries' 11 failed runs: share 10,530, reach 10,642, of 11,716 (2026-11-05), so share stays."""
+batteries' 11 failed runs: share 10,530, reach 10,642, of 11,716 (2026-11-05), so share stays.
+Set 5's 4 failed runs (2026-11-06): share 3,519 at ratio 0.7 and 3,806 at 0.8, reach 3,643 and 3,930,
+of 3,961; set 4 v3's picks are the same at 0.7-0.9. A run whose log has no 'Saving the candidate...'
+line gets its furthest candidate replayed from the log (furthest_sim.replay)."""
 import json
 import os
 import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import furthest_sim  # noqa: E402  (also puts Z:\workspace on the path)
+
 RUNS = r"Z:\runs"
 FURTHEST = re.compile(r"Saving the candidate that got furthest as the final file \(attempt (\d+), candidate (\d+)")
 ratio = float(sys.argv[sys.argv.index("--ratio") + 1]) if "--ratio" in sys.argv else 0.7
@@ -39,6 +45,18 @@ def order(d):
     return tuple(map(int, re.fullmatch(r"a(\d+)c(\d+)", d).groups()))
 
 
+def replayed_furthest(log):
+    """The furthest candidate by progress(), replayed from the log. The pipeline prints the 'Saving
+    the candidate...' line only when that candidate isn't the last attempt's code, so set 5's fmtspec
+    run on Ultra and inflate run on MAX have none."""
+    best = None
+    for attempt, k, cand in furthest_sim.replay(log):
+        rank = furthest_sim.p.progress(cand)[0]
+        if best is None or rank >= best[0]:          # a later candidate wins a tie, as in the pipeline
+            best = (rank, f"a{attempt}c{k}")
+    return best[1] if best else None
+
+
 grand = {}
 for name in names:
     per_run = json.load(open(os.path.join(HERE, f"finalpick_{name}.json"), encoding="utf-8"))
@@ -48,10 +66,10 @@ for name in names:
         sc = scores[rid]
         pts = {d: int(s.split("/")[0]) for d, s in sc["cands"].items() if re.fullmatch(r"\d+/\d+", s)}
         log = os.path.join(RUNS, rid, "pipeline.log")
-        m = None
+        furthest = None
         if os.path.isfile(log):
             m = FURTHEST.search(open(log, encoding="utf-8", errors="replace").read())
-        furthest = f"a{m.group(1)}c{m.group(2)}" if m else None
+            furthest = f"a{m.group(1)}c{m.group(2)}" if m else replayed_furthest(log)
         if furthest not in per:
             print(f"   {sc['task']:7}{sc['level']:6} furthest candidate unknown (log pruned or not saved); skipped")
             continue

@@ -718,7 +718,13 @@ matched by the file each run kept, with the best candidate in brackets where bet
 - **The final pick never overruled, once by a hair.** In the format-spec run on Ultra the kept
   candidate passed 62% of the final acceptance test's checks and attempt 1's first candidate 88%: 70.5%
   of the top share, just above the 70% line, and that candidate matches 1,202 cases against the kept
-  1,014.
+  1,014. Replayed on every candidate (`finalpick_sim.py`), an 80% line would have switched here and in
+  the decompressor on Ultra (50% against 65%: 673 cases against 574), keeping 3,806 of the 3,961 points
+  the failed runs' best candidates reach, against 3,519; in the fourth battery's second and third runs
+  every line from 60% to 80% keeps the same files, while always taking the top share lost 527 points in
+  the second. Counting passes against the most checks any candidate reached would also have kept the
+  decompressor's 892-case candidate on MAX: that count and the share have now each lost one run badly
+  where the other didn't, the share twice, the count once.
 - **Re-tests counted per test worked.** strptime re-tested once on each level, against a wrong
   acceptance test on Ultra and a wrong adversarial test on MAX, and both runs passed afterwards.
 - **The stand-in check caught a broken test.** The decompressor's acceptance test on Ultra crashed in

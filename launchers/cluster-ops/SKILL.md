@@ -301,7 +301,12 @@ applies, the old path. Wrong self-test values also mislead ranking: inflate/max'
 stuck and the restart after attempt 4 gave its line up (fresh lines peaked at 768); inflate/ultra's
 restart helped (580 -> 673); fmtspec/ultra's best was a1c1 (1202) but the fix base (latest attempt's
 longest stdout) was a1c4, whose 84 failure lines were the wrong 1e-05 expectations. Final pick never
-overruled; fmtspec/ultra kept 62% vs a1c1's 88% (70.5% of the top share). Per-test re-tests worked
+overruled; fmtspec/ultra kept 62% vs a1c1's 88% (70.5% of the top share). `finalpick_sim.py set5_umax`
+(`finalpick_set5_umax.json`): kept 3,519, top share always 3,825, best 3,961; `finalpick_metric.py`
+(now replays the furthest candidate when a log lacks the "Saving the candidate" line, printed only when
+it isn't the last attempt's code): ratio 0.8 gives share 3,806 (fmtspec/ultra 0.705 and inflate/ultra
+0.77 switch) and leaves set 4 v2/v3 as they are; reach would also keep inflate/max's a3c1 (892), so share
+has lost badly twice (v3 pyexpr/ultra, set 5 inflate/max), reach once (v2 struct/ultra). Per-test re-tests worked
 (strptime U acceptance, M adversarial; both passed after). Stand-in: inflate/ultra's acceptance test
 crashed in its own code (zlib option), gone after the third repair; inflate/max's adversarial KeyError
 repair changed nothing, but that test never failed a candidate. Last chance fired for the first time
