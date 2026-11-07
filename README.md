@@ -674,6 +674,61 @@ kept file, then the second's, then this one's, with this one's best candidate in
   none).
 - **The last chance never fired**, as in the second battery.
 
+**A fifth battery: three new tasks for the same changes** (2026-11-05 and 06, 6 runs in 21 hours).
+Every fix above was found on the fourth battery's tasks, so this one tries them on tasks they were never
+tuned on, Ultra and MAX only, each checked against an exact reference
+(`scripts/tests/battery5_checks.py`): Python's `format()` for integers, floats and strings with every
+rule of the format-spec language (fill and alignment, signs, `z`, `#`, zero padding with grouping,
+half-even rounding of the exact value, the `g` and no-type rules; 1,346 cases), `datetime.strptime`
+(directives as a regex table with backtracking, ISO weeks, `%z`; 1,226 cases) and zlib's `decompress`
+written without zlib (zlib, gzip and raw streams with every header and Huffman-table rule; 900 cases,
+74 of them hand-built streams that each break one rule). The correct solutions that validate the
+checker were written from the goals alone, so the goals state every rule the cases rely on. Cases
+matched by the file each run kept, with the best candidate in brackets where better:
+
+| | Ultra | MAX |
+|---|---|---|
+| Format specs (1,346) | 1,014 (1,202) | 1,163 (1,194) |
+| strptime (1,226) | passed: **1,226** | passed: 1,222 |
+| Decompression (900) | 574 (673) | 768 (892) |
+| Time per run | 166-199 min | 157-265 min |
+| Output tokens | 1.08-1.31 million | 1.22-2.05 million |
+
+- **Two passes, both strptime; 5,967 points kept of 6,944.** MAX kept more in both failures (1,163
+  against 1,014, and 768 against 574). The four failed runs kept 3,519 of the 3,961 points their best
+  candidates reach.
+- **The format-spec runs never got a candidate past its own self-test, because the fix to the test was
+  lost every time (fixed).** On Ultra, every candidate from the first attempt on printed
+  `fmt(1e-05, '.88')` right, with all 65 significant digits of the double, while its self-test expected
+  `'1e-05'`; on MAX the self-tests expected 42 centred in 10 with three spaces on the left instead of
+  four. The diagnosis saw it: it blamed both the code and the self-test and gave the right value, 7
+  times on Ultra and 12 on MAX, often the same correction again. But after a "both" verdict every
+  candidate rewrote the whole 1,000-line file and copied the wrong values along; only a verdict that
+  blamed the expected values alone had them corrected in place. "Both" corrections came 28 times in this
+  battery and 15 times in the fourth battery's third run, and the runs with the most of them all
+  failed. Now a "both" verdict on the self-test first corrects the values it names, with edits to the
+  previous version, and every candidate fixes the code from there (`edits_unit.py`).
+- **A self-test with wrong values also misleads every step that ranks candidates.** The decompressor
+  on MAX found its best candidate on attempt 3 (892 of 900 cases), but its self-test expected wrong
+  hand-built byte strings (an empty gzip stream, an empty stored block), the fixes on attempt 4 fell to
+  656, and the run started over after it, giving that line up; the fresh lines peaked at 768. On Ultra
+  the fresh start helped: 580 cases before it, 673 after. The format-spec run on Ultra had its best
+  candidate on attempt 1 (1,202 cases), but the fixes started from the first-attempt candidate that
+  printed the most (84 near-identical failure lines) and stayed near 1,014.
+- **The final pick never overruled, once by a hair.** In the format-spec run on Ultra the kept
+  candidate passed 62% of the final acceptance test's checks and attempt 1's first candidate 88%: 70.5%
+  of the top share, just above the 70% line, and that candidate matches 1,202 cases against the kept
+  1,014.
+- **Re-tests counted per test worked.** strptime re-tested once on each level, against a wrong
+  acceptance test on Ultra and a wrong adversarial test on MAX, and both runs passed afterwards.
+- **The stand-in check caught a broken test.** The decompressor's acceptance test on Ultra crashed in
+  its own code (an option passed wrongly to zlib); the crash was gone after the third repair. A
+  `KeyError` in a helper of the adversarial test on MAX came out the same for both stand-ins and its
+  repair changed nothing, but that test never failed a candidate.
+- **The last chance fired for the first time** (the decompressor on MAX, after attempt 16): the
+  candidates passed their own tests and only the acceptance test failed, so one more diagnosis ran.
+  It blamed the script, rightly: the kept file fails 95 of the 300 valid streams.
+
 **On every level.**
 
 - **Static check (pyflakes):** rejects a candidate that uses a name it never defines, a crash

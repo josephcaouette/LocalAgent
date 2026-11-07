@@ -1,0 +1,68 @@
+[
+ {
+  "task": "fmtspec",
+  "level": "ultra",
+  "state": "FAILED",
+  "run_id": "20261105-182550",
+  "attempt": "12",
+  "elapsed_s": "11797",
+  "tokens_out": 1295222,
+  "digest": true,
+  "check": "SCORE 1014/1346\nPARTS fixed=124/206 int=208/279 float=294/420 str=160/160 invalid=216/261 big=12/20\nfixed: fmt(5, '<05') -> got raised TypeError, expected '50000'\nfixed: fmt(-0.0, 'z') -> got '-0.0', expected '0.0'\nfixed: fmt(-0.0, 'z.0e') -> got '-0e+00', expected '0e+00'\nfixed: fmt(1e+16, '') -> got '1e+17', expected '1e+16'\nfixed: fmt(1e+16, '>8') -> got '   1e+17', expected '   1e+16'\nfixed: fmt(1.0, '.3') -> got '1.', expected '1.0'"
+ },
+ {
+  "task": "fmtspec",
+  "level": "max",
+  "state": "FAILED",
+  "run_id": "20261105-214231",
+  "attempt": "16",
+  "elapsed_s": "15374",
+  "tokens_out": 2045629,
+  "digest": true,
+  "check": "SCORE 1163/1346\nPARTS fixed=174/206 int=205/279 float=350/420 str=158/160 invalid=261/261 big=15/20\nfixed: fmt(-0.0, 'z') -> got '-0.0', expected '0.0'\nfixed: fmt(100.0, '.3') -> got '1.e+02', expected '1e+02'\nfixed: fmt(-inf, '010') -> got '000000-inf', expected '-000000inf'\nfixed: fmt(nan, '+.2e') -> got 'nan', expected '+nan'\nfixed: fmt(0.5, '%') -> got '50.000000', expected '50.000000%'\nfixed: fmt(0.5, '.0%') -> got '50', expected '50%'"
+ },
+ {
+  "task": "strptime",
+  "level": "ultra",
+  "state": "PASSED",
+  "run_id": "20261106-015849",
+  "attempt": "10",
+  "elapsed_s": "9934",
+  "tokens_out": 1082439,
+  "digest": true,
+  "check": "SCORE 1226/1226\nPARTS fixed=153/153 valid=759/759 invalid=314/314"
+ },
+ {
+  "task": "strptime",
+  "level": "max",
+  "state": "PASSED",
+  "run_id": "20261106-044425",
+  "attempt": "9",
+  "elapsed_s": "9437",
+  "tokens_out": 1220322,
+  "digest": true,
+  "check": "SCORE 1222/1226\nPARTS fixed=151/153 valid=759/759 invalid=312/314\nfixed: strptime('January', '%b') -> got datetime.datetime(1900, 1, 1, 0, 0), expected raised ValueError\nfixed: strptime('jan', '%B') -> got datetime.datetime(1900, 1, 1, 0, 0), expected raised ValueError\ninvalid: strptime('January 5', '%b %d') -> got datetime.datetime(1900, 1, 5, 0, 0), expected raised ValueError\ninvalid: strptime('+0530.5', '%z') -> got datetime.datetime(1900, 1, 1, 0, 0, tzinfo=datetime.timezone(datetime.timedelta(seconds=19800, microseconds=50..., expected raised ValueError"
+ },
+ {
+  "task": "inflate",
+  "level": "ultra",
+  "state": "FAILED",
+  "run_id": "20261106-072144",
+  "attempt": "12",
+  "elapsed_s": "11924",
+  "tokens_out": 1310228,
+  "digest": true,
+  "check": "SCORE 574/900\nPARTS fixed=53/74 valid=84/300 corrupt=436/520 big=1/6\nfixed: decompress(<14 bytes: 789c4b4c4a0600024d012778797a>, 15) -> got raised ValueError, expected b'abc'\nfixed: decompress(<16 bytes: cb48cdc9c957c8409000ff006a756e6b>, -15) -> got raised ValueError, expected b'hello hello hello'\nfixed: decompress(<58 bytes: 1f8b08000000000002034bafca2c5048492c4904001772e1...>, 31) -> got raised ValueError, expected b'gzip data'\nfixed: decompress(<31 bytes: 1f8b080200000000020325154bafca2c5048492c49040017...>, 31) -> got raised ValueError, expected b'gzip data'\nfixed: decompress(<61 bytes: 081d0bc94855282ccd4cce56482aca2fcf5348cbaf50c82a...>, 15) -> got raised ValueError, expected b'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fo...\nfixed: decompress(<61 bytes: 78da0bc94855282ccd4cce56482aca2fcf5348cbaf50c82a...>, 15) -> got raised ValueError, expected b'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fo..."
+ },
+ {
+  "task": "inflate",
+  "level": "max",
+  "state": "FAILED",
+  "run_id": "20261106-104033",
+  "attempt": "16",
+  "elapsed_s": "15915",
+  "tokens_out": 2028737,
+  "digest": true,
+  "check": "SCORE 768/900\nPARTS fixed=64/74 valid=205/300 corrupt=497/520 big=2/6\nfixed: decompress(<61 bytes: 081d0bc94855282ccd4cce56482aca2fcf5348cbaf50c82a...>, 15) -> got raised ValueError, expected b'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fo...\nfixed: decompress(<61 bytes: 78da0bc94855282ccd4cce56482aca2fcf5348cbaf50c82a...>, 15) -> got raised ValueError, expected b'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fo...\nfixed: decompress(<111 bytes: 1f8b081f00f1536502030f00616200636461620063646162...>, 31) -> got raised ValueError, expected b'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fo...\nfixed: decompress(<375 bytes: 1f8b08040000000000ff2c01000000000000000000000000...>, 31) -> got raised ValueError, expected b'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fo...\nfixed: decompress(<73 bytes: 1f8b08010000000000ff0bc94855282ccd4cce56482aca2f...>, 31) -> got raised ValueError, expected b'The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fo...\nfixed: decompress(<14 bytes: 1581010100000042b6f27f848211>, -15) -> got b'aaaa', expected raised ValueError"
+ }
+]

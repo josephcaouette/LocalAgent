@@ -2353,7 +2353,9 @@ def engineer_edits(state, system, blocks, think, n, reason="too long"):
     - reason "too long": the whole file doesn't fit in this context window (the prompt carries the whole
       previous version, and the answer would need it all again);
     - reason "expectation": the diagnosis blamed only the self-test's expected values, and a rewrite
-      re-rolls every hand-computed value (it tends to bring in new mistakes).
+      re-rolls every hand-computed value (it tends to bring in new mistakes);
+    - reason "both": the diagnosis blamed the code and some expected values; this corrects only the
+      values, before the candidates fix the code (correct_expectations_first).
     Returns replies shaped like llm_complete's (raw, finish, notes), where raw holds the edited file,
     and {k: problem} for replies whose edits didn't apply."""
     if reason == "expectation":
@@ -2361,6 +2363,12 @@ def engineer_edits(state, system, blocks, think, n, reason="too long"):
                "wrong. Correct exactly the expected values it names, after working each one out yourself "
                "from the goal, or delete those checks if you aren't certain of the right value. Change "
                "nothing else: the rest of the file already works.\n")
+    elif reason == "both":
+        ask = ("The diagnosis blames the code and also some of the self-test's hand-computed expected values. "
+               "In this step correct only those expected values, after working each one out yourself from "
+               "the goal (its CORRECTION line, if any, gives the right value), or delete a check if you "
+               "aren't certain of the right value. Don't touch the code under test: it gets fixed in the "
+               "next step. Change nothing else.\n")
     else:
         ask = ("The file is too long to send back whole, so change it with edits. Fix the problem while "
                "still meeting the goal and every acceptance check. If a failing self-test compares against "
@@ -2410,9 +2418,36 @@ def engineer_edits(state, system, blocks, think, n, reason="too long"):
             problems[k] = problem
             out.append((raw, "stop", notes))        # kept in the candidate's model_reply.txt
         else:
-            print(f"    Candidate {k}: {count} edit{'' if count == 1 else 's'} to the previous version.")
+            who = "Self-test" if reason == "both" else f"Candidate {k}"
+            print(f"    {who}: {count} edit{'' if count == 1 else 's'} to the previous version.")
             out.append((f"{TICK3}python\n{code}\n{TICK3}", "stop", notes))
     return out, problems
+
+
+BOTH_NOTE = ("The self-test's expected values that the diagnosis blamed are already corrected in the "
+             "previous version below. Fix the code it blames, and keep those corrected values.")
+
+
+def correct_expectations_first(state, system, blocks, think):
+    """The diagnosis of a failed self-test blamed the code and some of its expected values ("both"):
+    correct those values in place before any candidate is written, so every candidate fixes the code
+    from a self-test that is right. Returns the corrected file, or "" if the correction didn't apply.
+    A rewrite copies the old values or re-rolls them: in set 5 the fmtspec runs got the same corrections
+    5 and 13 times while every candidate kept the wrong values (`1e-05` at precision .88 printed in
+    full; 42 centred in 10), and inflate on MAX brought in new wrong byte strings each time."""
+    print("    The diagnosis blamed the code and the self-test: correcting the blamed expected values in "
+          "place first, so every candidate starts from them.")
+    try:
+        replies, problems = engineer_edits(state, system, blocks, think, 1, "both")
+    except ContextTooSmall as e:
+        print(f"    [i] Couldn't correct them in place ({short(e)}); the candidates fix the previous version.")
+        return ""
+    if problems:
+        print(f"    [i] The correction didn't apply ({short(problems[1])}); the candidates fix the previous "
+              "version.")
+        return ""
+    code, _ = extract_code(replies[0][0])
+    return code
 
 
 def engineer_node(state):
@@ -2500,6 +2535,14 @@ def engineer_node(state):
         answer_min = min(want_out, max(min_out, base_tokens * 3 // 2 + 1000)) if fixing else want_out
         want_out, min_out = want_out + THINK_TOKENS, min_out + 2000
     system = engineer_system(state)
+    if (fixing and state["code"] and state["failure_kind"] == "runtime"
+            and re.search(r"^BLAME:\s*both\b", state["error"], re.I | re.M)):
+        corrected = correct_expectations_first(state, system, blocks, think)
+        if corrected:
+            state = dict(state, code=corrected)
+            blocks = [block("Previous version:", corrected, code=True) if b["title"] == "Previous version:"
+                      else block("Note:", (b["text"] + " " + BOTH_NOTE).strip()) if b["title"] == "Note:"
+                      else b for b in blocks]
 
     def hint(k):
         return [block("Approach for this version:", APPROACHES[(k - 1) % len(APPROACHES)])] if diverse else []

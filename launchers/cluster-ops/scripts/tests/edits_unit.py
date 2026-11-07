@@ -2,7 +2,10 @@
 1. A fix whose whole file doesn't fit the context window falls back to edits instead of stopping the
    run (set 2's semver run on Low stopped with "the prompt needs 9969 tokens plus at least 10288").
 2. When the diagnosis blamed only the self-test's expected values, candidate 1 corrects them in place
-   and the others rewrite the file (set 2's life run on Low: each rewrite brought new wrong grids)."""
+   and the others rewrite the file (set 2's life run on Low: each rewrite brought new wrong grids).
+3. When it blamed the code and some expected values ("both"), one edits call corrects the values first
+   and every candidate fixes the code from that version (set 5's fmtspec runs: every rewrite kept the
+   wrong values, through the same correction 5 and 13 times)."""
 import os
 import shutil
 import sys
@@ -22,12 +25,16 @@ calls, mode = [], {"too_small": True}
 
 def fake(label, system, blocks, want_out, min_out, temperature=None, think=False, n=1, answer_min=None,
          with_reasoning=False, **kw):
-    calls.append((label, think, n, next((b["text"][:40] for b in blocks if b["title"] == "Instructions:"), "")))
+    texts = {b["title"]: b["text"] for b in blocks}
+    calls.append((label, think, n, texts.get("Instructions:", "")[:40], texts.get("Previous version:", ""),
+                  texts.get("Note:", "")))
     if label == "Engineer":
         if mode["too_small"]:
             raise p.ContextTooSmall("the prompt needs 9969 tokens plus at least 10288 for the answer, but the "
                                     "model's context window is 16384 tokens")
         replies = [(REWRITE, "stop", "notes")] * n
+    elif mode.get("bad_edit"):
+        replies = [(BAD_EDIT, "stop", "notes")] * n
     else:
         replies = [(GOOD_EDIT, "stop", "notes"), (BAD_EDIT, "stop", "notes")][:n]
     return [r if with_reasoning else r[:2] for r in replies]
@@ -80,9 +87,33 @@ checks += [
      cands[1]["code"].strip() == PREV.replace("v + 2", "v + 1").strip()),
     ("expectation: candidates 2 and 3 are rewrites", all("# rewritten" in cands[k]["code"] for k in (2, 3))),
 ]
+
+# 3. The code and some expected values were both blamed: the values are corrected in place first, and
+#    every candidate fixes the code from the corrected version.
 calls.clear()
-p.engineer_node(dict(state, num_candidates=3, error=diag.replace("BLAME: expectation", "BLAME: both")))
-checks.append(("blame both: the usual single call for all three", [(c[0], c[2]) for c in calls] == [("Engineer", 3)]))
+both = diag.replace("BLAME: expectation", "BLAME: both")
+cands = {c["k"]: c for c in p.engineer_node(dict(state, num_candidates=3, error=both))["candidates"]}
+checks += [
+    ("both: the edits call first, then one call for all three",
+     [(c[0], c[2]) for c in calls] == [("Engineer, edits", 1), ("Engineer", 3)]),
+    ("both: the edits call corrects only the expected values", calls[0][3].startswith("The diagnosis blames")),
+    ("both: the candidates start from the corrected version",
+     "return v + 1" in calls[1][4] and "return v + 2" not in calls[1][4]),
+    ("both: the note says the values are already corrected", "already corrected" in calls[1][5]),
+    ("both: all three candidates are written by the engineer",
+     all("# rewritten" in cands[k]["code"] for k in (1, 2, 3))),
+]
+calls.clear()
+mode["bad_edit"] = True
+p.engineer_node(dict(state, num_candidates=3, error=both))
+mode["bad_edit"] = False
+checks.append(("both, the correction doesn't apply: the candidates fix the previous version as it was",
+               [(c[0], c[2]) for c in calls] == [("Engineer, edits", 1), ("Engineer", 3)]
+               and "return v + 2" in calls[1][4] and "already corrected" not in calls[1][5]))
+calls.clear()
+p.engineer_node(dict(state, num_candidates=3, error=both, failure_kind="indep"))
+checks.append(("both, from an independent test: no edits call (the test's writer fixes the test)",
+               [(c[0], c[2]) for c in calls] == [("Engineer", 3)]))
 
 ok = True
 for name, good in checks:

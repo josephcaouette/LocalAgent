@@ -18,7 +18,7 @@ relying on it: the code keeps changing.
 |---|---|---|
 | Node 1 "Brain" | 192.168.254.24 (this PC, Windows 11 + WSL Ubuntu-24.04) | RTX 4090; vLLM (in WSL) at `http://127.0.0.1:8001` (use 127.0.0.1, not localhost); runs the pipeline and the Agent Cluster window |
 | Node 2 "Blackboard" | 192.168.254.25, SSH `server@192.168.254.25` (key auth, BatchMode works) | File share `/mnt/blackboard` = `Z:\` on Node 1; Redis; Qdrant :6333 (memory); SearXNG :8888; Docker sandbox (image `agent-sandbox:latest`); the Git repo |
-| Node 3 "Worker" | 192.168.254.26 | RTX 2070 laptop; Ollama (chat helper, memory summaries) |
+| Node 3 "Worker" | 192.168.254.26, SSH `server@192.168.254.26` (key auth, BatchMode works) | MSI GE63 Raider RGB 9SF laptop: i7-9750H (6 cores), 16 GB DDR4-2666 in 2 SO-DIMM slots (both used; the firmware lists 32 GB max), RTX 2070 8 GB (2026-11-05). Ollama (chat helper, memory summaries). Slot details without sudo: `udevadm info -q property -p /sys/devices/virtual/dmi/id` |
 
 Key paths:
 - `Z:\workspace\` — pipeline code (`run_langgraph_pipeline.py`, `agent_gui.py`, `config.py`,
@@ -76,8 +76,19 @@ adversary, prober in parallel), executor, verifier, condenser, retest, critic, m
 CLI: `run_langgraph_pipeline.py --goal-file F --target T --accuracy LEVEL [--no-memory --no-ingest]`.
 A running pipeline has its code loaded already; edits only affect runs started afterwards.
 
-Node 3's jobs: embeddings and memory summaries, memory relevance checks, web reading during runs,
-and chat while a run is going (the chat's Automatic model). On High+ the **example check**
+Node 3's jobs: embeddings and memory summaries, memory relevance checks, the chat's page and
+attachment reading while a run is going (a run's own research reads on Node 1 unless a second run is
+going: `research.reader_backend`), and chat while a run is going (the chat's Automatic model).
+A bigger model on Node 3 was weighed and rejected (2026-11-05): `qwen3.8:27b` would fit in place of
+the 9B but run ~2-3 tokens/s (most layers in DDR4-2666 RAM, ~42 GB/s), about 20x slower per request
+than Node 1, which averaged 122 tokens/s of output over set 4's v3 battery. Every model call in a run
+is in a step the run waits for, so it would only add ~2% capacity; `qwen3.5:35b-a3b` needs 32 GB RAM.
+The 9B stays, and so does the embedding model (user's choice, 2026-11-06). It only feeds memory (16
+stored solutions; a run whose lookup fails prints "Memory search skipped" and goes on, and every
+battery runs with `--no-memory --no-ingest`), and Ollama keeps it in Node 3's RAM (126 MB on the GPU,
+~70 ms a call). Node 1 has no Ollama: moving it there means the 1.6 GB `ollama-windows-amd64.zip` run
+CPU-only (vLLM claims 92% of the 4090 at start-up) plus the 639 MB model, for memory with the laptop
+off; the collection is small enough to re-embed in seconds (`reindex_memory.py`). On High+ the **example check**
 (`check_examples`, config `EXAMPLE_CHECK_BACKEND`, Node 1 by default; "node3" moves it back) writes
 a brute-force script for the plan's hand-worked values, runs it in the sandbox, and re-derives any
 disputed value with thinking. Failures skip harmlessly. Node 3 is a poor fit for writing code that
@@ -151,6 +162,17 @@ score 1234/1234, 1037/1037 and 1315/1315 in 12-28 s). `tests/probe4.py` records 
 behaviours the goals rely on: tomllib has no 64-bit limit, rejects `0x_1`, and recurses past ~900
 nested arrays (so no deep TOML cases); struct raises struct.error, not OverflowError, for a huge int
 packed as `f`, so no case depends on that.
+
+`set5` (`battery5_checks.py`, `umax` mode, about 21 hours with `BATTERY_HOURS=30`; the same 900 s /
+1 GB check as set 4) holds three tasks the v3 changes weren't tuned on: fmtspec (Python's `format()`
+for int/float/str with every spec rule, against `format`; 1,346 cases, 20 of them big, such as a
+5,000-digit int in hex or `.1100f`), strptime (a regex-table clone of `datetime.strptime` with
+backtracking, ISO weeks and `%z`; 1,226) and inflate (`zlib.decompress` for wbits 15/-15/31 without
+zlib; 900 cases: 74 hand-built streams that each test one header or Huffman rule, random and
+corrupted streams, and 6 of several MB). `python3 battery5_checks.py selfcheck` confirms each
+hand-built stream behaves in zlib as labelled. The `tests/stubs5/*_ok.py` were written from the goals
+alone (no `format`, `strptime` or zlib), so a full score also shows the goal states every rule the
+cases need; `python mkvariants5.py` writes the 29 `*_bad_*` variants, and each loses cases (2026-11-05).
 
 `battery.py level set4 high` runs one level on every task (results in
 `battery_results_<set><TAG>_<level>.json`), for checking a change on the runs that showed a problem.
@@ -266,6 +288,24 @@ reach 6,381 vs share 6,930 (struct/ultra's test stopped early for the right cand
 reach 813 vs 152; both batteries (finalpick_set4_v2/v3_umax.json) 10,642 vs 10,530 of 11,716 at any ratio
 0.6-0.8, one bad loss each, so share stays (no change on two opposite cases).
 `restart_sim.py` now skips re-tests and pruned logs; its shares come from log tails, so it's approximate.
+Set 5 umax (2026-11-05/06, 20.7 h, `battery_results_set5_umax.json`, `candidate_scores_set5_umax.json`):
+kept fmtspec 1014 (best 1202)/1163 (1194), strptime 1226 (passed)/1222 (passed), inflate 574 (673)/768
+(892) (Ultra/MAX); 5,967 of 6,944. Both fmtspec runs never passed a self-test: the diagnosis blamed
+"both" with the right CORRECTION 7 and 12 times (`fmt(1e-05, '.88')` prints 65 digits; 42 centred in 10
+has 4 spaces a side), often the same one again, but on "both" every candidate rewrote the file and copied
+the old values (only "expectation" got the in-place edit). Self-test "both"+CORRECTION verdicts: 28 in set
+5, 15 in set 4 v3; the runs with most all failed. Fixed: `correct_expectations_first()` (`edits_unit.py`):
+on a self-test "both" (`failure_kind` "runtime") one `engineer_edits(..., "both")` call corrects only the
+blamed values in place, then every candidate fixes the code from that version (`BOTH_NOTE`); if nothing
+applies, the old path. Wrong self-test values also mislead ranking: inflate/max's a3c1 (892) counted as
+stuck and the restart after attempt 4 gave its line up (fresh lines peaked at 768); inflate/ultra's
+restart helped (580 -> 673); fmtspec/ultra's best was a1c1 (1202) but the fix base (latest attempt's
+longest stdout) was a1c4, whose 84 failure lines were the wrong 1e-05 expectations. Final pick never
+overruled; fmtspec/ultra kept 62% vs a1c1's 88% (70.5% of the top share). Per-test re-tests worked
+(strptime U acceptance, M adversarial; both passed after). Stand-in: inflate/ultra's acceptance test
+crashed in its own code (zlib option), gone after the third repair; inflate/max's adversarial KeyError
+repair changed nothing, but that test never failed a candidate. Last chance fired for the first time
+(inflate/max attempt 16) and rightly blamed the script.
 If vLLM is down (the PC slept: no process in WSL, log ends without a shutdown line), start it with the
 window's saved settings: `cl.vllm_script(cl.load_settings()["vllm"])` run detached through `wsl bash
 -c`, as `scripts/tests/vllm_ab.py`'s `start()` does (about 45 s on the Fast preset).
@@ -331,6 +371,7 @@ Commit only when the user asked for it (a standing "sync GitHub" request counts)
 | `cut off at N tokens: about X of thinking, Y of answer` | A reply hit its limit. Thinking that runs past its budget spills into the answer; the engineer then finishes such candidates "from their own notes". See `model_reply.txt` in the candidate folder |
 | `N of M candidates, written independently ..., failed with exactly the same result` | Independent candidates agreeing against an expectation usually means the expectation (spec example, check, or test) is wrong, not the code |
 | `CORRECTION (found while testing ...)` in the spec | The diagnosis fixed a wrong spec example; later steps follow it |
+| `The diagnosis blamed the code and the self-test: correcting the blamed expected values in place first` | A self-test "both" verdict: one edit call fixes the named expected values, then every candidate fixes the code from that version (`Self-test: N edits`). `The correction didn't apply` means the old path: each candidate fixes the previous version |
 | `exited with code 0 but printed lines reporting failed checks` | An independent test printed FAIL lines; it counts as failed |
 | `its container was gone; starting a fresh one` | Pre-started container missing; harmless, costs a few seconds. Frequent occurrences mean a naming clash between steps |
 | `A later step failed ..., but a version had already passed; keeping it` | The safety net saved a passing version after an error |

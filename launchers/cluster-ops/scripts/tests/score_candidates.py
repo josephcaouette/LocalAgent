@@ -23,8 +23,8 @@ import config  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CHECKS = {"set1": "battery_checks.py", "set2": "battery2_checks.py", "set3": "battery3_checks.py",
-          "set4": "battery4_checks.py"}
-LIMITS = {"set4": (900, "1g")}          # (timeout s, memory); the rest use battery.py's 300 s / 512m
+          "set4": "battery4_checks.py", "set5": "battery5_checks.py"}
+LIMITS = {"set4": (900, "1g"), "set5": (900, "1g")}          # (timeout s, memory); the rest use battery.py's 300 s / 512m
 SSH = ["ssh", "-o", "BatchMode=yes", config.SSH_TARGET]
 SCORE = re.compile(r"SCORE (\d+)/(\d+)")
 CAND = re.compile(r"a(\d+)c(\d+)")

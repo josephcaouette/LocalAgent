@@ -1,9 +1,10 @@
 """Test battery: five non-cron tasks queued through a hidden Agent Cluster window at several
 accuracy levels, then each result is checked against a reference in the sandbox.
 
-Usage: python battery.py [full|quick|umax] [set1|set2|set3|set4]   (quick = Low only; umax = Ultra and MAX on
+Usage: python battery.py [full|quick|umax] [set1|...|set5]   (quick = Low only; umax = Ultra and MAX on
                                                     every task; set3 = three hard tasks for telling them apart;
-                                                    set4 = three big ones, full = all five levels on each)
+                                                    set4 = three big ones, full = all five levels on each;
+                                                    set5 = three fresh big ones for testing pipeline changes)
        python battery.py one set2 TASK LEVEL        (one run; BATTERY_TAG=_x suffixes the target name)
 BATTERY_HOURS (default 10) is how long it waits for the queue before giving up.
 Results: battery_results_<set>.json next to this file for a full battery (other modes and tags add a
@@ -95,6 +96,12 @@ elif SET == "set4":                    # big tasks dense with rules (pyexpr, tom
     GOALS, CHECKS_FILE = battery4_checks.GOALS, "battery4_checks.py"
     TOP = [(t, lvl) for t in battery4_checks.GOALS for lvl in ("ultra", "max")]
     CHECK_TIMEOUT, CHECK_MEMORY = 900, "1g"   # ~1,200 cases per task, each in its own forked child
+elif SET == "set5":                    # fresh big tasks (fmtspec, strptime, inflate) the v3 changes weren't tuned on
+    sys.path.insert(0, HERE)
+    import battery5_checks  # noqa: E402
+    GOALS, CHECKS_FILE = battery5_checks.GOALS, "battery5_checks.py"
+    TOP = [(t, lvl) for t in battery5_checks.GOALS for lvl in ("ultra", "max")]
+    CHECK_TIMEOUT, CHECK_MEMORY = 900, "1g"
 TASKS = list(GOALS)
 TAG = os.environ.get("BATTERY_TAG", "")                 # suffix for target names (one-off runs)
 EXTRA = os.environ.get("BATTERY_EXTRA", "").split()    # extra pipeline flags, e.g. --helper-think 8000
