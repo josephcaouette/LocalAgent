@@ -6,8 +6,8 @@ utilities, can research the web for them, remembers what worked, and explains it
 | Node | Hardware | Role |
 |---|---|---|
 | Node 1, 192.168.254.24 | i7-14700K, RTX 4090, 32 GB, Windows 11 + WSL2 | vLLM serving Qwen3.8-27B (4-bit, CUDA graphs, speculative decoding); the Agent Cluster window and the pipeline |
-| Node 2, 192.168.254.25 | Dual Xeon E5-2620 v2, 128 GB ECC, 5 TB RAID volume, Ubuntu 24.04 | The file share (`/mnt/blackboard`, mapped as `Z:\` on Node 1), Redis, Qdrant, SearXNG, the web dashboard, the test sandbox |
-| Node 3, 192.168.254.26 | MSI laptop, RTX 2070 8 GB, Ubuntu 24.04 | Ollama: `qwen3-embedding:0.6b` embeddings, background memory summaries, chat fallback, and page reading while Node 1 is busy (`qwen3.5:9b`) |
+| Node 2, 192.168.254.25 | Dual Xeon E5-2620 v2, 128 GB ECC, 5 TB RAID volume, Ubuntu 24.04 | The file share (`/mnt/blackboard`, mapped as `Z:\` on Node 1), Redis, Qdrant, SearXNG, the web dashboard, the test sandbox, and the embedding model for memory (`qwen3-embedding:0.6b` in Ollama, on the CPU) |
+| Node 3, 192.168.254.26 | MSI laptop, RTX 2070 8 GB, Ubuntu 24.04 | Ollama (`qwen3.5:9b`): background memory summaries, chat fallback, and page reading while Node 1 is busy |
 
 ## Contents
 
@@ -277,9 +277,9 @@ Avg prompt throughput: 628.1 tokens/s, Avg generation throughput: 204.0 tokens/s
 |---|---|
 | Connect Z: drive | Opens a window running `net use`; you type the share password there |
 | Reset pipeline | Stops every run, empties the queue, marks their records stopped and removes leftover test containers on Node 2. The window stays open |
-| Restart Node 2 services | Restarts Redis, Qdrant, SearXNG and the dashboard (Docker Compose). Warns first if runs are going |
+| Restart Node 2 services | Restarts Redis, Qdrant, SearXNG, the dashboard and the embedding model (Docker Compose). Warns first if runs are going |
 | Restart Ollama on Node 3 | Opens a window that asks for your own `sudo` password on Node 3 |
-| Warm up Node 3 models | Loads both Node 3 models so the first use isn't slow |
+| Warm up models | Loads the helper model on Node 3 and the embedding model on Node 2, so the first use isn't slow |
 | Back up to GitHub | See [Backups](#backups) |
 
 Next to them: links to the web dashboard, the search page, GitHub, the workspace and runs folders,
@@ -961,9 +961,19 @@ chats.
 
 ## Long-term memory
 
-Each passed run is summarized by Node 3, embedded with `qwen3-embedding:0.6b` and stored in Qdrant
-with its goal, checks and code (taken from the run's own `final_<target>`). Similar future goals get
-it as an example.
+Each passed run is summarized by Node 3, embedded with `qwen3-embedding:0.6b` on Node 2 and stored
+in Qdrant with its goal, checks and code (taken from the run's own `final_<target>`). Similar future
+goals get it as an example.
+
+The embedding model runs in Ollama on Node 2's CPU: the `embed` service in
+`docker/docker-compose.yml`, container `blackboard-embed`. It moved there from Node 3 on
+2026-11-07, which leaves the laptop to its chat model. Node 3's Ollama program and model file
+were copied, without the GPU libraries, into `/home/server/ollama_cpu`. That folder is outside the
+share, so the backup never commits them. The model files are mounted read-only, so nothing on the
+network can pull other models into it. A call takes about 1 s instead of 0.1 s, and a run makes
+two. The vectors match the stored ones (cosine 0.9997 or more, `embed_compare.py`), so the store
+needed no reindex, and the retrieval test picks the same matches (`embed_eval.py`: right matches
+0.705 and up, best wrong match 0.555).
 
 - `reindex_memory.py --list`: what's stored.
 - `reindex_memory.py --drop NAME`: remove entries.
@@ -1038,7 +1048,8 @@ runs the queue starts at once.
 
 | Setting | Value | Meaning |
 |---|---|---|
-| `EMBED_MODEL` | qwen3-embedding:0.6b | Turns text into vectors to find similar tasks. Changing it needs `reindex_memory.py`. The 4B model ranked the same 10 test goals just as well (10 of 10) with a wider gap between right and wrong matches, but it's 4x larger and can't share Node 3's 8 GB with the 9B model, so 0.6B stays |
+| `EMBED_URL` | http://192.168.254.25:11434 | Where text is turned into vectors: Ollama on Node 2's CPU since 2026-11-07. Point it at Node 3 (`http://192.168.254.26:11434`) to go back; the stored vectors work with either |
+| `EMBED_MODEL` | qwen3-embedding:0.6b | Turns text into vectors to find similar tasks. Changing it needs `reindex_memory.py`, and the new model in Node 2's `ollama_cpu/models`. The 4B model ranked the same 10 test goals just as well (10 of 10) with a wider gap between right and wrong matches, but it's 4x larger and would be several times slower on Node 2's CPU, so 0.6B stays |
 | `MEMORY_MIN_SCORE` | 0.63 | How similar a past solution must be to be shown. In tests right matches scored 0.71+ and the best wrong one 0.57. Raise it if irrelevant examples appear, lower it if good ones are missed (the retriever logs scores) |
 | `MEMORY_RELEVANCE_CHECK`, `MEMORY_RELEVANCE_MARGIN` | True, 0.05 | A match up to 0.05 below the minimum is shown only if Node 3 judges it relevant (it recovered a right match at 0.629) |
 | `MEMORY_TOP_K` | 3 | Most past examples shown |
@@ -1105,8 +1116,9 @@ Measured on 2026-10-30:
 - **High runs alone.** A High run already keeps the GPU busy (4 candidates plus the tester, then
   the panel), so a second run beside it would mostly slow both down.
 - **Node 3 (RTX 2070, Qwen3.5 9B at ~49 tokens/s without thinking)** takes the jobs that must not
-  slow Node 1 down: memory embeddings and summaries, the relevance check on near-miss memory
-  matches, reading web pages during runs, and chat while a run is going (Automatic). It was also
+  slow Node 1 down: memory summaries (embeddings run on Node 2's CPU since 2026-11-07), the
+  relevance check on near-miss memory matches, reading web pages during runs, and chat while a
+  run is going (Automatic). It was also
   tried for the example check, measured on 2026-10-31: its scripts were reliable when the check is
   simpler than the task (bowling scores: 3 of 3) and often failed when the check is as hard as the
   task (a cron parser: about 1 in 5; an expression parser: 0 of 3). Its thinking mode didn't help
@@ -1153,8 +1165,12 @@ databases, run folders, logs or secrets.
 1. **Node 2:**
    - clone this repository into `/mnt/blackboard` and share that folder with Samba as `blackboard`;
    - create `config/searxng.env` containing `SEARXNG_SECRET=<random hex>`;
+   - put a CPU-only Ollama and `qwen3-embedding:0.6b` in `/home/server/ollama_cpu` for the `embed`
+     service: `bin/ollama`, `lib/ollama/` without its `cuda_*` and `vulkan` folders, and `models/`
+     (copied from another Ollama install, or fetched with
+     `OLLAMA_MODELS=/home/server/ollama_cpu/models ollama pull qwen3-embedding:0.6b`);
    - run `docker compose up -d` in `docker/` (this also builds the sandbox image).
-2. **Node 3:** install Ollama, then `ollama pull qwen3.5:9b` and `ollama pull qwen3-embedding:0.6b`.
+2. **Node 3:** install Ollama, then `ollama pull qwen3.5:9b`.
 3. **Node 1:**
    - Install vLLM 0.32 in WSL at `~/vllm_env`. The first launch downloads `RedHatAI/Qwen3.8-27B-INT4`.
    - Create the `C:\AI\venvs\agent_brain` venv with `openai`, `langgraph`, `redis`, `qdrant-client`,
@@ -1186,5 +1202,6 @@ databases, run folders, logs or secrets.
 | A run log says "Shortened '...' to fit the ... context window" | The prompt plus room for thinking and the answer didn't fit. Extras (attachments, web notes, past examples) are cut first; then the thinking shrinks, down to half its budget, before the spec or the failure report is cut. Common on High (16k) with big files; Ultra and MAX use the 32k server for this reason |
 | A run log says "cut off at N tokens: about X of thinking, Y of answer" | A reply reached its token limit; the line shows where the room went. When thinking runs past its budget, the model tends to keep reasoning in its answer, which then gets cut off. Every thinking step then answers again from its own notes without thinking ("answering again from its notes"; for candidates, "finishing them from their own notes"). A candidate that still came back cut off or broken keeps the model's reply as `model_reply.txt` in its folder under `Z:\runs\<run>\`; a reply with no `--test` mode (a plan or notes instead of the script) is rejected straight away |
 | Research finds nothing useful | The allowlist may not cover the topic. Add the relevant documentation site to `research_allowlist.txt` |
-| Node 3 is slow on its first answer | Its models were unloaded. Cluster tab, Warm up Node 3 models |
+| Node 3 is slow on its first answer | Its models were unloaded. Cluster tab, Warm up models |
+| A run log says "Memory search skipped" with port 11434 | The embedding service on Node 2 is down (the Embeddings light is red). Cluster tab, Restart Node 2 services, or `docker compose up -d embed` in `docker/` on Node 2 |
 | The window itself won't respond | Run `Reset_Cluster.bat` (one of the fallback `.bat` files; copies are in `launchers/`): it stops the window and every run, then reopens the window |

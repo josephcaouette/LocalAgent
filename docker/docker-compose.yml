@@ -56,3 +56,35 @@ services:
       - /mnt/blackboard/config/searxng.env
     volumes:
       - /mnt/blackboard/docker/searxng:/etc/searxng
+
+  # Embedding model for long-term memory (on Node 3 until 2026-11-07), CPU only: Node 2 has no GPU.
+  # Ollama and qwen3-embedding:0.6b were copied from Node 3 (same version, without its GPU
+  # libraries) into /home/server/ollama_cpu, outside the share, so the backup never commits them.
+  # The model files are read-only, so nobody on the network can pull other models into it (the
+  # folder itself stays writable: this version keeps a manifests-v2 index next to them).
+  embed:
+    image: agent-sandbox:latest
+    container_name: blackboard-embed
+    restart: unless-stopped
+    user: "1000:1000"
+    command: ["/ollama/bin/ollama", "serve"]
+    environment:
+      - HOME=/ollama/home
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_MODELS=/ollama/models
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_NOPRUNE=1
+      - OLLAMA_NUM_PARALLEL=1
+      - OLLAMA_MAX_LOADED_MODELS=1
+      - OLLAMA_NO_CLOUD=1
+      - LLAMA_ARG_CACHE_RAM=0      # llama.cpp's prompt cache (8 GB by default) is no use for embeddings
+    ports:
+      - "11434:11434"
+    volumes:
+      - /home/server/ollama_cpu/bin:/ollama/bin:ro
+      - /home/server/ollama_cpu/lib:/ollama/lib:ro
+      - /home/server/ollama_cpu/models:/ollama/models
+      - /home/server/ollama_cpu/models/blobs:/ollama/models/blobs:ro
+      - /home/server/ollama_cpu/models/manifests:/ollama/models/manifests:ro
+      - /home/server/ollama_cpu/home:/ollama/home
+    mem_limit: 4g

@@ -27,11 +27,11 @@ def ollama_generate(prompt, *, temperature=0.1, json_mode=False, timeout=60, num
 
 
 def embed(text, kind):
-    """Embed text with the Node 3 embedding model. kind="query" for searches,
-    kind="document" for stored items; each gets the prefix set in config.py."""
+    """Embed text with the embedding model at config.EMBED_URL (Node 2's CPU). kind="query" for
+    searches, kind="document" for stored items; each gets the prefix set in config.py."""
     prefix = {"query": config.EMBED_QUERY_PREFIX, "document": config.EMBED_DOCUMENT_PREFIX}[kind]
     res = requests.post(
-        f"{config.OLLAMA_URL}/api/embed",
+        f"{config.EMBED_URL}/api/embed",
         json={"model": config.EMBED_MODEL, "input": prefix + text,
               "keep_alive": config.OLLAMA_KEEP_ALIVE},
         timeout=60,

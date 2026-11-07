@@ -77,6 +77,21 @@ MEMORY_RELEVANCE_CHECK = True   # Node 3 judges each match near or above the cut
 MEMORY_RELEVANCE_MARGIN = 0.05  # matches this far below MEMORY_MIN_SCORE also get Node 3's judgment
 MEMORY_TOP_K = 3
 
+# --- Embeddings for memory: Ollama on Node 2's CPU -------------------------------
+# Service "embed" in docker/docker-compose.yml (container blackboard-embed), with the Ollama
+# version and model file Node 3 used until 2026-11-07: its vectors match the stored ones (cosine
+# 0.9997 or more, embed_compare.py) at about 1 s per call instead of 0.1 s, for two calls a run.
+# The window's status light and warm-up use Node 2. To go back to Node 3, set this (or
+# AGENT_EMBED_URL) to f"http://{NODE3_IP}:11434"; the stored vectors work with either.
+EMBED_URL = _setting("AGENT_EMBED_URL", f"http://{NODE2_IP}:11434")
+EMBED_MODEL = "qwen3-embedding:0.6b" # was nomic-embed-text. Changing it changes the vector size:
+                                     # run reindex_memory.py afterwards to rebuild the memory store.
+# Text added in front of what gets embedded. Qwen3-Embedding wants a task instruction on queries
+# and nothing on stored documents. (nomic-embed-text used "search_query: " / "search_document: ".)
+EMBED_QUERY_PREFIX = ("Instruct: Given a programming task, retrieve a stored Python utility that "
+                      "solves a similar task\nQuery:")
+EMBED_DOCUMENT_PREFIX = ""
+
 # --- vLLM on Node 1 (planner / engineer / verifier) ---------------------------
 LLM_BASE_URL = "http://127.0.0.1:8001"   # not "localhost": Windows tries IPv6 first and each
                                          # new connection to WSL then waits ~2 s before falling back
@@ -98,27 +113,18 @@ THINK_PLANNER = True
 THINK_VERIFIER = True
 THINK_TOKENS = 5000
 
-# --- Ollama on Node 3 (scout / condenser / ingest summaries / embeddings) ------
+# --- Ollama on Node 3 (scout / condenser / ingest summaries / chat) -------------
 # Who does the pipeline's helper jobs (the scout's brief on referenced files and the diagnosis
 # of failed test runs): "node1" uses the main vLLM model, which is faster and stronger here;
-# "node3" uses WORKER_MODEL. Embeddings, background memory summaries and the GUI's chat
-# fallback always use Node 3.
+# "node3" uses WORKER_MODEL. Background memory summaries and the GUI's chat fallback always use
+# Node 3. (Embeddings moved to Node 2 on 2026-11-07: EMBED_URL above.)
 HELPER_BACKEND = "node1"
 OLLAMA_URL = f"http://{NODE3_IP}:11434"
 WORKER_MODEL = "qwen3.5:9b"          # was qwen2.5-coder:7b
 WORKER_THINK = False       # Qwen3.5 reasons step by step unless this is False. Use None for models
                            # without a thinking mode (such as qwen2.5-coder), which reject the option.
-EMBED_MODEL = "qwen3-embedding:0.6b" # was nomic-embed-text. Changing it changes the vector size:
-                                     # run reindex_memory.py afterwards to rebuild the memory store.
-                                     # Ollama keeps it on Node 3's CPU next to qwen3.5:9b (8 GB GPU);
-                                     # that's fine at ~70 ms per call. With qwen3.5:4b both fit on the GPU.
-# Text added in front of what gets embedded. Qwen3-Embedding wants a task instruction on queries
-# and nothing on stored documents. (nomic-embed-text used "search_query: " / "search_document: ".)
-EMBED_QUERY_PREFIX = ("Instruct: Given a programming task, retrieve a stored Python utility that "
-                      "solves a similar task\nQuery:")
-EMBED_DOCUMENT_PREFIX = ""
 OLLAMA_NUM_CTX = 8192      # keep identical everywhere (incl. Restart_Node3_Worker.bat) or Ollama reloads the model
-OLLAMA_KEEP_ALIVE = -1     # sent with every request; -1 keeps models loaded indefinitely
+OLLAMA_KEEP_ALIVE = -1     # sent with every request (embeddings too); -1 keeps models loaded indefinitely
 EXAMPLE_CHECK_BACKEND = "node1"   # who writes the example-checking script on High and above:
                                   # "node1" (27B, no thinking; 6 of 6 correct on test plans, ~15 s) or
                                   # "node3" (9B; 0-3 of 9). Disputes are always settled by Node 1.

@@ -241,7 +241,7 @@ class ClusterWindow:
         row.pack(fill=tk.X)
         self.dots = {}        # name -> (dot, short label, detail label)
         groups = [("Node 1", ["vLLM", "GPU", "Z: drive"]),
-                  ("Node 2", ["Redis", "Qdrant", "SearXNG", "Dashboard", "File share"]),
+                  ("Node 2", ["Redis", "Qdrant", "SearXNG", "Dashboard", "File share", "Embeddings"]),
                   ("Node 3", ["Ollama"])]
         for title, names in groups:
             tk.Label(row, text=title, bg=PANEL, fg="#5bc0de", font=("Segoe UI", 9, "bold")).pack(
@@ -376,9 +376,9 @@ class ClusterWindow:
         items = [
             ("Connect Z: drive", self.connect_drive, None, "Opens a window that asks for the share password."),
             ("Reset pipeline", self.reset_pipeline, "#d9534f", "Stops every run, clears their records and test containers."),
-            ("Restart Node 2 services", self.restart_node2, None, "Redis, Qdrant, SearXNG and the dashboard (~15 s)."),
+            ("Restart Node 2 services", self.restart_node2, None, "Redis, Qdrant, SearXNG, the dashboard, embeddings (~15 s)."),
             ("Restart Ollama on Node 3", self.restart_node3, None, "Opens a window for your sudo password."),
-            ("Warm up Node 3 models", self.warm_node3, None, "Loads the helper and embedding models."),
+            ("Warm up models", self.warm_models, None, "Loads the helper model (Node 3) and the embedding model (Node 2)."),
             ("Back up to GitHub", self.backup, "#3d8b3d", "Copies launchers and settings to Node 2, commits, pushes."),
         ]
         for i, (text, cmd, color, note) in enumerate(items, 1):
@@ -410,7 +410,7 @@ class ClusterWindow:
         grid = tk.Frame(details, bg=PANEL, padx=12, pady=8)
         grid.pack(fill=tk.X)
         columns = [("Node 1 (this PC)", ["vLLM", "GPU", "Z: drive"]),
-                   ("Node 2 (Blackboard)", ["Redis", "Qdrant", "SearXNG", "Dashboard", "File share"]),
+                   ("Node 2 (Blackboard)", ["Redis", "Qdrant", "SearXNG", "Dashboard", "File share", "Embeddings"]),
                    ("Node 3 (Worker)", ["Ollama", "Models"])]
         for col, (title, names) in enumerate(columns):
             frame = tk.Frame(grid, bg=PANEL)
@@ -636,14 +636,16 @@ class ClusterWindow:
                                "--format=csv,noheader,nounits"], timeout=5)
         st["gpu"] = [x.strip() for x in out.split(",")] if code == 0 and out.count(",") == 3 else None
         for name, host, port in (("Redis", n2, 6379), ("Qdrant", n2, 6333), ("SearXNG", n2, 8888),
-                                 ("Dashboard", n2, 8080), ("File share", n2, 445), ("Ollama", n3, 11434)):
+                                 ("Dashboard", n2, 8080), ("File share", n2, 445), ("Embeddings", n2, 11434),
+                                 ("Ollama", n3, 11434)):
             st[name] = port_open(host, port)
-        st["models"] = None
-        if st["Ollama"]:
-            try:
-                st["models"] = [m["name"] for m in requests.get(f"http://{n3}:11434/api/ps", timeout=2).json()["models"]]
-            except Exception:
-                pass
+        st["models"] = st["embed_loaded"] = None
+        for key, up, host in (("models", st["Ollama"], n3), ("embed_loaded", st["Embeddings"], n2)):
+            if up:
+                try:
+                    st[key] = [m["name"] for m in requests.get(f"http://{host}:11434/api/ps", timeout=2).json()["models"]]
+                except Exception:
+                    pass
         st["active_runs"] = 0
         if st["Redis"]:
             try:
@@ -696,6 +698,12 @@ class ClusterWindow:
         for name, short in (("Redis", "Redis"), ("Qdrant", "Qdrant"), ("SearXNG", "SearXNG"),
                             ("Dashboard", "Dashboard"), ("File share", "Share")):
             self._set(name, GREEN if st[name] else RED, short, "up" if st[name] else "down")
+        loaded = st["embed_loaded"]
+        if not st["Embeddings"]:
+            self._set("Embeddings", RED, "Embeddings", "down (Restart Node 2 services)")
+        else:
+            self._set("Embeddings", GREEN if loaded else ORANGE, "Embeddings",
+                      f"up, {', '.join(loaded)} loaded (CPU)" if loaded else "up, model loads on first use")
         models = st["models"]
         if not st["Ollama"]:
             self._set("Ollama", RED, "Ollama down", "down")
@@ -703,7 +711,7 @@ class ClusterWindow:
             color = GREEN if models else ORANGE
             self._set("Ollama", color, f"Ollama · {len(models)} models" if models else "Ollama · none loaded", "up")
         self._set("Models", GREEN if models else ORANGE, "",
-                  ", ".join(models) if models else ("none loaded (Warm up Node 3 models)" if models == [] else "unknown"))
+                  ", ".join(models) if models else ("none loaded (Warm up models)" if models == [] else "unknown"))
         if self.agent is None and st["drive"] and not self.agent_failed:
             self.load_agent()            # Z: has just been connected
 
@@ -780,12 +788,12 @@ class ClusterWindow:
         self.in_thread(work)
 
     def start_everything(self):
-        """Connect Z: if needed, start vLLM if it isn't running, and load Node 3's models."""
+        """Connect Z: if needed, start vLLM if it isn't running, and load the Node 3 and Node 2 models."""
         if not os.path.exists(self.s["drive"] + "\\workspace"):
             self.log("Z: isn't connected; connect it in the window that opens (the tabs load by themselves).")
             self.connect_drive()
         self.start_vllm()
-        self.warm_node3()
+        self.warm_models()
 
     def _stop_vllm_blocking(self):
         run_quiet(["wsl", "-u", "root", "bash", "-c",
@@ -970,26 +978,32 @@ class ClusterWindow:
     def restart_node3(self):
         cmd = (f"echo Restarting Ollama on Node 3. Enter the sudo password for '{self.s['ssh_user']}' when asked. && "
                f"ssh -t {self.s['ssh_user']}@{self.s['node3_ip']} \"sudo systemctl restart ollama\" && "
-               "echo Done. Back in Agent Cluster, press Warm up Node 3 models. You can close this window.")
+               "echo Done. Back in Agent Cluster, press Warm up models. You can close this window.")
         subprocess.Popen(["cmd", "/k", cmd], creationflags=NEW_CONSOLE)
-        self.log("Opened a window to restart Ollama on Node 3. Afterwards, press Warm up Node 3 models.")
+        self.log("Opened a window to restart Ollama on Node 3. Afterwards, press Warm up models.")
 
-    def warm_node3(self):
+    def warm_models(self):
+        """Load the helper model on Node 3 and the embedding model on Node 2's CPU (since
+        2026-11-07), both with keep_alive -1 so they stay loaded."""
         def work():
-            url = f"http://{self.s['node3_ip']}:11434"
+            n3, n2 = f"http://{self.s['node3_ip']}:11434", f"http://{self.s['node2_ip']}:11434"
             worker, embedder, ctx = self.s["worker_model"], self.s["embed_model"], self.s["ollama_num_ctx"]
             try:
                 self.post("log", f"Loading {worker} on Node 3...")
-                requests.post(f"{url}/api/generate", timeout=300, json={
+                requests.post(f"{n3}/api/generate", timeout=300, json={
                     "model": worker, "prompt": "warmup", "stream": False, "think": False,
                     "keep_alive": -1, "options": {"num_ctx": ctx}}).raise_for_status()
-                self.post("log", f"Loading {embedder} on Node 3...")
-                requests.post(f"{url}/api/embed", timeout=120, json={
-                    "model": embedder, "input": "warmup", "keep_alive": -1}).raise_for_status()
-                models = [m["name"] for m in requests.get(f"{url}/api/ps", timeout=5).json()["models"]]
+                models = [m["name"] for m in requests.get(f"{n3}/api/ps", timeout=5).json()["models"]]
                 self.post("log", "Node 3 models loaded: " + ", ".join(models), "ok")
             except Exception as e:
-                self.post("log", f"Warm-up failed: {e}", "err")
+                self.post("log", f"Node 3 warm-up failed: {e}", "err")
+            try:
+                self.post("log", f"Loading {embedder} on Node 2 (CPU)...")
+                requests.post(f"{n2}/api/embed", timeout=120, json={
+                    "model": embedder, "input": "warmup", "keep_alive": -1}).raise_for_status()
+                self.post("log", f"Embedding model loaded on Node 2: {embedder}", "ok")
+            except Exception as e:
+                self.post("log", f"Embedding warm-up on Node 2 failed: {e}", "err")
         self.in_thread(work)
 
     def backup(self):

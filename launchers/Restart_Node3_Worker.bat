@@ -42,17 +42,14 @@ if %errorlevel% neq 0 (
 )
 echo [+] Ollama daemon is active!
 
-:: 4. Pre-warm models in RTX 2070 VRAM and keep them loaded: keep_alive -1.
+:: 4. Pre-warm the helper model in RTX 2070 VRAM and keep it loaded: keep_alive -1.
 ::    The pipeline sends the same keep_alive and num_ctx with every request, so nothing
-::    resets the timer or forces a reload. Model names must match WORKER_MODEL and EMBED_MODEL,
-::    and num_ctx must match OLLAMA_NUM_CTX, in Z:\workspace\config.py.
+::    resets the timer or forces a reload. The model name must match WORKER_MODEL, and num_ctx
+::    OLLAMA_NUM_CTX, in Z:\workspace\config.py. The embedding model runs on Node 2 since
+::    2026-11-07 (Restart_Node2_Blackboard.bat loads it).
 echo [*] Pre-warming qwen3.5:9b into VRAM...
 curl -s http://%NODE3_IP%:11434/api/generate -d "{\"model\": \"qwen3.5:9b\", \"prompt\": \"warmup\", \"stream\": false, \"think\": false, \"keep_alive\": -1, \"options\": {\"num_ctx\": 8192}}" >nul
 echo [+] qwen3.5:9b loaded.
-
-echo [*] Pre-warming qwen3-embedding:0.6b into VRAM...
-curl -s http://%NODE3_IP%:11434/api/embed -d "{\"model\": \"qwen3-embedding:0.6b\", \"input\": \"warmup\", \"keep_alive\": -1}" >nul
-echo [+] qwen3-embedding:0.6b loaded.
 
 :: 5. Output active model status from Node 3
 echo ------------------------------------------------------

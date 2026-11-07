@@ -17,10 +17,10 @@ if %errorlevel% neq 0 (
 )
 echo [+] Node 2 host is reachable.
 
-:: 2. Restart Docker Compose stack: Redis, Qdrant and the dashboard.
+:: 2. Restart Docker Compose stack: Redis, Qdrant, SearXNG, the dashboard and the embedding model.
 ::    The pkill stops a dashboard left over from the old nohup setup, if any.
 ::    Test runs use throwaway containers, so there is no sandbox service any more.
-echo [*] Restarting Docker Compose stack (Redis, Qdrant, Dashboard)...
+echo [*] Restarting Docker Compose stack (Redis, Qdrant, SearXNG, Dashboard, Embeddings)...
 ssh %NODE2_USER%@%NODE2_IP% "pkill -f '^python3 /mnt/blackboard/workspace/agent_dashboard.py'; cd /mnt/blackboard/docker && docker compose down --remove-orphans && docker compose up -d"
 if %errorlevel% neq 0 (
     echo [!] Warning: Docker compose restart encountered an error.
@@ -43,6 +43,11 @@ if %errorlevel% equ 0 (echo [+] Qdrant is ONLINE.) else (echo [!] Qdrant failed 
 echo [*] Probing Telemetry Dashboard (port 8080)...
 curl -s --connect-timeout 2 http://%NODE2_IP%:8080 >nul
 if %errorlevel% equ 0 (echo [+] Dashboard is ONLINE.) else (echo [!] Dashboard failed to respond.)
+
+:: The embedding model (Ollama on Node 2's CPU since 2026-11-07) loads here and stays loaded.
+echo [*] Loading the embedding model (port 11434, a few seconds on the CPU)...
+curl -sf --connect-timeout 2 --max-time 120 http://%NODE2_IP%:11434/api/embed -d "{\"model\": \"qwen3-embedding:0.6b\", \"input\": \"warmup\", \"keep_alive\": -1}" >nul
+if %errorlevel% equ 0 (echo [+] Embedding model is ONLINE.) else (echo [!] Embedding model failed to respond.)
 
 :: 5. Refresh Windows drive Z: mount
 echo [*] Verifying network drive Z: mapping...

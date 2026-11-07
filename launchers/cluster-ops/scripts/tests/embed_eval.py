@@ -1,10 +1,13 @@
 """Compare embedding models on the pipeline's memory-retrieval job (goal -> stored utility)."""
 import math
+import os
 import sys
 
 import requests
 
-OLLAMA = "http://192.168.254.26:11434"
+# Node 3 has every candidate model. EMBED_EVAL_URL=http://192.168.254.25:11434 checks the live
+# server on Node 2 instead, which only has qwen3-embedding:0.6b.
+OLLAMA = os.environ.get("EMBED_EVAL_URL", "http://192.168.254.26:11434")
 
 DOCS = [  # (filename, goal it was built for, summary, tags)
     ("primes_report.py", "Create primes_report.py that finds primes below 100", "Finds all prime numbers below 100 with a sieve of Eratosthenes and prints them, their count and their sum. Test mode checks the results.", "primes, sieve, math"),

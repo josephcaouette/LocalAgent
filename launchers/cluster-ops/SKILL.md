@@ -17,7 +17,7 @@ relying on it: the code keeps changing.
 | Node | Address | Role |
 |---|---|---|
 | Node 1 "Brain" | 192.168.254.24 (this PC, Windows 11 + WSL Ubuntu-24.04) | RTX 4090; vLLM (in WSL) at `http://127.0.0.1:8001` (use 127.0.0.1, not localhost); runs the pipeline and the Agent Cluster window |
-| Node 2 "Blackboard" | 192.168.254.25, SSH `server@192.168.254.25` (key auth, BatchMode works) | File share `/mnt/blackboard` = `Z:\` on Node 1; Redis; Qdrant :6333 (memory); SearXNG :8888; Docker sandbox (image `agent-sandbox:latest`); the Git repo |
+| Node 2 "Blackboard" | 192.168.254.25, SSH `server@192.168.254.25` (key auth, BatchMode works) | File share `/mnt/blackboard` = `Z:\` on Node 1; Redis; Qdrant :6333 (memory); SearXNG :8888; Docker sandbox (image `agent-sandbox:latest`); the Git repo; embeddings: Ollama :11434 on the CPU (compose service `embed`, container `blackboard-embed`, files in `/home/server/ollama_cpu`). 2x Xeon E5-2620 v2 (24 threads, AVX but no AVX2), 125 GB RAM, no GPU |
 | Node 3 "Worker" | 192.168.254.26, SSH `server@192.168.254.26` (key auth, BatchMode works) | MSI GE63 Raider RGB 9SF laptop: i7-9750H (6 cores), 16 GB DDR4-2666 in 2 SO-DIMM slots (both used; the firmware lists 32 GB max), RTX 2070 8 GB (2026-11-05). Ollama (chat helper, memory summaries). Slot details without sudo: `udevadm info -q property -p /sys/devices/virtual/dmi/id` |
 
 Key paths:
@@ -76,19 +76,29 @@ adversary, prober in parallel), executor, verifier, condenser, retest, critic, m
 CLI: `run_langgraph_pipeline.py --goal-file F --target T --accuracy LEVEL [--no-memory --no-ingest]`.
 A running pipeline has its code loaded already; edits only affect runs started afterwards.
 
-Node 3's jobs: embeddings and memory summaries, memory relevance checks, the chat's page and
+Node 3's jobs: memory summaries, memory relevance checks, the chat's page and
 attachment reading while a run is going (a run's own research reads on Node 1 unless a second run is
 going: `research.reader_backend`), and chat while a run is going (the chat's Automatic model).
 A bigger model on Node 3 was weighed and rejected (2026-11-05): `qwen3.8:27b` would fit in place of
 the 9B but run ~2-3 tokens/s (most layers in DDR4-2666 RAM, ~42 GB/s), about 20x slower per request
 than Node 1, which averaged 122 tokens/s of output over set 4's v3 battery. Every model call in a run
 is in a step the run waits for, so it would only add ~2% capacity; `qwen3.5:35b-a3b` needs 32 GB RAM.
-The 9B stays, and so does the embedding model (user's choice, 2026-11-06). It only feeds memory (16
-stored solutions; a run whose lookup fails prints "Memory search skipped" and goes on, and every
-battery runs with `--no-memory --no-ingest`), and Ollama keeps it in Node 3's RAM (126 MB on the GPU,
-~70 ms a call). Node 1 has no Ollama: moving it there means the 1.6 GB `ollama-windows-amd64.zip` run
-CPU-only (vLLM claims 92% of the 4090 at start-up) plus the 639 MB model, for memory with the laptop
-off; the collection is small enough to re-embed in seconds (`reindex_memory.py`). On High+ the **example check**
+The 9B stays (2026-11-06). The embedding model moved to Node 2's CPU on 2026-11-07 (user's choice;
+Node 1 would have needed the 1.6 GB `ollama-windows-amd64.zip`, and Node 2 needed no download):
+compose service `embed` runs Node 3's Ollama 0.40.12, copied without `cuda_v12`/`cuda_v13`/`vulkan`
+(76 MB), and the model's three blobs (checksums verified) from `/usr/share/ollama/.ollama/models` into
+`/home/server/ollama_cpu`, outside the share so the backup can't commit 640 MB. It uses image
+`agent-sandbox:latest` as user 1000, with `models/blobs` and `models/manifests` mounted read-only, which
+blocks pulls (the folder itself must stay writable: 0.40 creates `manifests-v2`). Other settings:
+`OLLAMA_NO_CLOUD=1`, `LLAMA_ARG_CACHE_RAM=0` (llama.cpp's 8 GB prompt cache) and `mem_limit: 4g` (it
+uses ~1.1 GB). `config.EMBED_URL` (`AGENT_EMBED_URL` overrides it) feeds `agent_common.embed()`
+(`embedurl_unit.py`). The window has an Embeddings light under Node 2, and "Warm up models" loads each
+node's model. Measured: Node 2's vectors match the stored ones at cosine >= 0.99966 (Node 3 reproduces
+them exactly; `embed_compare.py [A] [B]`), so no reindex. `EMBED_EVAL_URL=... embed_eval.py` scores 10/10
+on both, right min 0.705 vs 0.710, best wrong 0.555 vs 0.559. Speed: ~1 s per stored text and 1.25 s
+per goal-length query, vs 0.12 s on Node 3. Node 3 keeps the files as a fallback; its loaded copy was
+unloaded. Memory is all it feeds: 16 stored solutions, a run whose lookup fails prints "Memory search
+skipped" and goes on, and every battery runs with `--no-memory --no-ingest`. On High+ the **example check**
 (`check_examples`, config `EXAMPLE_CHECK_BACKEND`, Node 1 by default; "node3" moves it back) writes
 a brute-force script for the plan's hand-worked values, runs it in the sandbox, and re-derives any
 disputed value with thinking. Failures skip harmlessly. Node 3 is a poor fit for writing code that
@@ -384,6 +394,7 @@ Commit only when the user asked for it (a standing "sync GitHub" request counts)
 | `A later step failed ..., but a version had already passed; keeping it` | The safety net saved a passing version after an error |
 | `[Node: Example Checker] -> N expected value(s) confirmed, M disputed` | Node 3's brute-force check of the plan's examples; disputes go to Node 1, which may print `Corrected ... before coding` |
 | `Node 3's script still failed ...; skipped` / `Nothing in the plan can be recomputed exactly` | The example check didn't apply or Node 3 couldn't write a working checker; the run continues unchanged |
+| `Memory search skipped: ...192.168.254.25... 11434` | The embedding service on Node 2 is down: `docker compose up -d embed` in `/mnt/blackboard/docker` (or the window's Restart Node 2 services); `docker logs blackboard-embed` |
 
 Lessons from the benchmarks (2026-10-31): the shared spec is a single point of failure (one wrong
 worked example or invented limit reaches every candidate); hand-computed expected values are the
