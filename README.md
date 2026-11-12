@@ -185,14 +185,54 @@ seconds while open.
 
 ### Model server tab
 
-Every vLLM setting as a form. Changes apply the next time you press **Start** or **Restart vLLM**;
-**Save settings** remembers them. vLLM runs without a window of its own: its log shows at the bottom
-of this tab (the status-check lines are hidden), and it keeps running when you close the window.
+Loads any model on Node 1 or Node 3, with its settings, from one place.
+
+**Node 1 (vLLM).** Every vLLM setting as a form. Changes apply the next time you press **Start** or
+**Restart vLLM**; **Save settings** remembers them. vLLM runs without a window of its own: its log
+shows at the bottom of this tab (the status-check lines are hidden), and it keeps running when you
+close the window.
+
+To load another model, type its Hugging Face name (`owner/model`) in **Model** and press **Check
+model**. That reads the model's details from Hugging Face without downloading anything and fills in
+settings that suit it:
+
+- speculative decoding (MTP) and text-only stay on only for Qwen3.5 and later, which have the parts
+  they use;
+- the reasoning parser follows the model family: `qwen3`, `deepseek_r1` for R1 distills and QwQ, or
+  none;
+- the context length is capped at the longest the model supports.
+
+The line under the form says what changed, how big the weights are, whether they're already
+downloaded, whether they fit the 4090 (weights above ~19 GB won't), and whether the model is gated.
+Change anything you like, then press Start or Restart vLLM. A model that isn't downloaded yet asks
+first, with its size. A gated one (Llama, Gemma) needs its license accepted on huggingface.co and a
+login in WSL: `~/vllm_env/bin/hf auth login`. GGUF-only repos don't work in vLLM; they can run on
+Node 3. Models that started are added to the Model list. The pipeline, chat and research all use
+whatever vLLM serves, and the chat's model list renames itself. One exception: Ultra and MAX runs
+still switch Node 1 to the **Long context (32k)** preset, which is the Qwen3.8 model, and back
+afterwards.
+
+**Node 3 (Ollama).** Below the vLLM buttons:
+
+| Setting | Default | What it does |
+|---|---|---|
+| Model | qwen3.5:9b | Any Ollama name: `llama3.1:8b`, `hf.co/owner/repo:Q4_K_M`. Must be a chat model |
+| Context | 8192 | Tokens per request; more uses more of the 2070's 8 GB |
+| GPU layers | auto | How many layers go on the GPU; fewer leave VRAM free, the rest runs on the CPU (slower) |
+| Thinking | Off (faster) | For models that can think. Ignored, and never sent, for models that can't |
+
+**Check model** says whether Node 3 has the model, how big it is, whether it fits the GPU, its
+longest context and whether it can think. For a model Node 3 doesn't have, it gives the
+ollama.com download size. **Load on Node 3** asks before any download, unloads the old model, loads
+the new one and reports how much of it sits on the GPU. It then saves the choice in
+`Z:\config\node3_model.json`. `config.py` reads that file, so new runs, the chat, the **Warm up
+models** button and `Restart_Node3_Worker.bat` all use the new model. Runs already going keep the
+old one.
 
 | Setting | Default | What it does |
 |---|---|---|
 | Preset | Fast | **Fast** for daily use. **Long context (32k)** for very large files or chats: about half speed, because speculative decoding is off so the bigger context fits. **Old model** (Qwen2.5-Coder-32B) as a fallback. Saving records which preset the values match, or "Custom" |
-| Model | `RedHatAI/Qwen3.8-27B-INT4` | The Hugging Face model. A new name downloads on first start. The pipeline uses whatever vLLM serves |
+| Model | `RedHatAI/Qwen3.8-27B-INT4` | The Hugging Face model; **Check model** suggests settings for a new one. A new name downloads on first start (after asking). The pipeline uses whatever vLLM serves |
 | Context length | 16,384 | Most tokens one request may hold (prompt plus answer). About 12,000 words or 1,500 lines of code. The pipeline measures and trims prompts to fit. Above 16k, vLLM's working memory jumps from 0.6 to 2.8 GiB, so fewer requests fit at once |
 | GPU memory | 0.92 | Share of the 4090 vLLM claims. It holds the model (~17 GB), working memory, and the **KV cache**: the model's short-term memory of the text it's working on. See the table below |
 | Parallel requests | 8 | Most requests served at once. Candidates, the tester, judges, research and chat share them. KV cache is the real limit, not this |
@@ -1040,8 +1080,8 @@ runs the queue starts at once.
 | `HELPER_BACKEND` | "node1" | Who writes the scout's brief and failure diagnoses. Node 1 is faster and better; "node3" frees Node 1 at some cost to quality. (Deciding whether a script or an independent test is wrong always uses Node 1) |
 | `EXAMPLE_CHECK_BACKEND` | "node1" | Who writes the example-check script. Node 1's scripts worked 6 of 6 times; Node 3's often crashed or were cut off on checks as hard as the task |
 | `READER_BACKEND` | "auto" | Who reads research pages, condenses attachments and summarizes chats. "auto" uses Node 1, or Node 3 while Node 1 is busy with runs |
-| `WORKER_MODEL`, `WORKER_THINK` | qwen3.5:9b, False | Node 3's model, thinking off for speed |
-| `OLLAMA_NUM_CTX` | 8192 | Node 3's context. Must match everywhere, or Ollama reloads the model (~10 s) |
+| `WORKER_MODEL`, `WORKER_THINK` | qwen3.5:9b, False | Node 3's model, thinking off for speed (None for models without a thinking mode). Set from the Model server tab, which saves them in `Z:\config\node3_model.json`; these are the defaults without that file |
+| `OLLAMA_NUM_CTX`, `OLLAMA_NUM_GPU` | 8192, None | Node 3's context and GPU layers (None: Ollama decides), from the same file. `ollama_options()` sends them with every request, because a different value makes Ollama reload the model (~10 s) |
 | `OLLAMA_KEEP_ALIVE` | -1 | Keep Node 3's models loaded permanently |
 
 **Memory**

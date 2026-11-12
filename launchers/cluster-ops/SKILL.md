@@ -76,6 +76,29 @@ adversary, prober in parallel), executor, verifier, condenser, retest, critic, m
 CLI: `run_langgraph_pipeline.py --goal-file F --target T --accuracy LEVEL [--no-memory --no-ingest]`.
 A running pipeline has its code loaded already; edits only affect runs started afterwards.
 
+**Loading any model (2026-11-12, `modelload_unit.py`).** The window's Model server tab:
+- **Node 1:** the Model box takes any HF name. **Check model** (`hf_model_info`: HF API `?blobs=true`
+  plus `config.json`, no download) fills the form via `suggest_vllm`: MTP and text-only only for
+  `qwen3.N`, `reasoning_parser_for` (qwen3 / deepseek_r1 / none), and context capped at
+  `max_position_embeddings` when there's no rope scaling.
+- **Downloads:** `_precheck_node1` runs before Start and Restart. A model not in WSL's
+  `~/.cache/huggingface/hub` gets a yes/no with its size (warning above `FIT_GB` 19). Gated models
+  without a login are blocked (`~/vllm_env/bin/hf auth login`; `hf` is only in the venv), and so are
+  GGUF-only repos.
+- **Remembering:** models vLLM served go into `recent_node1` (launcher_settings.json), and
+  `agent_gui.set_model_names()` renames the chat choice. `LONG_PRESET` (Ultra/MAX) still forces Qwen3.8.
+- **Node 3:** model, context, GPU layers (`num_gpu`) and thinking. Check reads `/api/tags` and
+  `/api/show`, plus the ollama.com manifest size via `ollama_manifest_path` (dotted names such as
+  `llama3.1` are fine; `hf.co/...` has no size). Load asks before `/api/pull`, refuses non-chat
+  models, unloads the others, loads with keep_alive -1, and writes `Z:\config\node3_model.json`
+  (gitignored). Thinking is None when the model can't think.
+- **Who reads the file:** `config.py` sets WORKER_MODEL, WORKER_THINK, OLLAMA_NUM_CTX and
+  OLLAMA_NUM_GPU from it, and `config.ollama_options()` sends them with every request. The window
+  patches the live config for its own chat, and Warm up models and `Restart_Node3_Worker.bat` use it
+  too.
+- **Tested live:** qwen2.5-coder:7b (think None; a fresh process's helper call worked) and back to
+  qwen3.5:9b, ~5 s each.
+
 Node 3's jobs: memory summaries, memory relevance checks, the chat's page and
 attachment reading while a run is going (a run's own research reads on Node 1 unless a second run is
 going: `research.reader_backend`), and chat while a run is going (the chat's Automatic model).

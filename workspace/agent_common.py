@@ -7,7 +7,7 @@ import config
 def ollama_generate(prompt, *, temperature=0.1, json_mode=False, timeout=60, num_predict=None):
     """Run the Node 3 worker model. num_ctx and keep_alive are always sent with the
     same values, so Ollama never reloads the model or lets it expire."""
-    options = {"temperature": temperature, "num_ctx": config.OLLAMA_NUM_CTX}
+    options = config.ollama_options(temperature=temperature)
     if num_predict:
         options["num_predict"] = num_predict
     payload = {

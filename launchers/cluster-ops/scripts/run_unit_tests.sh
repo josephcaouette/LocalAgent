@@ -12,7 +12,7 @@ echo "== graph"; $PY -c "import run_langgraph_pipeline as p; p.build_graph(); pr
 [ "${PIPESTATUS[0]}" -eq 0 ] || fail=1
 # A test fails the suite when it crashes, exits non-zero or prints "N FAILED". Most older tests only
 # print their results (True/False per case), so read the output too.
-for t in rescue softfail consensus fit finish finishroom testfix inplace edits editmatch stuck silent bigfile fixbase lastchance standin finalpick restart queueguard guards spill compare retest chatroute embedurl examples; do
+for t in rescue softfail consensus fit finish finishroom testfix inplace edits editmatch stuck silent bigfile fixbase lastchance standin finalpick restart queueguard guards spill compare retest chatroute embedurl modelload examples; do
   echo "== $t"
   out=$(timeout 300 $PY "$T/${t}_unit.py" 2>&1); rc=$?
   echo "$out" | grep -vE '^\s*$|^\[Node|^    ' | tail -8

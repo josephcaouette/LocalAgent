@@ -4,7 +4,8 @@
   Chat          talk with the models; "Talk about result" explains finished runs   } from
   Task & Queue  the task form, accuracy level, attachments, queue and per-run logs   } Z:\\workspace\\
   Runs          every recorded run with details and actions                          } agent_gui.py
-  Model server  vLLM settings, presets, free-VRAM check, start / stop / restart, live log
+  Model server  load any model: Node 1 (vLLM: settings, presets, Check model, free-VRAM check,
+                start / stop / restart, live log) and Node 3 (Ollama: model, context, GPU layers, thinking)
   Cluster       Z: drive, pipeline reset, Node 2 / Node 3 restarts, backup, links, status details
   Activity      what the window did (bottom)
 
@@ -71,6 +72,7 @@ DEFAULTS = {
     "drive": "Z:", "share": r"\\192.168.254.25\blackboard", "venv": r"C:\AI\venvs\agent_brain",
     "github": "https://github.com/josephcaouette/LocalAgent",
     "worker_model": "qwen3.5:9b", "embed_model": "qwen3-embedding:0.6b", "ollama_num_ctx": 8192,
+    "recent_node1": [], "recent_node3": [],
     "preset": "Fast (default)", "vllm": copy.deepcopy(PRESETS["Fast (default)"]),
 }
 KNOWN_MODELS = ["RedHatAI/Qwen3.8-27B-INT4", "Qwen/Qwen2.5-Coder-32B-Instruct-AWQ"]
@@ -173,6 +175,107 @@ def vllm_card():
         return None
 
 
+# --------------------------------------------------------------------------- loading other models
+
+NODE3_FILE = "node3_model.json"          # in Z:\config; config.py reads Node 3's model and settings from it
+NODE3_DEFAULTS = {"model": "qwen3.5:9b", "think": False, "num_ctx": 8192, "num_gpu": None}
+FIT_GB = 19.0       # weights above this leave too little of the 4090's 24 GB for vLLM's working memory
+RECENT_MAX = 10
+
+
+def reasoning_parser_for(name):
+    """vLLM's reasoning parser for a model, judged by its name ('' when it has none)."""
+    n = name.lower()
+    if "qwen3" in n:
+        return "qwen3"
+    if "deepseek-r1" in n or "r1-distill" in n or "qwq" in n:
+        return "deepseek_r1"
+    return ""
+
+
+def suggest_vllm(v, name, max_ctx=None):
+    """vLLM settings for model `name`, starting from settings v: MTP and text-only stay only for
+    Qwen3.5 and later (they have MTP heads and a vision part), the reasoning parser follows the
+    model, and the context is capped at what the model supports. Returns (settings, changes)."""
+    new = dict(v, model=name)
+    newer_qwen = bool(re.search(r"qwen3\.\d", name.lower()))
+    new["mtp"] = bool(v["mtp"]) and newer_qwen
+    new["text_only"] = newer_qwen
+    new["reasoning_parser"] = reasoning_parser_for(name)
+    if max_ctx and new["ctx"] > max_ctx:
+        new["ctx"] = int(max_ctx)
+    words = {"mtp": "speculative decoding (MTP)", "text_only": "text only", "reasoning_parser": "reasoning parser",
+             "ctx": "context length"}
+    changes = [f"{words[k]} {v[k]!r} -> {new[k]!r}" for k in words if new[k] != v[k]]
+    return new, changes
+
+
+def hf_model_info(name, timeout=10):
+    """What Hugging Face says about a model, without downloading it: whether it exists, whether it's
+    gated, the size of its weights and the longest context its config allows."""
+    res = requests.get(f"https://huggingface.co/api/models/{name}", params={"blobs": "true"}, timeout=timeout)
+    if res.status_code in (401, 404):
+        return {"found": False}
+    res.raise_for_status()
+    data = res.json()
+    files = [(f.get("rfilename", ""), f.get("size") or 0) for f in data.get("siblings") or []]
+    weights = [s for f, s in files if f.endswith(".safetensors")] or \
+              [s for f, s in files if f.endswith(".bin") and "pytorch_model" in f]
+    info = {"found": True, "gated": data.get("gated") not in (False, None), "gb": sum(weights) / 2 ** 30,
+            "weights": bool(weights), "gguf_only": not weights and any(f.endswith(".gguf") for f, _ in files),
+            "max_ctx": None}
+    if not info["gated"]:
+        try:
+            cfg = requests.get(f"https://huggingface.co/{name}/resolve/main/config.json", timeout=timeout).json()
+            text = cfg.get("text_config") or {}
+            if not (cfg.get("rope_scaling") or text.get("rope_scaling")):
+                info["max_ctx"] = cfg.get("max_position_embeddings") or text.get("max_position_embeddings")
+        except (requests.RequestException, ValueError, AttributeError):
+            pass
+    return info
+
+
+def valid_ollama_name(name):
+    return bool(re.fullmatch(r"[\w.\-/:]+", name))
+
+
+def ollama_manifest_path(name):
+    """The ollama.com manifest path for an Ollama model name ('library/llama3.1/manifests/8b'), or
+    None for models from another registry (hf.co/owner/repo:tag). Dots in a model name are fine."""
+    base, _, tag = name.partition(":")
+    parts = base.split("/")
+    if len(parts) > 2 or (len(parts) == 2 and "." in parts[0]):
+        return None
+    return f"{base if len(parts) == 2 else 'library/' + base}/manifests/{tag or 'latest'}"
+
+
+def ollama_registry_gb(name, timeout=10):
+    """Download size of a model on ollama.com, from its manifest: GB, 0.0 if it doesn't exist, or
+    None for other registries (hf.co/...) and errors."""
+    path = ollama_manifest_path(name)
+    if path is None:
+        return None
+    try:
+        res = requests.get(f"https://registry.ollama.ai/v2/{path}", timeout=timeout,
+                           headers={"Accept": "application/vnd.docker.distribution.manifest.v2+json"})
+        if res.status_code == 404:
+            return 0.0
+        res.raise_for_status()
+        return sum(layer.get("size", 0) for layer in res.json().get("layers", [])) / 2 ** 30
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def node3_think(caps, wanted):
+    """The 'think' value Node 3's requests send: None when the model can't think (Ollama rejects
+    the option for those), else what was chosen."""
+    return bool(wanted) if "thinking" in caps else None
+
+
+def add_recent(lst, name):
+    return [name] + [m for m in lst if m != name][:RECENT_MAX - 1]
+
+
 # --------------------------------------------------------------------------- the window
 
 class ClusterWindow:
@@ -188,6 +291,7 @@ class ClusterWindow:
         self._vlog_path = None
         self._vlog_busy = False
         self._vlog_text = ""
+        self._served = None              # the model vLLM was last seen serving
         root.title("Agent Cluster")
         root.geometry("1280x960")
         root.minsize(1060, 760)
@@ -312,8 +416,11 @@ class ClusterWindow:
                      width=38).pack(side=tk.LEFT)
         self._button(preset_box, "Apply preset", self.apply_preset).pack(side=tk.LEFT, padx=6)
         row("Preset", preset_box, "Fills in the settings below; nothing changes until you start vLLM.")
-        row("Model", ttk.Combobox(form, textvariable=self.v_model, values=KNOWN_MODELS, width=44),
-            "Hugging Face name; new models download on first start.")
+        model_box = tk.Frame(form, bg=BG)
+        self.model_box = ttk.Combobox(model_box, textvariable=self.v_model, width=44, values=self._node1_choices())
+        self.model_box.pack(side=tk.LEFT)
+        self._button(model_box, "Check model", self.check_node1_model).pack(side=tk.LEFT, padx=6)
+        row("Model", model_box, "Any Hugging Face name (owner/model). Check fills in settings that suit it.")
         row("Context length", ttk.Combobox(form, textvariable=self.v_ctx, width=12,
                                            values=["8192", "12288", "16384", "20480", "24576", "32768"]),
             "Tokens per request. Larger leaves less room for parallel requests.")
@@ -349,6 +456,9 @@ class ClusterWindow:
         row("Extra arguments", tk.Entry(form, textvariable=self.v_extra, width=60, bg=FIELD, fg=TEXT,
                                         insertbackground="white", relief=tk.FLAT),
             "Added to the vllm serve command as-is.")
+        self.v1_info = self._label(form, "", muted=True)
+        self.v1_info.config(wraplength=1150)
+        self.v1_info.grid(row=r, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         bar = tk.Frame(p, bg=BG, padx=12, pady=4)
         bar.pack(fill=tk.X)
@@ -359,6 +469,37 @@ class ClusterWindow:
         self._button(bar, "Save settings", self.save_form).pack(side=tk.LEFT, padx=(18, 3))
         self._button(bar, "Show command", self.show_command).pack(side=tk.LEFT, padx=3)
         self._button(bar, "Open log file", self.open_vllm_log).pack(side=tk.LEFT, padx=3)
+
+        # ---- Node 3's model (Ollama): saved in Z:\config\node3_model.json, which config.py reads
+        n3 = tk.Frame(p, bg=BG, padx=12, pady=6)
+        n3.pack(fill=tk.X)
+        self._label(n3, "Node 3 model (Ollama on the RTX 2070, 8 GB): helper jobs, memory summaries and the "
+                        "chat's Node 3 choice", bold=True).grid(row=0, column=0, columnspan=8, sticky="w", pady=(0, 4))
+        cur = self._node3_current()
+        self.v3_model, self.v3_ctx = tk.StringVar(value=cur["model"]), tk.StringVar(value=str(cur["num_ctx"]))
+        self.v3_gpu = tk.StringVar(value="auto" if cur["num_gpu"] is None else str(cur["num_gpu"]))
+        self.v3_think = tk.StringVar(value="On" if cur["think"] else "Off (faster)")
+        self._label(n3, "Model").grid(row=1, column=0, sticky="w")
+        self.model3_box = ttk.Combobox(n3, textvariable=self.v3_model, width=34, values=self._node3_choices())
+        self.model3_box.grid(row=1, column=1, sticky="w", padx=(6, 0))
+        self._label(n3, "   Context").grid(row=1, column=2, sticky="w")
+        ttk.Combobox(n3, textvariable=self.v3_ctx, width=7, values=["4096", "8192", "16384", "32768"]).grid(
+            row=1, column=3, sticky="w", padx=4)
+        self._label(n3, "   GPU layers").grid(row=1, column=4, sticky="w")
+        tk.Entry(n3, textvariable=self.v3_gpu, width=6, bg=FIELD, fg=TEXT, insertbackground="white",
+                 relief=tk.FLAT).grid(row=1, column=5, sticky="w", padx=4)
+        self._label(n3, "   Thinking").grid(row=1, column=6, sticky="w")
+        ttk.Combobox(n3, textvariable=self.v3_think, state="readonly", width=12,
+                     values=["Off (faster)", "On"]).grid(row=1, column=7, sticky="w", padx=4)
+        b3 = tk.Frame(n3, bg=BG)
+        b3.grid(row=2, column=0, columnspan=8, sticky="w", pady=(4, 0))
+        self._button(b3, "Check model", self.check_node3_model).pack(side=tk.LEFT, padx=(0, 6))
+        self._button(b3, "Load on Node 3", self.load_node3_model, "#3d8b3d").pack(side=tk.LEFT, padx=3)
+        self._label(b3, "Ollama names: qwen3.5:9b, llama3.1:8b, hf.co/owner/repo:Q4_K_M. GPU layers: auto, "
+                        "or fewer to leave VRAM free (the rest runs on the CPU).", muted=True).pack(side=tk.LEFT, padx=10)
+        self.v3_info = self._label(n3, "", muted=True)
+        self.v3_info.config(wraplength=1150)
+        self.v3_info.grid(row=3, column=0, columnspan=8, sticky="w", pady=(2, 0))
 
         logf = tk.Frame(p, bg=BG, padx=12)
         logf.pack(fill=tk.BOTH, expand=True, pady=(4, 6))
@@ -674,6 +815,15 @@ class ClusterWindow:
             if self.vllm_started_at:
                 self.log(f"vLLM is ready after {time.time() - self.vllm_started_at:.0f} s.", "ok")
                 self.vllm_started_at = None
+            model = card.get("id", "")
+            if model and model != self._served:      # remember models that started; rename the chat's choice
+                self._served = model
+                if self.s.get("recent_node1", [None])[:1] != [model]:
+                    self.s["recent_node1"] = add_recent(self.s.get("recent_node1", []), model)
+                    save_settings(self.s)
+                    self.model_box["values"] = self._node1_choices()
+                if self.agent is not None and hasattr(self.agent, "set_model_names"):
+                    self.agent.set_model_names(node1=model)
             ctx = card.get("max_model_len")
             self._set("vLLM", GREEN, f"vLLM ready ({ctx // 1024 if ctx else '?'}k)",
                       f"ready, {card['id'].split('/')[-1]}, {ctx} context")
@@ -724,6 +874,9 @@ class ClusterWindow:
         if vllm_card():
             self.log("vLLM is already running. Use Restart vLLM to apply new settings.")
             return
+        self._precheck_node1(v, lambda: self._start_now(v))
+
+    def _start_now(self, v):
         self.log("Starting vLLM: " + " ".join(vllm_args(v)[2:]))
         self._launch_vllm(v)
         self._set("vLLM", ORANGE, "vLLM starting", "starting...")
@@ -832,8 +985,302 @@ class ClusterWindow:
         def work():
             self.post("log", "Restarting vLLM with the settings above...")
             self._stop_vllm_blocking()
-            self.post("call", self.start_vllm)
+            self.post("call", lambda: self._start_now(v))
+        self._precheck_node1(v, lambda: self.in_thread(work))
+
+    # ------------------------------------------------------------------ loading other models
+
+    def _node1_choices(self):
+        return KNOWN_MODELS + [m for m in self.s.get("recent_node1", []) if m not in KNOWN_MODELS]
+
+    def _node3_choices(self):
+        return [NODE3_DEFAULTS["model"]] + [m for m in self.s.get("recent_node3", []) if m != NODE3_DEFAULTS["model"]]
+
+    def _node3_path(self):
+        return os.path.join(self.s["drive"] + "\\", "config", NODE3_FILE)
+
+    def _node3_current(self):
+        """Node 3's model and settings as config.py sees them (Z:\\config\\node3_model.json)."""
+        cur = dict(NODE3_DEFAULTS)
+        try:
+            with open(self._node3_path(), encoding="utf-8") as f:
+                cur.update({k: v for k, v in json.load(f).items() if k in cur})
+        except (OSError, ValueError, AttributeError):
+            pass
+        return cur
+
+    @staticmethod
+    def _wsl_ok(test):
+        return run_quiet(["wsl", "bash", "-c", test], timeout=20)[0] == 0
+
+    def _hf_cached(self, name):
+        return self._wsl_ok(f"test -d ~/.cache/huggingface/hub/models--{name.replace('/', '--')}/snapshots")
+
+    def _hf_login(self):
+        return self._wsl_ok('test -n "$HF_TOKEN" -o -f ~/.cache/huggingface/token')
+
+    def check_node1_model(self):
+        """Look the typed model up on Hugging Face (nothing is downloaded) and fill in settings that suit
+        it; you can still change any of them before starting."""
+        name = self.v_model.get().strip()
+        if not re.fullmatch(r"[\w.\-]+/[\w.\-]+", name):
+            messagebox.showerror("Agent Cluster", "Type a Hugging Face model name, owner/model: for example "
+                                                  "Qwen/Qwen3-14B-AWQ.")
+            return
+        self.v1_info.config(text=f"Checking {name} on Hugging Face...")
+
+        def work():
+            try:
+                info = hf_model_info(name)
+            except Exception as e:
+                info = {"error": str(e)[:200]}
+            cached, login = self._hf_cached(name), self._hf_login()
+            self.post("call", lambda: self._show_node1_check(name, info, cached, login))
         self.in_thread(work)
+
+    def _show_node1_check(self, name, info, cached, login):
+        if info.get("error"):
+            text = f"Couldn't reach Hugging Face ({info['error']})."
+        elif not info["found"]:
+            text = f"There's no public model named {name} on Hugging Face (check the spelling)."
+        elif not info["weights"]:
+            text = (f"{name} has only GGUF files; vLLM needs safetensors weights (look for an AWQ, GPTQ or INT4 "
+                    "repo). GGUF models can run on Node 3 instead." if info["gguf_only"]
+                    else f"{name} has no weight files vLLM can load.")
+        else:
+            v = self.read_form()
+            if v is None:
+                return
+            new, changes = suggest_vllm(v, name, info["max_ctx"])
+            self._load_form(new)
+            parts = [f"{name}: {info['gb']:.1f} GB of weights, " + ("already downloaded" if cached else
+                                                                     "not downloaded yet (Start asks first)")]
+            if info["gb"] > FIT_GB:
+                parts.append("probably too big for the 4090 with room for its cache: try a 4-bit (AWQ/GPTQ/INT4) version")
+            if info["gated"]:
+                parts.append("gated: " + ("WSL has a Hugging Face login" if login else
+                                          "accept its license on huggingface.co, then run "
+                                          "'~/vllm_env/bin/hf auth login' in WSL"))
+            parts.append(("settings changed: " + "; ".join(changes)) if changes else "the settings below suit it")
+            text = ". ".join(parts) + ". Adjust anything, then Start or Restart vLLM."
+        self.v1_info.config(text=text)
+        self.log(text)
+
+    def _precheck_node1(self, v, go):
+        """Before vLLM starts a model that isn't downloaded yet: say how big it is, whether it fits and
+        whether it needs a Hugging Face login, and ask. Downloaded models start straight away."""
+        name = v["model"]
+
+        def work():
+            if self._hf_cached(name):
+                self.post("call", go)
+                return
+            try:
+                info = hf_model_info(name)
+            except Exception as e:
+                info = {"error": str(e)[:200]}
+            login = self._hf_login()
+            self.post("call", lambda: self._confirm_node1_download(name, info, login, go))
+        self.in_thread(work)
+
+    def _confirm_node1_download(self, name, info, login, go):
+        title = "Load a model on Node 1"
+        if info.get("error"):
+            ok = messagebox.askyesno(title, f"{name} isn't downloaded yet, and Hugging Face couldn't be checked "
+                                            f"({info['error']}).\n\nStart anyway? vLLM downloads it first.")
+        elif not info["found"]:
+            messagebox.showerror(title, f"There's no public model named {name} on Hugging Face.")
+            return
+        elif not info["weights"]:
+            messagebox.showerror(title, f"{name} has no safetensors weights for vLLM" +
+                                 (" (only GGUF files; those can run on Node 3)." if info["gguf_only"] else "."))
+            return
+        elif info["gated"] and not login:
+            messagebox.showerror(title, f"{name} is gated. Accept its license on huggingface.co, then log in "
+                                        "inside WSL (open a WSL terminal and run: ~/vllm_env/bin/hf auth login), "
+                                        "and start it again.")
+            return
+        else:
+            msg = (f"{name} isn't downloaded yet. Starting it first downloads about {info['gb']:.1f} GB from "
+                   "Hugging Face into WSL, so this start takes longer than usual.")
+            if info["gb"] > FIT_GB:
+                msg += (f"\n\nIts weights alone are {info['gb']:.1f} GB, so it probably won't fit on the 4090 "
+                        "(24 GB) and vLLM will stop with an out-of-memory error.")
+            ok = messagebox.askyesno(title, msg + "\n\nDownload and start it?")
+        if ok:
+            go()
+
+    def _read_node3_form(self):
+        title = "Node 3 model"
+        name = self.v3_model.get().strip()
+        if not valid_ollama_name(name):
+            messagebox.showerror(title, "Type an Ollama model name, for example qwen3.5:9b, llama3.1:8b or "
+                                        "hf.co/owner/repo:Q4_K_M.")
+            return None
+        try:
+            ctx = int(self.v3_ctx.get())
+            gpu = self.v3_gpu.get().strip().lower()
+            gpu = None if gpu in ("", "auto") else int(gpu)
+        except ValueError:
+            messagebox.showerror(title, "Context must be a whole number, and GPU layers a whole number or auto.")
+            return None
+        if not 1024 <= ctx <= 262144 or (gpu is not None and not 0 <= gpu <= 999):
+            messagebox.showerror(title, "Context must be 1024-262144 tokens, and GPU layers 0-999 or auto.")
+            return None
+        return {"model": name, "num_ctx": ctx, "num_gpu": gpu, "think": self.v3_think.get() == "On"}
+
+    def _node3_base(self):
+        return f"http://{self.s['node3_ip']}:11434"
+
+    @staticmethod
+    def _same_model(a, b):
+        return (a if ":" in a else a + ":latest") == (b if ":" in b else b + ":latest")
+
+    def check_node3_model(self):
+        want = self._read_node3_form()
+        if not want:
+            return
+        name = want["model"]
+        self.v3_info.config(text=f"Checking {name}...")
+
+        def work():
+            base = self._node3_base()
+            try:
+                have = requests.get(f"{base}/api/tags", timeout=5).json()["models"]
+                here = next((m for m in have if self._same_model(m["name"], name)), None)
+                if here is None:
+                    gb = ollama_registry_gb(name)
+                    text = (f"There's no model named {name} on ollama.com." if gb == 0.0 else
+                            f"{name} isn't on Node 3 yet: Load downloads it first" +
+                            (f" (about {gb:.1f} GB)." if gb else " (its size shows as it downloads)."))
+                else:
+                    show = requests.post(f"{base}/api/show", json={"model": name}, timeout=20).json()
+                    caps = show.get("capabilities") or []
+                    d = show.get("details") or {}
+                    longest = next((v for k, v in (show.get("model_info") or {}).items()
+                                    if k.endswith(".context_length")), None)
+                    gb = here.get("size", 0) / 2 ** 30
+                    text = f"{name}: on Node 3, {d.get('parameter_size', '?')} parameters, " \
+                           f"{d.get('quantization_level', '?')}, {gb:.1f} GB"
+                    if "completion" not in caps:
+                        text += ". It can't write text (" + (", ".join(caps) or "no chat ability") + \
+                                "), so it can't do Node 3's jobs"
+                    else:
+                        if gb > 7:
+                            text += ": bigger than the 2070's 8 GB, so part of it runs on the CPU (slower)"
+                        if longest:
+                            text += f". Context up to {longest} tokens"
+                        text += ". Thinking: " + ("it can think" if "thinking" in caps else
+                                                  "it has no thinking mode, so that setting is ignored")
+                    text += "."
+            except Exception as e:
+                text = f"Couldn't check {name} on Node 3: {e}"
+            self.post("call", lambda: self.v3_info.config(text=text))
+        self.in_thread(work)
+
+    def load_node3_model(self):
+        """Load the typed model on Node 3 with the settings beside it (downloading it first if Node 3
+        doesn't have it, after asking), unload the one it replaces, and save the choice for every
+        process started afterwards (Z:\\config\\node3_model.json)."""
+        want = self._read_node3_form()
+        if not want or not self._confirm_runs("Switching Node 3's model"):
+            return
+        if not os.path.isdir(os.path.dirname(self._node3_path())):
+            messagebox.showerror("Node 3 model", "Connect Z: first: the choice is saved in Z:\\config.")
+            return
+        name = want["model"]
+
+        def gather():
+            try:
+                have = requests.get(f"{self._node3_base()}/api/tags", timeout=5).json()["models"]
+            except Exception as e:
+                self.post("log", f"Node 3's Ollama isn't reachable: {e}", "err")
+                return
+            if any(self._same_model(m["name"], name) for m in have):
+                self._load_node3(want)
+            else:
+                gb = ollama_registry_gb(name)
+                self.post("call", lambda: self._confirm_node3_pull(want, gb))
+        self.in_thread(gather)
+
+    def _confirm_node3_pull(self, want, gb):
+        name = want["model"]
+        if gb == 0.0:
+            messagebox.showerror("Node 3 model", f"There's no model named {name} on ollama.com.")
+            return
+        size = f"about {gb:.1f} GB" if gb else "its size shows in Activity as it downloads"
+        if messagebox.askyesno("Node 3 model", f"{name} isn't on Node 3 yet. Download it ({size}) and load it?"):
+            self.in_thread(self._load_node3, want, True)
+
+    def _load_node3(self, want, pull=False):
+        base, name = self._node3_base(), want["model"]
+        try:
+            if pull:
+                self.post("log", f"Downloading {name} on Node 3...")
+                shown = -10
+                with requests.post(f"{base}/api/pull", json={"model": name, "stream": True}, stream=True,
+                                   timeout=3600) as res:
+                    res.raise_for_status()
+                    for line in res.iter_lines():
+                        ev = json.loads(line) if line else {}
+                        if ev.get("error"):
+                            raise RuntimeError(ev["error"])
+                        if ev.get("total") and ev.get("completed") is not None and ev["total"] > 2 ** 26:
+                            pct = int(100 * ev["completed"] / ev["total"])
+                            if pct >= shown + 10:
+                                shown = pct
+                                self.post("log", f"    {pct}% of {ev['total'] / 2 ** 30:.1f} GB")
+            show = requests.post(f"{base}/api/show", json={"model": name}, timeout=30).json()
+            if show.get("error"):
+                raise RuntimeError(show["error"])
+            caps = show.get("capabilities") or []
+            if "completion" not in caps:
+                raise RuntimeError("it can't write text (" + (", ".join(caps) or "no chat ability") +
+                                   "), and Node 3's jobs need a chat model")
+            for m in requests.get(f"{base}/api/ps", timeout=5).json()["models"]:
+                if not self._same_model(m["name"], name):
+                    self.post("log", f"Unloading {m['name']} from Node 3...")
+                    requests.post(f"{base}/api/generate", json={"model": m["name"], "keep_alive": 0}, timeout=60)
+            opts = {"num_ctx": want["num_ctx"]}
+            if want["num_gpu"] is not None:
+                opts["num_gpu"] = want["num_gpu"]
+            self.post("log", f"Loading {name} on Node 3...")
+            requests.post(f"{base}/api/generate", timeout=600, json={
+                "model": name, "prompt": "", "keep_alive": -1, "options": opts}).raise_for_status()
+            ps = next((m for m in requests.get(f"{base}/api/ps", timeout=5).json()["models"]
+                       if self._same_model(m["name"], name)), None)
+        except Exception as e:
+            self.post("log", f"Couldn't load {name} on Node 3: {e}", "err")
+            return
+        choice = dict(want, think=node3_think(caps, want["think"]))
+        self.post("call", lambda: self._node3_loaded(choice, ps))
+
+    def _node3_loaded(self, choice, ps):
+        path = self._node3_path()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(choice, f, indent=2)
+        except OSError as e:
+            self.log(f"{choice['model']} is loaded, but the choice couldn't be saved ({e}), so runs still use "
+                     "the old model.", "err")
+            return
+        self.s.update(worker_model=choice["model"], ollama_num_ctx=choice["num_ctx"],
+                      recent_node3=add_recent(self.s.get("recent_node3", []), choice["model"]))
+        save_settings(self.s)
+        self.model3_box["values"] = self._node3_choices()
+        cfg = sys.modules.get("config")
+        if cfg is not None:              # the chat in this window; new runs read the file
+            cfg.WORKER_MODEL, cfg.WORKER_THINK = choice["model"], choice["think"]
+            cfg.OLLAMA_NUM_CTX, cfg.OLLAMA_NUM_GPU = choice["num_ctx"], choice["num_gpu"]
+        if self.agent is not None and hasattr(self.agent, "set_model_names"):
+            self.agent.set_model_names(node3=choice["model"])
+        where = (f", {ps['size'] / 2 ** 30:.1f} GB with {ps['size_vram'] / ps['size']:.0%} on the GPU"
+                 if ps and ps.get("size") else "")
+        think = {None: "no thinking mode", True: "thinking on", False: "thinking off"}[choice["think"]]
+        text = (f"Node 3 now runs {choice['model']} ({choice['num_ctx']} context{where}, {think}). New runs and "
+                "the chat use it; runs already going keep the old one.")
+        self.v3_info.config(text=text)
+        self.log(text, "ok")
 
     def check_vram(self):
         def work():
@@ -987,12 +1434,14 @@ class ClusterWindow:
         2026-11-07), both with keep_alive -1 so they stay loaded."""
         def work():
             n3, n2 = f"http://{self.s['node3_ip']}:11434", f"http://{self.s['node2_ip']}:11434"
-            worker, embedder, ctx = self.s["worker_model"], self.s["embed_model"], self.s["ollama_num_ctx"]
+            cur, embedder = self._node3_current(), self.s["embed_model"]
+            worker, opts = cur["model"], {"num_ctx": cur["num_ctx"]}
+            if cur["num_gpu"] is not None:
+                opts["num_gpu"] = cur["num_gpu"]
+            body = {"model": worker, "prompt": "", "keep_alive": -1, "options": opts}
             try:
                 self.post("log", f"Loading {worker} on Node 3...")
-                requests.post(f"{n3}/api/generate", timeout=300, json={
-                    "model": worker, "prompt": "warmup", "stream": False, "think": False,
-                    "keep_alive": -1, "options": {"num_ctx": ctx}}).raise_for_status()
+                requests.post(f"{n3}/api/generate", timeout=300, json=body).raise_for_status()
                 models = [m["name"] for m in requests.get(f"{n3}/api/ps", timeout=5).json()["models"]]
                 self.post("log", "Node 3 models loaded: " + ", ".join(models), "ok")
             except Exception as e:

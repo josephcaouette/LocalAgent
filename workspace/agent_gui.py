@@ -432,6 +432,18 @@ class AgentControlGUI:
         self._build_runs(self.runs_tab)
         self.tabs.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
 
+    def set_model_names(self, node1=None, node3=None):
+        """Rename the chat's model choices after the Agent Cluster window loads another model on
+        Node 1 (the name vLLM serves) or Node 3. The choice that's selected stays selected."""
+        global NODE1_LABEL, NODE3_LABEL
+        if node1:
+            NODE1_LABEL = CHAT_MODELS[1] = f"Node 1 - {node1.split('/')[-1]} (RTX 4090)"
+        if node3:
+            NODE3_LABEL = CHAT_MODELS[2] = f"Node 3 - {node3} (RTX 2070)"
+        pick = self.chat_backend.current()
+        self.chat_backend["values"] = CHAT_MODELS
+        self.chat_backend.current(max(pick, 0))
+
     def _build_chat(self, parent):
         opts = tk.Frame(parent, bg=BG, padx=10, pady=6)
         opts.pack(fill=tk.X)
@@ -971,8 +983,7 @@ class AgentControlGUI:
             messages = self._fit(system, history, budget)
             payload = {"model": config.WORKER_MODEL, "messages": messages, "stream": True,
                        "keep_alive": config.OLLAMA_KEEP_ALIVE,
-                       "options": {"num_ctx": config.OLLAMA_NUM_CTX, "temperature": 0.7,
-                                   "num_predict": max_tokens}}
+                       "options": config.ollama_options(temperature=0.7, num_predict=max_tokens)}
             if config.WORKER_THINK is not None:
                 payload["think"] = think
             res = requests.post(f"{config.OLLAMA_URL}/api/chat", json=payload, stream=True, timeout=900)

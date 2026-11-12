@@ -8,6 +8,7 @@ from ../config/agent_secrets.env, i.e. Z:\\config on Windows and
 /mnt/blackboard/config on Node 2. That folder is outside the workspace, so
 sandboxed code can't read it.
 """
+import json
 import os
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -120,11 +121,39 @@ THINK_TOKENS = 5000
 # Node 3. (Embeddings moved to Node 2 on 2026-11-07: EMBED_URL above.)
 HELPER_BACKEND = "node1"
 OLLAMA_URL = f"http://{NODE3_IP}:11434"
-WORKER_MODEL = "qwen3.5:9b"          # was qwen2.5-coder:7b
-WORKER_THINK = False       # Qwen3.5 reasons step by step unless this is False. Use None for models
-                           # without a thinking mode (such as qwen2.5-coder), which reject the option.
-OLLAMA_NUM_CTX = 8192      # keep identical everywhere (incl. Restart_Node3_Worker.bat) or Ollama reloads the model
+# Node 3's model and its settings. The Agent Cluster window's Model server tab (Node 3 section)
+# saves them in ../config/node3_model.json (Z:\config, outside the workspace and Git) and every
+# process started afterwards reads them here; without that file the defaults below apply.
+NODE3_MODEL_FILE = os.path.join(_HERE, "..", "config", "node3_model.json")
+
+
+def _node3_choice():
+    try:
+        with open(NODE3_MODEL_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+_NODE3 = _node3_choice()
+WORKER_MODEL = str(_NODE3.get("model") or "qwen3.5:9b")          # was qwen2.5-coder:7b
+WORKER_THINK = _NODE3.get("think", False)  # Qwen3.5 reasons step by step unless this is False. None for
+if WORKER_THINK not in (True, False, None):  # models without a thinking mode (such as qwen2.5-coder),
+    WORKER_THINK = False                     # which reject the option.
+OLLAMA_NUM_CTX = int(_NODE3.get("num_ctx") or 8192)  # sent with every request: a different value makes Ollama reload
+OLLAMA_NUM_GPU = _NODE3.get("num_gpu")     # layers on Node 3's GPU (the rest run on its CPU); None: Ollama decides
 OLLAMA_KEEP_ALIVE = -1     # sent with every request (embeddings too); -1 keeps models loaded indefinitely
+
+
+def ollama_options(**extra):
+    """The options sent with every Node 3 request. They must be the same each time (num_ctx,
+    num_gpu), or Ollama reloads the model."""
+    opts = {"num_ctx": OLLAMA_NUM_CTX}
+    if OLLAMA_NUM_GPU is not None:
+        opts["num_gpu"] = OLLAMA_NUM_GPU
+    opts.update(extra)
+    return opts
 EXAMPLE_CHECK_BACKEND = "node1"   # who writes the example-checking script on High and above:
                                   # "node1" (27B, no thinking; 6 of 6 correct on test plans, ~15 s) or
                                   # "node3" (9B; 0-3 of 9). Disputes are always settled by Node 1.
